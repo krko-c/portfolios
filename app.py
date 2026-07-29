@@ -19,6 +19,8 @@ import json
 import re
 from pathlib import Path
 
+from scipy.optimize import minimize
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -843,13 +845,365 @@ def monthly_table(r):
     return (pv * 100).round(2)
 
 
+
+# ======================================================================
+# 성장 기여도 분해
+# ======================================================================
+def start_weights(prices: pd.DataFrame, weights: dict, rebalance: str) -> pd.DataFrame:
+    """
+    각 거래일이 '시작될 때' 보유 중인 비중. 그날 수익률에 실제로 적용되는 값이다.
+    (하루가 끝난 뒤의 비중을 쓰면 리밸런싱이 있는 경우 합계가 어긋난다)
+    """
+    tickers = list(weights)
+    px = prices[tickers].dropna()
+    w = np.array([weights[t] for t in tickers], dtype=float)
+    w = w / w.sum()
+    d = px.pct_change().dropna()
+
+    if rebalance == REBAL_DAILY:
+        return pd.DataFrame(np.tile(w, (len(d), 1)), index=d.index, columns=tickers)
+
+    if rebalance == REBAL_NONE:
+        g = (1 + d).cumprod().shift(1)
+        g.iloc[0] = 1.0
+        val = g * w
+    else:
+        pid = d.index.to_period(PERIOD_CODE[rebalance])
+        val = pd.DataFrame(index=d.index, columns=tickers, dtype=float)
+        for _, ix in d.groupby(pid).groups.items():
+            pr = d.loc[ix]
+            g = (1 + pr).cumprod().shift(1)
+            g.iloc[0] = 1.0
+            val.loc[ix] = (g * w).values
+    return val.div(val.sum(axis=1), axis=0)
+
+
+def growth_contribution(prices: pd.DataFrame, weights: dict, rebalance: str,
+                        port_r: pd.Series) -> pd.Series:
+    """
+    종목별 성장 기여도.  기여도_i = Σ_t V(t-1) × 시작비중_i(t) × 수익률_i(t)
+    이 값들의 합은 포트폴리오 총수익과 정확히 일치한다.
+    """
+    tickers = list(weights)
+    d = prices[tickers].dropna().pct_change().dropna()
+    d = d.reindex(port_r.index).dropna()
+    ws = start_weights(prices, weights, rebalance).reindex(d.index)
+    V_prev = equity_curve(port_r).shift(1).reindex(d.index)
+    return (d * ws).mul(V_prev, axis=0).sum()
+
+
+# ======================================================================
+# 최적화 엔진
+# ======================================================================
+def ann_stats(returns: pd.DataFrame):
+    """연율화 기대수익률과 공분산."""
+    return (returns.mean() * TRADING_DAYS).values, (returns.cov() * TRADING_DAYS).values
+
+
+def port_perf(w, mu, cov, rf=0.0):
+    ret = float(w @ mu)
+    vol = float(np.sqrt(w @ cov @ w))
+    return ret, vol, ((ret - rf) / vol if vol > 0 else np.nan)
+
+
+def risk_contributions(w, cov):
+    """자산별 위험 기여도. 합은 포트폴리오 변동성과 같다."""
+    vol = np.sqrt(w @ cov @ w)
+    return np.zeros_like(w) if vol == 0 else w * (cov @ w) / vol
+
+
+def _opt_solve(fn, n, wmin, wmax, extra=()):
+    """SLSQP. 시작점을 여러 개 시도해 국소해에 갇히는 것을 줄인다."""
+    cons = [{"type": "eq", "fun": lambda w: w.sum() - 1.0}] + list(extra)
+    bounds = tuple((wmin, wmax) for _ in range(n))
+    best, best_val = None, np.inf
+    rng = np.random.default_rng(0)
+    starts = [np.ones(n) / n] + [rng.random(n) for _ in range(6)]
+    for x0 in starts:
+        x0 = np.clip(np.asarray(x0, dtype=float), wmin, wmax)
+        if x0.sum() > 0:
+            x0 = x0 / x0.sum()
+        try:
+            res = minimize(fn, x0, method="SLSQP", bounds=bounds, constraints=cons,
+                           options={"maxiter": 500, "ftol": 1e-12})
+        except Exception:
+            continue
+        if res.success and res.fun < best_val:
+            best, best_val = res.x, res.fun
+    if best is None:
+        return np.ones(n) / n
+    best = np.clip(best, wmin, wmax)
+    return best / best.sum()
+
+
+def opt_max_sharpe(mu, cov, rf=0.0, wmin=0.0, wmax=1.0):
+    def neg(w):
+        v = np.sqrt(w @ cov @ w)
+        return 1e6 if v <= 0 else -(w @ mu - rf) / v
+    return _opt_solve(neg, len(mu), wmin, wmax)
+
+
+def opt_min_vol(mu, cov, wmin=0.0, wmax=1.0):
+    return _opt_solve(lambda w: w @ cov @ w, len(mu), wmin, wmax)
+
+
+def opt_risk_parity(cov, wmin=0.0, wmax=1.0):
+    def obj(w):
+        rc = risk_contributions(w, cov)
+        return float(((rc - rc.mean()) ** 2).sum()) * 1e4
+    return _opt_solve(obj, len(cov), max(wmin, 1e-4), wmax)
+
+
+def opt_target_return(mu, cov, target, wmin=0.0, wmax=1.0):
+    extra = [{"type": "eq", "fun": lambda w: float(w @ mu) - target}]
+    return _opt_solve(lambda w: w @ cov @ w, len(mu), wmin, wmax, extra)
+
+
+def efficient_frontier(mu, cov, n_points=30, wmin=0.0, wmax=1.0):
+    lo = float(mu @ opt_min_vol(mu, cov, wmin, wmax))
+    hi = float(mu.max()) if wmax >= 1.0 else float(mu @ opt_max_sharpe(mu, cov, 0, wmin, wmax))
+    hi = max(hi, lo + 1e-6)
+    pts = []
+    for tgt in np.linspace(lo, hi, n_points):
+        w = opt_target_return(mu, cov, tgt, wmin, wmax)
+        r, v, _ = port_perf(w, mu, cov)
+        if abs(r - tgt) < 5e-3:
+            pts.append((v, r, w))
+    return pts
+
+
+# ======================================================================
+# 최적화 화면
+# ======================================================================
+OPT_COLS = ["티커", "종목명", "최소(%)", "최대(%)"]
+OBJECTIVES = {
+    "최대 샤프 비율": "위험 대비 초과수익이 가장 높은 조합을 찾습니다. 가장 널리 쓰입니다.",
+    "최소 변동성": "수익률과 무관하게 흔들림이 가장 적은 조합입니다. 보수적 접근.",
+    "위험 균형 (리스크 패리티)": "각 종목이 전체 위험에 똑같이 기여하도록 배분합니다. "
+                            "변동성 큰 종목의 비중이 자연히 낮아집니다.",
+    "목표 수익률 · 최소 위험": "원하는 연 수익률을 정하면 그걸 달성하는 가장 안전한 조합을 찾습니다.",
+}
+
+
+def _opt_blank():
+    return {"티커": "", "종목명": "", "최소(%)": 0.0, "최대(%)": 100.0}
+
+
+def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
+    key = "_opt_df"
+    if key not in st.session_state:
+        st.session_state[key] = pd.DataFrame(
+            [{"티커": t, "종목명": "", "최소(%)": 0.0, "최대(%)": 100.0}
+             for t in ("SCHD", "QQQ", "NVDA", "AGG")])[OPT_COLS]
+
+    st.subheader("1️⃣ 후보 종목")
+    st.caption("최적화에 넣을 종목을 입력하세요. 비중은 계산 결과로 나옵니다. "
+               "특정 종목을 제한하고 싶으면 최소·최대를 조정하세요.")
+
+    c1, c2 = st.columns([1, 5])
+    n = c1.number_input("종목 수", 2, 20, len(st.session_state[key]), step=1, key="_opt_n")
+    if int(n) != len(st.session_state[key]):
+        cur = st.session_state[key]
+        if int(n) > len(cur):
+            cur = pd.concat([cur, pd.DataFrame([_opt_blank()] * (int(n) - len(cur)))],
+                            ignore_index=True)
+        else:
+            cur = cur.iloc[:int(n)].reset_index(drop=True)
+        st.session_state[key] = cur[OPT_COLS]
+        st.session_state.pop("_opt_editor", None)
+        st.rerun()
+
+    ed = st.data_editor(
+        st.session_state[key], num_rows="fixed", width="stretch",
+        key="_opt_editor", column_order=OPT_COLS, hide_index=True,
+        column_config={
+            "티커": st.column_config.TextColumn("티커", width="small"),
+            "종목명": st.column_config.TextColumn("종목명 (자동)", disabled=True, width="large"),
+            "최소(%)": st.column_config.NumberColumn("최소(%)", min_value=0.0, max_value=100.0,
+                                                   step=1.0, format="%.0f", width="small"),
+            "최대(%)": st.column_config.NumberColumn("최대(%)", min_value=0.0, max_value=100.0,
+                                                   step=1.0, format="%.0f", width="small"),
+        })
+
+    f = ed.copy()
+    for c in OPT_COLS:
+        if c not in f.columns:
+            f[c] = np.nan
+    f = f[OPT_COLS]
+    f["티커"] = f["티커"].fillna("").astype(str).str.strip()
+    f["최소(%)"] = pd.to_numeric(f["최소(%)"], errors="coerce").fillna(0.0)
+    f["최대(%)"] = pd.to_numeric(f["최대(%)"], errors="coerce").fillna(100.0)
+
+    res_t, res_l, bad = [], [], []
+    if any(t for t in f["티커"]):
+        with st.spinner("티커 확인 중..."):
+            for t in f["티커"]:
+                if not t:
+                    res_t.append(""); res_l.append(""); continue
+                r = probe_ticker(tuple(normalize_ticker(t)))
+                if r["ticker"] is None:
+                    res_t.append(t); res_l.append("❌ 확인 불가"); bad.append(t)
+                else:
+                    res_t.append(r["ticker"])
+                    nm = r.get("name") or "(종목명 없음)"
+                    res_l.append(f"✅ {nm} · {r['currency']}")
+    else:
+        res_t, res_l = list(f["티커"]), [""] * len(f)
+    f["티커"], f["종목명"] = res_t, res_l
+
+    if not _frames_equal(f, st.session_state[key]):
+        st.session_state[key] = f
+        st.session_state.pop("_opt_editor", None)
+        st.rerun()
+
+    if bad:
+        st.error(f"확인되지 않는 티커: {', '.join(bad)}")
+
+    st.subheader("2️⃣ 목적")
+    obj = st.radio("최적화 목적", list(OBJECTIVES), horizontal=False,
+                   label_visibility="collapsed")
+    st.caption(OBJECTIVES[obj])
+
+    target = None
+    if obj.startswith("목표 수익률"):
+        target = st.number_input("목표 연 수익률 (%)", -20.0, 100.0, 10.0, step=1.0) / 100
+
+    go_btn = st.button("🎯 최적 비중 계산", type="primary", width="stretch",
+                       disabled=bool(bad))
+    if not go_btn:
+        st.info("👆 종목을 입력하고 **최적 비중 계산**을 눌러주세요.")
+        return
+
+    tickers = [t for t in f["티커"] if t]
+    if len(tickers) < 2:
+        st.error("최소 2개 종목이 필요합니다.")
+        return
+
+    try:
+        with st.spinner("데이터 수집 중..."):
+            prices, meta = build_price_frame(tickers, start_date, end_date,
+                                             base_ccy, use_div)
+    except Exception as ex:
+        st.error(f"데이터를 가져오지 못했습니다: {ex}")
+        return
+    if prices.empty or len(prices) < 60:
+        st.error("공통 거래일이 너무 적습니다. 기간이나 종목을 확인해주세요.")
+        return
+
+    R = prices[tickers].pct_change().dropna()
+    mu, cov = ann_stats(R)
+    lo = np.array([f.loc[f["티커"] == t, "최소(%)"].iloc[0] for t in tickers]) / 100
+    hi = np.array([f.loc[f["티커"] == t, "최대(%)"].iloc[0] for t in tickers]) / 100
+    wmin, wmax = float(lo.max()) if lo.max() > 0 else 0.0, float(hi.min())
+    if lo.sum() > 1.0:
+        st.error(f"최소 비중 합계가 {lo.sum()*100:.0f}% 로 100%를 넘습니다.")
+        return
+    if hi.sum() < 1.0:
+        st.error(f"최대 비중 합계가 {hi.sum()*100:.0f}% 로 100%에 못 미칩니다.")
+        return
+
+    with st.spinner("최적화 계산 중..."):
+        if obj.startswith("최대 샤프"):
+            w = opt_max_sharpe(mu, cov, rf_rate, wmin, wmax)
+        elif obj.startswith("최소 변동성"):
+            w = opt_min_vol(mu, cov, wmin, wmax)
+        elif obj.startswith("위험 균형"):
+            w = opt_risk_parity(cov, wmin, wmax)
+        else:
+            w = opt_target_return(mu, cov, target, wmin, wmax)
+        w_eq = np.ones(len(tickers)) / len(tickers)
+        ef = efficient_frontier(mu, cov, 25, wmin, wmax)
+
+    st.success(f"✅ 계산 완료 · 공통 거래일 {len(R):,}일 "
+               f"({R.index[0].date()} ~ {R.index[-1].date()}) · 기준통화 {base_ccy}")
+
+    ret, vol, shp = port_perf(w, mu, cov, rf_rate)
+    st.subheader("3️⃣ 최적 비중")
+    k1, k2, k3 = st.columns(3)
+    k1.metric("기대 수익률 (연)", f"{ret*100:.2f}%")
+    k2.metric("예상 변동성 (연)", f"{vol*100:.2f}%")
+    k3.metric("Sharpe", f"{shp:.2f}")
+
+    rc = risk_contributions(w, cov)
+    rc_pct = rc / rc.sum() * 100 if rc.sum() else np.zeros_like(rc)
+    wdf = pd.DataFrame({
+        "티커": tickers,
+        "종목명": [meta.get(t, {}).get("name", t) for t in tickers],
+        "최적 비중(%)": w * 100,
+        "위험 기여도(%)": rc_pct,
+    }).sort_values("최적 비중(%)", ascending=False)
+
+    fb = go.Figure(go.Bar(x=wdf["최적 비중(%)"], y=wdf["티커"], orientation="h",
+                          marker_color="#0d9488",
+                          text=[f"{x:.1f}%" for x in wdf["최적 비중(%)"]],
+                          textposition="outside"))
+    fb.update_layout(height=60 + 42 * len(wdf), margin=dict(l=0, r=40, t=10, b=0),
+                     xaxis=dict(title=None, ticksuffix="%"),
+                     yaxis=dict(autorange="reversed"))
+    st.plotly_chart(fb, width="stretch")
+    st.dataframe(wdf.style.format({"최적 비중(%)": "{:.2f}", "위험 기여도(%)": "{:.2f}"}),
+                 width="stretch", hide_index=True)
+    st.caption("**위험 기여도** = 그 종목이 포트폴리오 전체 변동성에서 차지하는 몫입니다. "
+               "비중은 낮아도 변동이 큰 종목은 위험 기여도가 높게 나옵니다.")
+
+    st.subheader("4️⃣ 효율적 투자선")
+    if ef:
+        fe = go.Figure()
+        fe.add_trace(go.Scatter(x=[v*100 for v, _, _ in ef], y=[r*100 for _, r, _ in ef],
+                                mode="lines", name="효율적 투자선",
+                                line=dict(color="#94a3b8", width=2)))
+        for t in tickers:
+            i = tickers.index(t)
+            fe.add_trace(go.Scatter(x=[np.sqrt(cov[i, i])*100], y=[mu[i]*100],
+                                    mode="markers+text", text=[t], textposition="top center",
+                                    marker=dict(size=8, color="#cbd5e1"), showlegend=False))
+        r_eq, v_eq, _ = port_perf(w_eq, mu, cov, rf_rate)
+        fe.add_trace(go.Scatter(x=[v_eq*100], y=[r_eq*100], mode="markers+text",
+                                text=["균등분산"], textposition="bottom center",
+                                marker=dict(size=12, color="#d97706", symbol="diamond"),
+                                name="균등분산"))
+        fe.add_trace(go.Scatter(x=[vol*100], y=[ret*100], mode="markers+text",
+                                text=["최적"], textposition="top center",
+                                marker=dict(size=15, color="#0d9488", symbol="star"),
+                                name="최적 포트폴리오"))
+        fe.update_layout(height=440, hovermode="closest",
+                         xaxis=dict(title="변동성 (연, %)"),
+                         yaxis=dict(title="기대 수익률 (연, %)"),
+                         margin=dict(l=0, r=0, t=20, b=0),
+                         legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+        st.plotly_chart(fe, width="stretch")
+        st.caption("곡선 위의 점들은 '그 수익률을 내면서 위험이 가장 낮은' 조합입니다. "
+                   "회색 점은 개별 종목, 별표가 계산된 최적 조합입니다.")
+    else:
+        st.info("제약 조건이 빡빡해 투자선을 그릴 수 없습니다. 최소·최대 비중을 완화해보세요.")
+
+    st.subheader("5️⃣ 균등분산과 비교")
+    rows = []
+    for label, ww in [("최적화 결과", w), ("균등분산", w_eq)]:
+        rr, vv, ss = port_perf(ww, mu, cov, rf_rate)
+        rows.append({"구성": label, "기대수익률(%)": rr*100,
+                     "변동성(%)": vv*100, "Sharpe": ss})
+    cmp_df = pd.DataFrame(rows).set_index("구성")
+    st.dataframe(cmp_df.style.format("{:.2f}"), width="stretch")
+
+    st.divider()
+    out = wdf.copy()
+    st.download_button("📥 최적 비중 CSV", out.to_csv(index=False).encode("utf-8-sig"),
+                       f"optimal_weights_{pd.Timestamp.now():%Y%m%d_%H%M}.csv",
+                       "text/csv", width="stretch")
+    st.caption("최적화는 **과거 데이터의 평균·변동성·상관관계**를 그대로 미래에 적용한다고 "
+               "가정합니다. 기대수익률 추정은 특히 오차가 커서, 결과를 그대로 따르기보다 "
+               "참고 자료로 쓰시길 권합니다. 교육·참고용이며 투자 자문이 아닙니다.")
+
+
+
 # ======================================================================
 # 사이드바
 # ======================================================================
-st.title("📊 Portfolio Analyzer")
-st.caption("여러 포트폴리오와 벤치마크를 한 화면에서 비교합니다. 통화는 자동으로 인식됩니다.")
-
 with st.sidebar:
+    tool = st.radio("도구", ["📊 포트폴리오 분석", "🎯 포트폴리오 최적화"],
+                    label_visibility="collapsed")
+    st.divider()
     st.header("⚙️ 공통 설정")
     base_ccy = st.selectbox("기준 통화", ["KRW", "USD", "JPY", "EUR", "GBP"], index=0,
                             help="모든 자산을 이 통화로 환산해 비교합니다.")
@@ -959,6 +1313,20 @@ with st.sidebar:
                "한국 `005930.KS` `086520.KQ`\n\n"
                "미국 `NVDA` `SPY` `QQQ`\n\n"
                "일본 `7203.T`  홍콩 `0700.HK`")
+
+
+IS_OPT = tool.endswith("최적화")
+
+if IS_OPT:
+    st.title("🎯 포트폴리오 최적화")
+    st.caption("종목을 넣으면 목적에 맞는 최적 비중을 계산합니다. "
+               "과거 데이터 기반이며 미래 성과를 보장하지 않습니다.")
+    render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate)
+    st.stop()
+
+st.title("📊 Portfolio Analyzer")
+st.caption("여러 포트폴리오와 벤치마크를 한 화면에서 비교합니다. 통화는 자동으로 인식됩니다.")
+
 
 # ======================================================================
 # 포트폴리오 입력
@@ -1408,6 +1776,46 @@ for name, v in series.items():
 
         st.markdown("**최악의 낙폭 구간**")
         st.dataframe(worst_drawdowns(r), width="stretch", hide_index=True)
+
+        st.markdown("**포트폴리오 성장 기여도**")
+        st.caption("각 종목이 포트폴리오 총 성장률에 얼마나 기여했는지 보여줍니다. "
+                   "막대의 합이 곧 포트폴리오 총 성장률입니다.")
+        try:
+            contrib = growth_contribution(prices, v["weights"], v["rebalance"], r) * 100
+            contrib = contrib.sort_values(ascending=False)
+            total_g = float(contrib.sum())
+
+            labels = list(contrib.index) + ["Portfolio"]
+            values = list(contrib.values) + [total_g]
+            measures = ["relative"] * len(contrib) + ["total"]
+
+            fw = go.Figure(go.Waterfall(
+                orientation="v", measure=measures, x=labels, y=values,
+                text=[f"{x:+.2f}%" for x in values],
+                textposition="outside",
+                connector={"line": {"color": "#d1d5db", "width": 1}},
+                increasing={"marker": {"color": "#0d9488"}},
+                decreasing={"marker": {"color": "#dc2626"}},
+                totals={"marker": {"color": "#c8b89a"}},
+            ))
+            fw.update_layout(height=340, showlegend=False,
+                             margin=dict(l=0, r=0, t=20, b=0),
+                             yaxis=dict(title=None, ticksuffix="%"))
+            st.plotly_chart(fw, width="stretch", key=f"wf_{name}")
+
+            cdf = pd.DataFrame({
+                "종목": contrib.index,
+                "기여도(%p)": contrib.values,
+                "비중(%)": [v["weights"].get(t, np.nan) / sum(v["weights"].values()) * 100
+                           for t in contrib.index],
+            })
+            cdf["총성장 대비"] = cdf["기여도(%p)"] / total_g * 100 if total_g else np.nan
+            st.dataframe(cdf.style.format({"기여도(%p)": "{:+.2f}", "비중(%)": "{:.2f}",
+                                           "총성장 대비": "{:.1f}%"}),
+                         width="stretch", hide_index=True)
+            st.caption(f"기여도 합계 **{total_g:+.2f}%** = 포트폴리오 총 성장률")
+        except Exception as ex:
+            st.warning(f"기여도를 계산하지 못했습니다: {ex}")
 
         st.markdown("**보유 비중 추이**")
         wd = weight_drift(prices, v["weights"], v["rebalance"]).loc[r.index] * 100
