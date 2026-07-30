@@ -19,7 +19,9 @@ import json
 import re
 from pathlib import Path
 
+from scipy.cluster.hierarchy import linkage, to_tree
 from scipy.optimize import minimize
+from scipy.spatial.distance import squareform
 
 import numpy as np
 import pandas as pd
@@ -620,6 +622,83 @@ def build_excel(series: dict, comp: pd.DataFrame, prices: pd.DataFrame,
     return buf.getvalue()
 
 
+def build_opt_excel(alloc, t_oos, t_ins, oos_rows, bdf, rdf, corr,
+                    wd, settings, opt_date) -> bytes:
+    """최적화 결과를 화면과 같은 순서로 엑셀에 담는다."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter",
+                        datetime_format="yyyy-mm-dd", date_format="yyyy-mm-dd") as xw:
+        wb = xw.book
+        f_num = wb.add_format({"num_format": "0.00"})
+        f_date = wb.add_format({"num_format": "yyyy-mm-dd"})
+        f_head = wb.add_format({"bold": True, "bg_color": "#eef2ff",
+                                "border": 1, "align": "center"})
+        f_title = wb.add_format({"bold": True, "font_size": 14})
+
+        def _sheet(df, name, index=True, title=None, widths=None):
+            df.to_excel(xw, sheet_name=name, index=index, startrow=1)
+            ws = xw.sheets[name]
+            ws.write(0, 0, title or name, f_title)
+            off = 1 if index else 0
+            for c, col in enumerate(df.columns):
+                ws.write(1, c + off, str(col), f_head)
+            ws.set_column(0, 0, 26)
+            ws.set_column(off, off + len(df.columns), 15, f_num)
+            return ws
+
+        _sheet(alloc, "1_최적자산배분", False, "최적 자산배분 (Optimal Allocation)")
+        _sheet(t_oos, "2_표본외성과", True, "표본외 성과 (Out-of-Sample)")
+        _sheet(t_ins, "3_표본내성과", True, "표본내 성과 (In-Sample)")
+
+        curves = pd.DataFrame({k: equity_curve(v) for k, v in oos_rows.items()
+                               if v is not None})
+        curves.index.name = "날짜"
+        curves.to_excel(xw, sheet_name="4_성과추이")
+        ws = xw.sheets["4_성과추이"]
+        ws.write(0, 0, "", f_title)
+        ws.set_column(0, 0, 12, f_date)
+        ws.set_column(1, len(curves.columns), 15, f_num)
+        ch = wb.add_chart({"type": "line"})
+        for j, nm in enumerate(curves.columns, start=1):
+            ch.add_series({"name": ["4_성과추이", 0, j],
+                           "categories": ["4_성과추이", 1, 0, len(curves), 0],
+                           "values": ["4_성과추이", 1, j, len(curves), j],
+                           "line": {"width": 1.75}})
+        ch.set_title({"name": "포트폴리오 성과"})
+        ch.set_size({"width": 900, "height": 430})
+        ch.set_legend({"position": "bottom"})
+        ws.insert_chart(1, len(curves.columns) + 2, ch)
+
+        if bdf is not None and not bdf.empty:
+            _sheet(bdf, "5_벤치마크지표", True, "벤치마크 대비 지표")
+        _sheet(rdf, "6_위험기여도", False, "위험 기여도 (Risk Contribution)")
+
+        if wd is not None and not wd.empty:
+            wd2 = wd.copy(); wd2.index.name = "날짜"
+            wd2.to_excel(xw, sheet_name="7_비중추이")
+            ws = xw.sheets["7_비중추이"]
+            ws.set_column(0, 0, 12, f_date)
+            ws.set_column(1, len(wd2.columns), 13, f_num)
+            ca = wb.add_chart({"type": "area", "subtype": "stacked"})
+            for j, nm in enumerate(wd2.columns, start=1):
+                ca.add_series({"name": ["7_비중추이", 0, j],
+                               "categories": ["7_비중추이", 1, 0, len(wd2), 0],
+                               "values": ["7_비중추이", 1, j, len(wd2), j]})
+            ca.set_title({"name": "시간에 따른 비중 변화"})
+            ca.set_y_axis({"min": 0, "max": 100})
+            ca.set_size({"width": 900, "height": 380})
+            ca.set_legend({"position": "bottom"})
+            ws.insert_chart(1, len(wd2.columns) + 2, ca)
+
+        _sheet(corr, "8_자산상관관계", True, "자산 상관관계 (Asset Correlations)")
+        pd.DataFrame(list(settings.items()), columns=["항목", "값"]).to_excel(
+            xw, sheet_name="9_설정", index=False, startrow=1)
+        ws = xw.sheets["9_설정"]
+        ws.write(0, 0, "최적화 설정", f_title)
+        ws.set_column(0, 0, 30); ws.set_column(1, 1, 64)
+    return buf.getvalue()
+
+
 def build_price_frame(tickers, start, end, base_ccy: str, use_dividends: bool):
     """
     여러 종목을 받아 기준통화로 환산된 가격 DataFrame을 만든다.
@@ -965,21 +1044,21 @@ def ratio_omega(r, thr=0.0, **k):
 
 
 RISK_DEFS = {
-    "표준편차": dict(group="변동성 기반", fn=risk_std, kind="risk",
+    "표준편차 (Standard Deviation)": dict(group="변동성 기반", fn=risk_std, kind="risk",
                  desc="가장 표준적인 위험 척도. 상승·하락을 구분하지 않습니다."),
     "평균절대편차 (MAD)": dict(group="변동성 기반", fn=risk_mad, kind="risk",
                           desc="제곱을 쓰지 않아 극단적 하루에 덜 흔들립니다."),
-    "준표준편차": dict(group="하방위험", fn=risk_semisd, kind="risk",
+    "준표준편차 (Semi Std Dev)": dict(group="하방위험", fn=risk_semisd, kind="risk",
                   desc="기준선 아래로 내려간 움직임만 위험으로 봅니다."),
-    "소르티노 비율": dict(group="하방위험", fn=ratio_sortino, kind="ratio",
+    "소르티노 비율 (Sortino Ratio)": dict(group="하방위험", fn=ratio_sortino, kind="ratio",
                     desc="하방 변동성만으로 나눈 위험조정수익. 클수록 좋습니다."),
-    "오메가 비율": dict(group="하방위험", fn=ratio_omega, kind="ratio",
+    "오메가 비율 (Omega Ratio)": dict(group="하방위험", fn=ratio_omega, kind="ratio",
                    desc="이익총합을 손실총합으로 나눈 값. 분포 전체 모양을 봅니다."),
     "조건부 낙폭 (CDaR)": dict(group="낙폭 기반", fn=risk_cdar, kind="risk",
                           desc="최악 5% 낙폭의 평균. 깊은 하락을 집중적으로 억제합니다."),
-    "얼서지수": dict(group="낙폭 기반", fn=risk_ulcer, kind="risk",
+    "얼서지수 (Ulcer Index)": dict(group="낙폭 기반", fn=risk_ulcer, kind="risk",
                  desc="낙폭의 깊이와 지속기간을 함께 반영합니다."),
-    "조건부 VaR (CVaR)": dict(group="꼬리위험", fn=risk_cvar, kind="risk",
+    "조건부 손실 (CVaR)": dict(group="꼬리위험", fn=risk_cvar, kind="risk",
                           desc="최악 5% 일간 손실의 평균. 꼬리 위험에 민감합니다."),
 }
 
@@ -1074,13 +1153,131 @@ def efficient_frontier(mu, cov, n_points=30, wmin=0.0, wmax=1.0):
 # ======================================================================
 # 목표 제약이 있는 일반 최적화
 # ======================================================================
+# ---------------------- 벤치마크 대비 지표 ----------------------
+def bench_metrics(rp: pd.Series, rb: pd.Series, rf=0.0) -> dict:
+    """알파(연)·베타·R²·상승/하락장 포착률."""
+    df = pd.concat([rp, rb], axis=1).dropna()
+    if len(df) < 20:
+        return {k: np.nan for k in
+                ("알파(연,%)", "베타", "R²", "상승장 포착률(%)", "하락장 포착률(%)")}
+    a, b = df.iloc[:, 0], df.iloc[:, 1]
+    var = b.var()
+    beta = float(a.cov(b) / var) if var > 0 else np.nan
+    alpha = float(((a.mean() - rf / TRADING_DAYS)
+                   - beta * (b.mean() - rf / TRADING_DAYS)) * TRADING_DAYS * 100)
+    r2 = float(a.corr(b) ** 2)
+
+    def cap(mask):
+        k = int(mask.sum())
+        if k < 2:
+            return np.nan
+        pa = float((1 + a[mask]).prod() ** (1 / k) - 1)
+        pb = float((1 + b[mask]).prod() ** (1 / k) - 1)
+        return np.nan if abs(pb) < 1e-12 else pa / pb * 100
+
+    return {"알파(연,%)": alpha, "베타": beta, "R²": r2,
+            "상승장 포착률(%)": cap(b > 0), "하락장 포착률(%)": cap(b < 0)}
+
+
+# ---------------------- HRP (계층적 위험 분산) ----------------------
+def hrp_weights(R: pd.DataFrame) -> np.ndarray:
+    """
+    상관관계로 종목을 계층 군집화한 뒤, 트리를 따라 역분산 배분한다.
+    기대수익률을 전혀 추정하지 않으므로 과최적화에 상대적으로 강하다.
+    """
+    n = R.shape[1]
+    if n == 1:
+        return np.array([1.0])
+    corr = R.corr().values
+    cov = R.cov().values
+    d = np.sqrt(np.clip((1 - corr) / 2, 0, 1))
+    np.fill_diagonal(d, 0.0)
+    Z = linkage(squareform(d, checks=False), "single")
+    root, _ = to_tree(Z, rd=True)
+    order = root.pre_order(lambda x: x.id)
+
+    w = np.ones(n)
+    clusters = [order]
+    while clusters:
+        nxt = []
+        for c in clusters:
+            if len(c) <= 1:
+                continue
+            h = len(c) // 2
+            left, right = c[:h], c[h:]
+
+            def cvar(items):
+                sub = cov[np.ix_(items, items)]
+                iv = 1 / np.diag(sub)
+                iv = iv / iv.sum()
+                return float(iv @ sub @ iv)
+
+            vl, vr = cvar(left), cvar(right)
+            a = 1 - vl / (vl + vr) if (vl + vr) > 0 else 0.5
+            w[left] *= a
+            w[right] *= (1 - a)
+            nxt += [left, right]
+        clusters = nxt
+    return w / w.sum()
+
+
+# ---------------------- 주기적 재최적화 (워크포워드) ----------------------
+REOPT_FREQ = {"한 번만": None, "분기마다": "QS", "매년": "YS"}
+
+
+def walk_forward(prices, tickers, start, freq_code, train_win, rebal,
+                 goal, risk_name, rf, wmin, wmax, min_ret, max_vol,
+                 progress=None):
+    """
+    각 재최적화 시점까지의 데이터로만 비중을 구해 다음 구간에 적용하고 이어붙인다.
+    실제로 운용했다면 어땠을지를 재현한다.
+    """
+    dates = [pd.Timestamp(d) for d in
+             pd.date_range(start, prices.index[-1], freq=freq_code)]
+    if not dates:
+        return None, []
+    segs, hist = [], []
+    for i, d in enumerate(dates):
+        tr_start = prices.index[0] if train_win is None else max(prices.index[0], d - train_win)
+        tr = prices.loc[tr_start:d]
+        if len(tr) < MIN_TRAIN_DAYS:
+            continue
+        R = tr[tickers].pct_change().dropna()
+        try:
+            if goal.startswith("HRP"):
+                w = hrp_weights(R)
+            else:
+                w, _, _ = optimize(R, goal, risk_name, rf, wmin, wmax, min_ret, max_vol)
+        except Exception:
+            continue
+        end = dates[i + 1] if i + 1 < len(dates) else prices.index[-1]
+        seg = prices.loc[d:end]
+        if len(seg) < 2:
+            continue
+        W = {t: float(x) for t, x in zip(tickers, w)}
+        try:
+            segs.append(portfolio_returns(seg, W, rebal))
+        except Exception:
+            continue
+        hist.append((d, w))
+        if progress:
+            progress((i + 1) / len(dates))
+    if not segs:
+        return None, []
+    full = pd.concat(segs)
+    full = full[~full.index.duplicated(keep="first")].sort_index()
+    return full, hist
+
+
 OPT_GOALS = {
     "위험 대비 수익 최대화": "선택한 위험 지표로 나눈 초과수익을 극대화합니다. "
                      "위험 지표를 표준편차로 두면 샤프지수 최대화와 같습니다.",
     "위험 최소화": "수익률과 무관하게 선택한 위험 지표를 최소화합니다.",
     "수익률 최대화": "제약 조건 안에서 기대수익률만 극대화합니다.",
-    "위험균형 (리스크 패리티)": "각 종목의 위험 기여도가 같아지도록 배분합니다. "
-                        "이 방식은 표준편차(공분산)를 사용합니다.",
+    "위험균형 (Risk Parity)": "각 종목의 위험 기여도가 같아지도록 배분합니다. "
+                        "표준편차(공분산) 기반으로 계산합니다.",
+    "계층적 위험 분산 (HRP)": "상관관계로 종목을 묶은 뒤 트리를 따라 역분산 배분합니다. "
+                       "기대수익률을 추정하지 않아 과최적화에 상대적으로 강합니다.",
 }
 
 
@@ -1132,6 +1329,9 @@ def optimize(R: pd.DataFrame, goal: str, risk_name: str, rf=0.0,
     if max_vol is not None:
         extra.append({"type": "ineq",
                       "fun": lambda w: max_vol - float(np.sqrt(w @ cov @ w))})
+
+    if goal.startswith("계층적"):
+        return hrp_weights(R), mu, cov
 
     if goal.startswith("위험균형"):
         cons = [{"type": "eq", "fun": lambda w: w.sum() - 1.0}] + extra
@@ -1214,7 +1414,7 @@ def _cmp_table(rows: dict, rf: float) -> pd.DataFrame:
                 chg[c] = np.nan
             else:
                 chg[c] = (n[c] - o[c]) / abs(o[c]) * 100
-        df.loc["변화율(%)"] = chg
+        df.loc["변화율 (Change, %)"] = chg
     return df
 
 
@@ -1227,7 +1427,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         ])[OPT_COLS]
 
     # ------------------------------------------------------------------
-    st.subheader("1️⃣ 현재 포트폴리오")
+    st.subheader("1️⃣ 현재 포트폴리오 (Current Holdings)")
     st.caption("지금 보유 중인 종목과 비중을 넣으세요. 최적화 결과는 **이 구성과 비교**해서 보여드립니다. "
                "특정 종목을 제한하려면 최소·최대 편입비중을 조정하세요.")
 
@@ -1310,7 +1510,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         st.error(f"확인되지 않는 티커: {', '.join(bad)}")
 
     # ------------------------------------------------------------------
-    st.subheader("2️⃣ 최적화 설정")
+    st.subheader("2️⃣ 최적화 설정 (Settings)")
     o1, o2 = st.columns([1, 1])
     goal = o1.selectbox("목적", list(OPT_GOALS))
     o1.caption(OPT_GOALS[goal])
@@ -1320,12 +1520,12 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         groups.setdefault(v["group"], []).append(k)
     risk_labels = [f"{g} · {k}" for g in groups for k in groups[g]]
     risk_pick = o2.selectbox("위험을 정의하는 방법", risk_labels,
-                             disabled=goal.startswith("위험균형"),
+                             disabled=goal.startswith(("위험균형", "계층적")),
                              help="목적 계산에 쓰이는 위험 척도입니다.")
     risk_name = risk_pick.split(" · ", 1)[1]
     o2.caption(RISK_DEFS[risk_name]["desc"]
-               if not goal.startswith("위험균형")
-               else "위험균형은 표준편차(공분산) 기반으로 계산됩니다.")
+               if not goal.startswith(("위험균형", "계층적"))
+               else "이 방식은 위험 지표 선택과 무관하게 공분산 구조로 계산됩니다.")
 
     st.markdown("**목표 제약** — 비워두면 제약 없이 계산합니다")
     g1, g2 = st.columns(2)
@@ -1339,11 +1539,15 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         st.caption("두 값은 **이상 / 이하** 조건으로 적용됩니다. "
                    "동시에 만족할 수 없으면 달성 가능한 수치를 알려드립니다.")
 
-    p1, p2, p3 = st.columns(3)
-    cut_label = p1.selectbox("최적화 기준일", list(CUTOFFS), index=2,
+    p1, p2, p3, p4 = st.columns(4)
+    reopt = p4.selectbox("재최적화 주기", list(REOPT_FREQ), index=0,
+                         help="'한 번만'은 기준일에 정한 비중을 끝까지 유지합니다. "
+                              "분기·매년을 고르면 그 주기마다 그 시점까지의 데이터로 "
+                              "비중을 다시 계산해, 실제 운용을 재현합니다.")
+    cut_label = p1.selectbox("최적화 기준일 (Optimization Date)", list(CUTOFFS), index=2,
                              help="이 시점까지의 데이터로만 비중을 계산하고, "
                                   "이후 구간으로 실제 성과를 채점합니다.")
-    train_label = p2.selectbox("학습 기간", list(TRAIN_WINDOWS), index=1,
+    train_label = p2.selectbox("학습 기간 (Training Period)", list(TRAIN_WINDOWS), index=1,
                                help="비중을 계산하는 데 쓸 과거 데이터의 길이입니다.")
     rebal = p3.selectbox("리밸런싱", REBAL_OPTIONS, index=2)
 
@@ -1446,7 +1650,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                  f"({len(oos_px):,}일)")
 
     # ---------------- 최적 자산배분 ----------------
-    st.subheader("3️⃣ 최적 자산배분")
+    st.subheader("3️⃣ 최적 자산배분 (Optimal Allocation)")
     alloc = pd.DataFrame({
         "티커": tickers,
         "종목명": [meta.get(t, {}).get("name", t) for t in tickers],
@@ -1490,20 +1694,39 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         except Exception:
             return None
 
-    st.subheader("4️⃣ 성과 비교")
+    st.subheader("4️⃣ 성과 비교 (Performance)")
 
-    st.markdown("#### 표본외 구간 — 최적화 기준일 이후")
+    st.markdown("#### 표본외 구간 (Out-of-Sample) — 최적화 기준일 이후")
     st.caption("최적화가 **보지 않은** 데이터입니다. 실제 성적표에 해당하며, "
                "최적화가 원본보다 나쁠 수도 있습니다.")
     oos_rows = {"원본 포트폴리오": _bt(oos_px, W_now),
                 "최적화 포트폴리오": _bt(oos_px, W_opt)}
+
+    wf_r, wf_hist = None, []
+    if REOPT_FREQ[reopt] is not None:
+        bar = st.progress(0.0, text="주기적 재최적화 계산 중...")
+        try:
+            wf_r, wf_hist = walk_forward(
+                prices, tickers, opt_date, REOPT_FREQ[reopt], tw, rebal,
+                goal, risk_name, rf_rate, wmin, wmax, min_ret, max_vol,
+                progress=lambda x: bar.progress(min(1.0, x),
+                                                text=f"주기적 재최적화 계산 중... {x*100:.0f}%"))
+        except Exception as ex:
+            st.warning(f"재최적화 계산 실패: {ex}")
+        bar.empty()
+        if wf_r is not None and len(wf_r) > 5:
+            oos_rows[f"재최적화 ({reopt})"] = wf_r
+            st.info(f"🔁 **{reopt}** 재최적화를 {len(wf_hist)}회 수행했습니다. "
+                    f"각 시점까지의 데이터만 사용했으므로 미래 정보가 섞이지 않습니다.")
+
     b_oos = _bench(oos_px)
     if b_oos is not None:
         oos_rows[f"벤치마크 ({bench_norm})"] = b_oos
     t_oos = _cmp_table(oos_rows, rf_rate)
     st.dataframe(t_oos.style.format("{:.2f}", na_rep="-"), width="stretch")
 
-    with st.expander("표본내 구간 — 학습에 쓰인 데이터 (참고용)", expanded=False):
+    t_ins = pd.DataFrame()
+    with st.expander("표본내 구간 (In-Sample) — 학습에 쓰인 데이터 · 참고용", expanded=False):
         st.caption("최적화가 이 구간을 보고 비중을 정했으므로 좋게 나오는 것이 당연합니다. "
                    "성과 판단의 근거로 삼으면 안 됩니다.")
         ins_rows = {"원본 포트폴리오": _bt(train_px, W_now),
@@ -1511,11 +1734,11 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         b_ins = _bench(train_px)
         if b_ins is not None:
             ins_rows[f"벤치마크 ({bench_norm})"] = b_ins
-        st.dataframe(_cmp_table(ins_rows, rf_rate).style.format("{:.2f}", na_rep="-"),
-                     width="stretch")
+        t_ins = _cmp_table(ins_rows, rf_rate)
+        st.dataframe(t_ins.style.format("{:.2f}", na_rep="-"), width="stretch")
 
     # ---------------- 성과 차트 ----------------
-    st.subheader("5️⃣ 포트폴리오 성과")
+    st.subheader("5️⃣ 포트폴리오 성과 (Growth of Investment)")
     unit = 10_000_000 if base_ccy == "KRW" else 10_000
     st.caption(f"최적화 기준일에 {unit:,} {base_ccy}를 투자했다면 어떻게 됐을지 보여줍니다.")
     fp = go.Figure()
@@ -1534,8 +1757,24 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                      yaxis=dict(title=None, tickformat=",.0f"))
     st.plotly_chart(fp, width="stretch")
 
+    # ---------------- 벤치마크 대비 지표 ----------------
+    if b_oos is not None:
+        st.subheader("6️⃣ 벤치마크 대비 지표 (Benchmark Metrics)")
+        st.caption("검증 구간 기준입니다. **알파(Alpha)** 는 시장 노출만으로 설명되지 않는 "
+                   "초과수익, **베타(Beta)** 는 시장 대비 민감도, **R²** 는 시장으로 설명되는 "
+                   "비율입니다. **포착률(Capture Ratio)** 은 시장이 오를 때/내릴 때 "
+                   "내 포트폴리오가 그중 몇 %를 따라갔는지 보여줍니다 — "
+                   "상승은 높고 하락은 낮을수록 유리합니다.")
+        brows = {}
+        for label, r in oos_rows.items():
+            if r is None or label.startswith("벤치마크"):
+                continue
+            brows[label] = bench_metrics(r, b_oos, rf_rate)
+        bdf = pd.DataFrame(brows).T
+        st.dataframe(bdf.style.format("{:.2f}", na_rep="-"), width="stretch")
+
     # ---------------- 위험 기여도 · 효율적 투자선 ----------------
-    st.subheader("6️⃣ 위험 기여도")
+    st.subheader("7️⃣ 위험 기여도 (Risk Contribution)")
     rc = risk_contributions(w_opt, cov)
     rc_pct = rc / rc.sum() * 100 if rc.sum() else np.zeros_like(rc)
     rdf = pd.DataFrame({"티커": tickers, "최적 비중(%)": w_opt * 100,
@@ -1545,7 +1784,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
     st.caption("전체 변동성에서 각 종목이 차지하는 몫입니다. 비중이 낮아도 변동이 크면 높게 나옵니다. "
                "학습 구간 기준으로 계산했습니다.")
 
-    with st.expander("효율적 투자선 (학습 구간 기준)", expanded=False):
+    with st.expander("효율적 투자선 (Efficient Frontier) — 학습 구간 기준", expanded=False):
         ef = efficient_frontier(mu, cov, 25, wmin, wmax)
         if ef:
             fe = go.Figure()
@@ -1576,9 +1815,10 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
             st.info("제약 조건이 빡빡해 투자선을 그릴 수 없습니다.")
 
     # ---------------- 추가 분석 ----------------
-    st.subheader("7️⃣ 시간에 따른 비중 변화")
+    st.subheader("8️⃣ 시간에 따른 비중 변화 (Allocation Over Time)")
     st.caption("검증 구간에서 실제 보유 비중이 어떻게 흘러갔는지 보여줍니다. "
                "리밸런싱 주기에 따라 모양이 달라집니다.")
+    wd = pd.DataFrame()
     try:
         r_opt_oos = oos_rows["최적화 포트폴리오"]
         wd = (weight_drift(oos_px, W_opt, rebal).loc[r_opt_oos.index] * 100)
@@ -1597,7 +1837,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                            format_func=lambda x: {63: "3개월", 126: "6개월", 252: "1년"}[x],
                            help="아래 세 차트의 이동 계산 구간입니다.")
 
-    st.subheader("8️⃣ 샤프지수 추이")
+    st.subheader("9️⃣ 샤프지수 추이 (Rolling Sharpe)")
     st.caption(f"{'3개월' if win==63 else '6개월' if win==126 else '1년'} 이동 샤프지수입니다. "
                "특정 시기에만 좋았는지, 꾸준했는지를 보여줍니다.")
     fs = go.Figure()
@@ -1614,7 +1854,10 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                      legend=dict(orientation="h", y=1.02, yanchor="bottom"))
     st.plotly_chart(fs, width="stretch")
 
-    st.subheader("9️⃣ 낙폭")
+    st.subheader("🔟 낙폭 (Drawdowns)")
+    st.caption("직전 고점 대비 얼마나 내려와 있는지를 매일 표시한 것입니다. "
+               "가장 깊이 파인 지점이 곧 위 비교표의 **최대낙폭(MDD)** 이며, "
+               "0으로 돌아오는 데 걸린 기간이 원금 회복에 걸린 시간입니다.")
     fd = go.Figure()
     for label, r in oos_rows.items():
         if r is None or len(r) < 2:
@@ -1628,7 +1871,11 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                      legend=dict(orientation="h", y=1.02, yanchor="bottom"))
     st.plotly_chart(fd, width="stretch")
 
-    st.subheader("🔟 변동성 추이")
+    st.subheader("1️⃣1️⃣ 변동성 추이 (Rolling Volatility)")
+    st.caption(f"일별 수익률의 이동 표준편차를 연율화(×√252)한 값입니다. "
+               f"위 슬라이더에서 고른 {'3개월' if win==63 else '6개월' if win==126 else '1년'} "
+               f"구간을 뒤돌아보며 계산하므로, 값이 치솟은 시점은 그 직전에 큰 등락이 "
+               f"있었다는 뜻입니다.")
     fv = go.Figure()
     for label, r in oos_rows.items():
         if r is None or len(r) < win + 5:
@@ -1642,7 +1889,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                      legend=dict(orientation="h", y=1.02, yanchor="bottom"))
     st.plotly_chart(fv, width="stretch")
 
-    st.subheader("1️⃣1️⃣ 자산 상관관계")
+    st.subheader("1️⃣2️⃣ 자산 상관관계 (Asset Correlations)")
     st.caption("검증 구간의 일별 수익률 기준입니다. 1에 가까우면 같이 움직이고, "
                "0에 가까우면 서로 무관하며, 음수면 반대로 움직입니다. "
                "낮은 값이 많을수록 분산 효과가 큽니다.")
@@ -1660,9 +1907,39 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
     st.dataframe(corr.style.format("{:.2f}").map(_corr_color), width="stretch")
 
     st.divider()
-    st.download_button("📥 최적 비중 CSV", alloc.to_csv(index=False).encode("utf-8-sig"),
+    st.subheader("📥 결과 내보내기")
+    opt_settings = {
+        "목적": goal,
+        "위험 정의": _rn,
+        "목표 제약": " · ".join(_cons) if _cons else "없음",
+        "재최적화 주기": reopt,
+        "최적화 기준일": str(opt_date.date()),
+        "학습 기간": f"{train_label} ({train_px.index[0].date()} ~ {opt_date.date()})",
+        "검증 구간": f"{opt_date.date()} ~ {last.date()} ({len(oos_px):,}일)",
+        "리밸런싱": rebal,
+        "기준 통화": base_ccy,
+        "무위험 수익률": f"{rf_rate*100:.2f}%",
+        "벤치마크": bench_norm or "-",
+        "배당 처리": "재투자 (총수익)" if use_div else "주가만 (배당 제외)",
+        "생성 시각": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    x1, x2 = st.columns(2)
+    try:
+        xb = build_opt_excel(alloc, t_oos, t_ins, oos_rows,
+                             bdf if b_oos is not None else None,
+                             rdf, corr, wd, opt_settings, opt_date)
+        x1.download_button("📊 엑셀 파일 받기 (차트 포함)", xb,
+                           f"optimization_{pd.Timestamp.now():%Y%m%d_%H%M}.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           width="stretch")
+    except Exception as ex:
+        x1.error(f"엑셀 생성 실패: {ex}")
+    x2.download_button("📄 최적 비중 CSV", alloc.to_csv(index=False).encode("utf-8-sig"),
                        f"optimal_weights_{pd.Timestamp.now():%Y%m%d_%H%M}.csv",
                        "text/csv", width="stretch")
+    st.caption("엑셀은 화면과 같은 순서(최적자산배분 → 표본외성과 → 표본내성과 → 성과추이 → "
+               "벤치마크지표 → 위험기여도 → 비중추이 → 자산상관관계 → 설정)로 구성되며, "
+               "성과추이와 비중추이에는 엑셀 네이티브 차트가 포함됩니다.")
     st.caption("최적화는 학습 구간의 평균·변동성·상관관계가 앞으로도 유지된다고 가정합니다. "
                "특히 기대수익률 추정은 오차가 커서, 표본외 성과가 원본보다 나쁜 경우도 흔합니다. "
                "교육·참고용이며 투자 자문이 아닙니다.")
@@ -1857,7 +2134,7 @@ if "_pending_load" in st.session_state:
             st.session_state[f"rebal_{i}"] = p.get("rebalance", REBAL_QUARTER)
         st.success(f"**{cfg.get('label', key)}** 구성을 불러왔습니다.")
 
-st.subheader("1️⃣ 포트폴리오 구성")
+st.subheader("1️⃣ 포트폴리오 구성 (Holdings)")
 st.caption("티커는 `005930.KS` · `005930 KS`(블룸버그) · `005930`(숫자만) 모두 인식합니다. "
            "엑셀에서 **티커·비중 두 열**을 복사해 첫 칸에 붙여넣으면 한 번에 채워집니다.")
 
@@ -2146,7 +2423,7 @@ st.success(f"✅ 분석 완료 · 공통 거래일 **{len(common):,}일** "
 # ======================================================================
 # 결과
 # ======================================================================
-st.subheader("2️⃣ 성과 차트")
+st.subheader("2️⃣ 성과 차트 (Performance)")
 
 # --- 선 색상 지정 ---
 default_color = {}
@@ -2195,7 +2472,7 @@ if log_scale:
 st.plotly_chart(fig, width="stretch")
 
 # ---------------- Drawdown ----------------
-st.subheader("3️⃣ Drawdown 비교")
+st.subheader("3️⃣ 낙폭 비교 (Drawdowns)")
 fig2 = go.Figure()
 for name, v in series.items():
     dd = drawdown_series(v["returns"]) * 100
@@ -2209,47 +2486,47 @@ fig2.update_layout(height=360, hovermode="x unified", yaxis_title="Drawdown (%)"
 st.plotly_chart(fig2, width="stretch")
 
 # ---------------- 종합 비교표 ----------------
-st.subheader("4️⃣ 종합 성과 비교")
+st.subheader("4️⃣ 종합 성과 비교 (Summary)")
 rows = []
 for name, v in series.items():
     r = v["returns"]
     rows.append({
         "": ("📈 " if v["kind"] == "portfolio" else "📊 ") + name,
-        "최종배수": equity_curve(r).iloc[-1],
+        "누적성장배수": equity_curve(r).iloc[-1],
         "CAGR (%)": cagr(r) * 100,
         "변동성 (%)": annual_vol(r) * 100,
         "MDD (%)": max_drawdown(r) * 100,
-        "Sharpe": sharpe_ratio(r, rf_rate),
-        "Sortino": sortino_ratio(r, rf_rate),
-        "Calmar": calmar_ratio(r),
-        "Ulcer": ulcer_index(r),
+        "샤프지수": sharpe_ratio(r, rf_rate),
+        "소르티노": sortino_ratio(r, rf_rate),
+        "칼마": calmar_ratio(r),
+        "얼서지수": ulcer_index(r),
     })
 comp = pd.DataFrame(rows).set_index("")
 st.dataframe(
     comp.style.format("{:.2f}")
-        .highlight_max(subset=["최종배수", "CAGR (%)", "MDD (%)", "Sharpe",
+        .highlight_max(subset=["누적성장배수", "CAGR (%)", "MDD (%)", "Sharpe",
                                "Sortino", "Calmar"], color="#dcfce7")
         .highlight_min(subset=["변동성 (%)", "Ulcer"], color="#dcfce7"),
     width="stretch")
 st.caption("초록색 = 각 지표에서 가장 좋은 값 (MDD는 0에 가까울수록 좋음). 📈 포트폴리오 · 📊 벤치마크")
 
 # ---------------- 포트폴리오별 상세 ----------------
-st.subheader("5️⃣ 포트폴리오별 상세")
+st.subheader("5️⃣ 포트폴리오별 상세 (Details)")
 for name, v in series.items():
     if v["kind"] != "portfolio":
         continue
     with st.expander(f"📈 {name} — {v['rebalance']}", expanded=False):
         r = v["returns"]
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("CAGR", f"{cagr(r)*100:.2f}%")
-        m2.metric("MDD", f"{max_drawdown(r)*100:.2f}%")
-        m3.metric("Sharpe", f"{sharpe_ratio(r, rf_rate):.2f}")
-        m4.metric("현재 낙폭", f"{drawdown_series(r).iloc[-1]*100:.2f}%")
+        m1.metric("연평균 수익률 (CAGR)", f"{cagr(r)*100:.2f}%")
+        m2.metric("최대낙폭 (MDD)", f"{max_drawdown(r)*100:.2f}%")
+        m3.metric("샤프지수 (Sharpe)", f"{sharpe_ratio(r, rf_rate):.2f}")
+        m4.metric("현재 낙폭 (Current DD)", f"{drawdown_series(r).iloc[-1]*100:.2f}%")
 
-        st.markdown("**최악의 낙폭 구간**")
+        st.markdown("**최대 낙폭 구간 (Worst Drawdowns)**")
         st.dataframe(worst_drawdowns(r), width="stretch", hide_index=True)
 
-        st.markdown("**포트폴리오 성장 기여도**")
+        st.markdown("**성장 기여도 (Contribution to Growth)**")
         st.caption("각 종목이 포트폴리오 총 성장률에 얼마나 기여했는지 보여줍니다. "
                    "막대의 합이 곧 포트폴리오 총 성장률입니다.")
         try:
@@ -2289,7 +2566,7 @@ for name, v in series.items():
         except Exception as ex:
             st.warning(f"기여도를 계산하지 못했습니다: {ex}")
 
-        st.markdown("**보유 비중 추이**")
+        st.markdown("**보유 비중 추이 (Allocation Drift)**")
         wd = weight_drift(prices, v["weights"], v["rebalance"]).loc[r.index] * 100
         f3 = go.Figure()
         for t in wd.columns:
@@ -2299,7 +2576,7 @@ for name, v in series.items():
                          yaxis_range=[0, 100], margin=dict(l=0, r=0, t=10, b=0))
         st.plotly_chart(f3, width="stretch", key=f"wd_{name}")
 
-        st.markdown("**월별 수익률 (%)**")
+        st.markdown("**월별 수익률 (Monthly Returns, %)**")
         st.dataframe(style_monthly(monthly_table(r)), width="stretch")
 
 # ---------------- 다운로드 ----------------
