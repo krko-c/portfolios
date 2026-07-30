@@ -699,13 +699,15 @@ def build_opt_excel(alloc, t_oos, t_ins, oos_rows, bdf, rdf, corr,
     return buf.getvalue()
 
 
-def build_price_frame(tickers, start, end, base_ccy: str, use_dividends: bool):
+def build_price_frame(tickers, start, end, base_ccy: str, use_dividends: bool,
+                      fx_hedge: bool = False, gap_fill: bool = False):
     """
-    여러 종목을 받아 기준통화로 환산된 가격 DataFrame을 만든다.
-    반환: (prices DataFrame, meta dict)
+    여러 종목을 기준통화로 환산한 가격 DataFrame.
+    fx_hedge=True 면 환율 변동을 제거(환헤지 가정)하고 종목 자체 수익률만 본다.
+    gap_fill=True 면 국가별 휴장일 차이를 직전 종가로 메워 공통 거래일 손실을 줄인다.
+    반환: (prices, meta, fx_used)
     """
-    series, meta = {}, {}
-    fx_cache = {}
+    series, meta, fx_cache = {}, {}, {}
 
     for t in tickers:
         d = load_ticker(t, start, end)
@@ -713,14 +715,17 @@ def build_price_frame(tickers, start, end, base_ccy: str, use_dividends: bool):
         ccy = d["currency"]
         meta[t] = {"currency": ccy, "name": d["name"], "rows": len(px)}
 
-        if ccy != base_ccy:
+        if ccy != base_ccy and not fx_hedge:
             if ccy not in fx_cache:
                 fx_cache[ccy] = load_fx(ccy, base_ccy, start, end)
             fx = fx_cache[ccy].reindex(px.index).ffill().bfill()
             px = px * fx
         series[t] = px
 
-    return pd.DataFrame(series).dropna(), meta
+    df = pd.DataFrame(series)
+    if gap_fill:
+        df = df.ffill()
+    return df.dropna(), meta, fx_cache
 
 
 # ======================================================================
@@ -776,7 +781,88 @@ def weight_drift(prices: pd.DataFrame, weights: dict, rebalance: str) -> pd.Data
     return val.div(val.sum(axis=1), axis=0)
 
 
-# ---------------------- 성과 지표 ----------------------
+# ---------------------- 거래비용 · 회전율 ----------------------
+def turnover_series(prices: pd.DataFrame, weights: dict, rebalance: str) -> pd.Series:
+    """
+    각 거래일의 회전율 Σ|바뀐 비중|.
+    '오늘 시작 비중'과 '어제 종료 비중(가격 변동으로 흘러간 상태)'의 차이가 실제 거래량이다.
+    Buy&Hold 는 거래가 없으므로 0, 매일 리밸런싱은 매일 발생한다.
+    """
+    tickers = list(weights)
+    d = prices[tickers].dropna().pct_change().dropna()
+    ws = start_weights(prices, weights, rebalance).reindex(d.index)
+    v = ws * (1 + d)
+    w_end_prev = v.div(v.sum(axis=1), axis=0).shift(1)
+    tno = (ws - w_end_prev).abs().sum(axis=1)
+    tno.iloc[0] = 1.0                      # 최초 매수
+    return tno.fillna(0.0)
+
+
+def apply_cost(r: pd.Series, tno: pd.Series, cost_bp: float) -> pd.Series:
+    """편도 거래비용(bp)을 회전율에 곱해 일별 수익률에서 차감."""
+    if not cost_bp:
+        return r
+    return r - tno.reindex(r.index).fillna(0.0) * (cost_bp / 10000.0)
+
+
+def annual_turnover(tno: pd.Series) -> float:
+    if len(tno) < 2:
+        return np.nan
+    yrs = (tno.index[-1] - tno.index[0]).days / 365.25
+    body = tno.iloc[1:]                    # 최초 매수 제외
+    return float(body.sum() / yrs) if yrs > 0 else np.nan
+
+
+# ---------------------- 적립식 (DCA) ----------------------
+def xirr(cashflows, dates, lo=-0.95, hi=10.0):
+    """현금흐름 내부수익률(연율). 이분법으로 안정적으로 해를 찾는다."""
+    if not cashflows or len(cashflows) < 2:
+        return np.nan
+    t0 = dates[0]
+
+    def npv(rate):
+        return sum(cf / ((1 + rate) ** ((d - t0).days / 365.25))
+                   for cf, d in zip(cashflows, dates))
+    try:
+        if npv(lo) * npv(hi) > 0:
+            return np.nan
+        for _ in range(200):
+            mid = (lo + hi) / 2
+            if npv(lo) * npv(mid) <= 0:
+                hi = mid
+            else:
+                lo = mid
+        return (lo + hi) / 2
+    except Exception:
+        return np.nan
+
+
+def dca_result(r: pd.Series, monthly: float, start_value: float = 0.0):
+    """
+    매월 첫 거래일에 monthly 만큼 추가 납입.
+    반환: (평가액 시계열, 누적 원금 시계열, 납입일 목록)
+    """
+    curve = (1 + r).cumprod()
+    idx = curve.index
+    first_of_month = pd.Series(idx, index=idx).groupby(
+        [idx.year, idx.month]).first().values
+    units, invested = 0.0, 0.0
+    if start_value > 0:
+        units += start_value / float(curve.iloc[0])
+        invested += start_value
+    vals, invs, buys = [], [], []
+    contrib = {pd.Timestamp(d) for d in first_of_month}
+    for dt, c in curve.items():
+        if dt in contrib and monthly > 0:
+            units += monthly / float(c)
+            invested += monthly
+            buys.append(dt)
+        vals.append(units * float(c))
+        invs.append(invested)
+    return (pd.Series(vals, index=idx), pd.Series(invs, index=idx), buys)
+
+
+# ---------------------- 성과 지표
 def equity_curve(r, start_value=1.0):
     """
     투자 직전 시점(=start_value)을 맨 앞에 붙여서 곡선이 1.00에서 출발하게 한다.
@@ -1561,7 +1647,9 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
 
     run_opt = st.button("🎯 포트폴리오 최적화", type="primary", width="stretch",
                         disabled=bool(bad) or live.empty)
-    if not run_opt:
+    if run_opt:
+        st.session_state["_opt_has_run"] = True
+    if not st.session_state.get("_opt_has_run"):
         st.info("👆 종목과 현재 비중을 넣고 **포트폴리오 최적화**를 눌러주세요.")
         return
 
@@ -1578,7 +1666,8 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
 
     try:
         with st.spinner("데이터 수집 중..."):
-            prices, meta = build_price_frame(need, start_date, end_date, base_ccy, use_div)
+            prices, meta, fx_used = build_price_frame(
+                need, start_date, end_date, base_ccy, use_div, fx_hedge, gap_fill)
     except Exception as ex:
         st.error(f"데이터를 가져오지 못했습니다: {ex}")
         return
@@ -1678,6 +1767,55 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
     st.dataframe(alloc.style.format({"원본 비중(%)": "{:.2f}", "최적 비중(%)": "{:.2f}",
                                      "변화(%p)": "{:+.2f}"}),
                  width="stretch", hide_index=True)
+
+    with st.expander("🔬 비중 안정성 점검 (Weight Stability)", expanded=False):
+        st.caption("학습 기간을 바꿔가며 최적 비중이 얼마나 흔들리는지 봅니다. "
+                   "기간을 조금 바꿨는데 비중이 크게 달라진다면, 그 결과는 "
+                   "우연에 기댄 것일 수 있습니다.")
+        stab_rows = {}
+        for lbl in ["6개월", "1년", "2년", "3년"]:
+            twx = TRAIN_WINDOWS[lbl]
+            tsx = prices.index[0] if twx is None else max(prices.index[0], opt_date - twx)
+            tpx = prices.loc[tsx:opt_date]
+            if len(tpx) < MIN_TRAIN_DAYS:
+                continue
+            Rx = tpx[tickers].pct_change().dropna()
+            try:
+                if goal.startswith("계층적"):
+                    wx = hrp_weights(Rx)
+                else:
+                    wx, _, _ = optimize(Rx, goal, risk_name, rf_rate,
+                                        wmin, wmax, min_ret, max_vol)
+                stab_rows[lbl] = pd.Series(wx * 100, index=tickers)
+            except Exception:
+                continue
+        if len(stab_rows) >= 2:
+            sdf = pd.DataFrame(stab_rows)
+            sdf["변동폭(%p)"] = sdf.max(axis=1) - sdf.min(axis=1)
+            st.dataframe(sdf.style.format("{:.2f}"), width="stretch")
+            worst = float(sdf["변동폭(%p)"].max())
+            if worst > 30:
+                st.warning(f"학습 기간에 따라 비중이 최대 **{worst:.1f}%p** 까지 달라집니다. "
+                           f"결과가 불안정하니 종목 수를 줄이거나 비중 상한을 두는 것을 "
+                           f"고려해보세요.")
+            else:
+                st.success(f"학습 기간을 바꿔도 비중 변동폭이 최대 {worst:.1f}%p 로 "
+                           f"비교적 안정적입니다.")
+        else:
+            st.info("비교할 만큼의 데이터가 부족합니다.")
+
+    if st.button("↗️ 이 비중으로 상세 분석하기", width="stretch",
+                 help="최적 비중을 포트폴리오 분석 화면으로 넘겨 자세히 살펴봅니다."):
+        st.session_state["df_0"] = pd.DataFrame(
+            [{"티커": t, "비중(%)": round(float(x) * 100, 2), "종목명": ""}
+             for t, x in zip(tickers, w_opt)])[COLS]
+        st.session_state["nrow_0"] = len(tickers)
+        st.session_state["name_0"] = f"최적화 ({goal})"
+        st.session_state["rebal_0"] = rebal
+        st.session_state["_tool"] = "📊 포트폴리오 분석"
+        st.session_state["_has_run"] = False
+        st.success("포트폴리오 분석 화면으로 옮겼습니다. 왼쪽 도구에서 확인하세요.")
+        st.rerun()
 
     # ---------------- 성과 비교 ----------------
     def _bt(px, W):
@@ -1951,7 +2089,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
 # ======================================================================
 with st.sidebar:
     tool = st.radio("도구", ["📊 포트폴리오 분석", "🎯 포트폴리오 최적화"],
-                    label_visibility="collapsed")
+                    label_visibility="collapsed", key="_tool")
     st.divider()
     st.header("⚙️ 공통 설정")
     base_ccy = st.selectbox("기준 통화", ["KRW", "USD", "JPY", "EUR", "GBP"], index=0,
@@ -1969,6 +2107,16 @@ with st.sidebar:
              "두 경우 모두 액면분할은 보정됩니다.",
     )
     use_div = div_mode.startswith("배당 재투자")
+
+    cost_bp = st.number_input("거래비용 (편도, bp)", 0.0, 200.0, 0.0, step=1.0,
+                              help="1bp = 0.01%. 매수·매도 각각에 적용됩니다. "
+                                   "국내주식 위탁수수료+세금은 보통 20~30bp 수준입니다. "
+                                   "0이면 비용을 반영하지 않습니다.")
+    fx_hedge = st.checkbox("환헤지 가정 (환율 고정)", value=False,
+                           help="체크하면 환율 변동을 제거하고 종목 자체 수익률만 봅니다.")
+    gap_fill = st.checkbox("휴장일 직전값으로 채우기", value=False,
+                           help="국가별 휴장일이 다를 때 공통 거래일이 크게 줄어드는 것을 "
+                                "막습니다. 체크하면 없는 날은 직전 종가로 채웁니다.")
 
     rf_rate = st.number_input("무위험 수익률 (연, %)", value=3.0, step=0.25,
                               help="Sharpe·Sortino 계산에만 쓰입니다. "
@@ -2323,8 +2471,9 @@ all_tickers = sorted({str(r["티커"]).strip()
 # ---------------- 데이터 수집 ----------------
 try:
     with st.spinner(f"{len(all_tickers)}개 종목 데이터 수집 및 환율 환산 중..."):
-        prices, meta = build_price_frame(all_tickers, start_date, end_date,
-                                         base_ccy, use_div)
+        prices, meta, fx_used = build_price_frame(
+            all_tickers, start_date, end_date, base_ccy, use_div,
+            fx_hedge, gap_fill)
 except Exception as e:
     st.error(f"데이터를 가져오지 못했습니다: {e}")
     st.stop()
@@ -2370,6 +2519,29 @@ with st.expander("🔍 인식된 종목 정보 (통화·데이터 구간)", expa
     st.dataframe(show, width="stretch", hide_index=True)
     st.caption("통화는 야후 파이낸스가 제공하는 종목 정보에서 직접 읽어옵니다. "
                "'일수'가 유독 적은 종목이 있으면 티커를 다시 확인해주세요.")
+
+# ---------------- 적용된 환율 ----------------
+if fx_used and not fx_hedge:
+    with st.expander("💱 적용된 환율", expanded=False):
+        st.caption(f"각 종목의 거래통화를 {base_ccy}로 환산하는 데 쓴 환율입니다. "
+                   f"환율 변동도 수익률에 포함돼 있습니다. "
+                   f"환율 영향을 빼고 보려면 사이드바의 **환헤지 가정**을 켜세요.")
+        ff = go.Figure()
+        for ccy, s in fx_used.items():
+            if s is None or s.empty:
+                continue
+            fx_s = s.reindex(prices.index).ffill().bfill()
+            ff.add_trace(go.Scatter(x=fx_s.index, y=fx_s.values,
+                                    name=f"1 {ccy} → {base_ccy}"))
+        ff.update_layout(height=280, hovermode="x unified",
+                         margin=dict(l=0, r=0, t=20, b=0),
+                         legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+        st.plotly_chart(ff, width="stretch")
+        if base_ccy == "KRW" and "JPY" in fx_used:
+            st.caption("※ 엔화는 **1엔당 원화**입니다. 뉴스의 '100엔당' 표기와 100배 차이납니다.")
+elif fx_hedge:
+    st.info("💱 **환헤지 가정**이 켜져 있습니다. 환율 변동을 제거하고 "
+            "종목 자체 수익률만 계산했습니다.")
 
 # ---------------- 수익률 계산 ----------------
 series, errors = {}, []
@@ -2500,18 +2672,78 @@ for name, v in series.items():
         "소르티노": sortino_ratio(r, rf_rate),
         "칼마": calmar_ratio(r),
         "얼서지수": ulcer_index(r),
+        "연 회전율(%)": (v.get("turnover") * 100
+                     if v["kind"] == "portfolio" and v.get("turnover") is not None
+                     and not pd.isna(v.get("turnover")) else np.nan),
     })
 comp = pd.DataFrame(rows).set_index("")
+_hi = [c for c in ["누적성장배수", "CAGR (%)", "MDD (%)", "샤프지수", "소르티노", "칼마"]
+       if c in comp.columns]
+_lo = [c for c in ["변동성 (%)", "얼서지수", "연 회전율(%)"] if c in comp.columns]
 st.dataframe(
-    comp.style.format("{:.2f}")
-        .highlight_max(subset=["누적성장배수", "CAGR (%)", "MDD (%)", "Sharpe",
-                               "Sortino", "Calmar"], color="#dcfce7")
-        .highlight_min(subset=["변동성 (%)", "Ulcer"], color="#dcfce7"),
+    comp.style.format("{:.2f}", na_rep="-")
+        .highlight_max(subset=_hi, color="#dcfce7")
+        .highlight_min(subset=_lo, color="#dcfce7"),
     width="stretch")
-st.caption("초록색 = 각 지표에서 가장 좋은 값 (MDD는 0에 가까울수록 좋음). 📈 포트폴리오 · 📊 벤치마크")
+st.caption("초록색 = 각 지표에서 가장 좋은 값 (MDD는 0에 가까울수록 좋음). "
+           "📈 포트폴리오 · 📊 벤치마크 · **연 회전율**은 1년에 자산의 몇 %를 "
+           "사고파는지를 뜻하며, 거래비용을 입력했다면 성과에 이미 반영돼 있습니다.")
 
 # ---------------- 포트폴리오별 상세 ----------------
-st.subheader("5️⃣ 포트폴리오별 상세 (Details)")
+st.subheader("5️⃣ 연도별 성과 (Calendar Year Returns)")
+st.caption("연도별로 잘라 보면 특정 해에만 좋았는지, 꾸준했는지가 드러납니다. "
+           "약세장이 있던 해를 눈여겨보세요.")
+yr_rows = {}
+for name, v in series.items():
+    yr = (1 + v["returns"]).groupby(v["returns"].index.year).prod() - 1
+    yr_rows[name] = yr * 100
+ydf = pd.DataFrame(yr_rows)
+st.dataframe(ydf.style.format("{:.2f}", na_rep="-").map(_heat_color),
+             width="stretch")
+
+st.subheader("6️⃣ 적립식 투자 (Dollar-Cost Averaging)")
+st.caption("목돈을 한 번에 넣는 대신 매달 일정액을 넣었다면 어땠을지 계산합니다. "
+           "나중에 넣은 돈일수록 투자 기간이 짧으므로, 단순 수익률보다 "
+           "**내부수익률(IRR)** 이 올바른 비교 기준입니다.")
+d1, d2 = st.columns(2)
+_unit = 1_000_000 if base_ccy == "KRW" else 1_000
+init_amt = d1.number_input(f"최초 투자금 ({base_ccy})", 0.0, 1e12,
+                           float(_unit * 10), step=float(_unit))
+mon_amt = d2.number_input(f"매월 납입액 ({base_ccy})", 0.0, 1e12,
+                          float(_unit), step=float(_unit))
+if mon_amt > 0 or init_amt > 0:
+    drows, fig_d = [], go.Figure()
+    for name, v in series.items():
+        val, inv, buys = dca_result(v["returns"], mon_amt, init_amt)
+        if val.empty:
+            continue
+        cf = ([-init_amt] if init_amt > 0 else []) + [-mon_amt] * len(buys) + [float(val.iloc[-1])]
+        dts = ([val.index[0]] if init_amt > 0 else []) + list(buys) + [val.index[-1]]
+        irr = xirr(cf, dts)
+        drows.append({"": name, f"총 납입금 ({base_ccy})": float(inv.iloc[-1]),
+                      f"최종 평가액 ({base_ccy})": float(val.iloc[-1]),
+                      "단순 수익률(%)": (float(val.iloc[-1]) / float(inv.iloc[-1]) - 1) * 100
+                      if inv.iloc[-1] > 0 else np.nan,
+                      "내부수익률 IRR(%)": irr * 100 if not pd.isna(irr) else np.nan})
+        fig_d.add_trace(go.Scatter(x=val.index, y=val.values, name=name,
+                                   line=dict(color=color_of.get(name), width=2)))
+    if drows:
+        _inv = pd.DataFrame({"납입원금": inv})
+        fig_d.add_trace(go.Scatter(x=inv.index, y=inv.values, name="납입 원금",
+                                   line=dict(color="#94a3b8", width=1.5, dash="dot")))
+        fig_d.update_layout(height=380, hovermode="x unified",
+                            margin=dict(l=0, r=0, t=30, b=0),
+                            yaxis=dict(tickformat=",.0f"),
+                            legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+        st.plotly_chart(fig_d, width="stretch")
+        st.dataframe(pd.DataFrame(drows).set_index("")
+                     .style.format({f"총 납입금 ({base_ccy})": "{:,.0f}",
+                                    f"최종 평가액 ({base_ccy})": "{:,.0f}",
+                                    "단순 수익률(%)": "{:.2f}",
+                                    "내부수익률 IRR(%)": "{:.2f}"}, na_rep="-"),
+                     width="stretch")
+
+st.subheader("7️⃣ 포트폴리오별 상세 (Details)")
 for name, v in series.items():
     if v["kind"] != "portfolio":
         continue
