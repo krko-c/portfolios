@@ -32,6 +32,38 @@ import streamlit as st
 TRADING_DAYS = 252
 MAX_PORTFOLIOS = 6
 
+COLS = ["티커", "비중(%)", "종목명"]
+DEFAULT_ROWS = 3
+MIN_ROWS, MAX_ROWS = 1, 30
+PRESETS = [
+    [("005930.KS", 60.0), ("SPY", 40.0)],
+    [("SPY", 60.0), ("AGG", 40.0)],
+]
+
+
+def blank_row():
+    return {"티커": "", "비중(%)": np.nan, "종목명": ""}
+
+
+def default_holdings(i: int) -> pd.DataFrame:
+    rows = list(PRESETS[i]) if i < len(PRESETS) else []
+    data = [{"티커": t, "비중(%)": w, "종목명": ""} for t, w in rows]
+    while len(data) < DEFAULT_ROWS:
+        data.append(blank_row())
+    return pd.DataFrame(data)[COLS]
+
+
+def fit_rows(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    """행 수를 n개로 맞춘다 (모자라면 빈 행 추가, 남으면 뒤에서 자름)."""
+    df = df.copy()
+    if len(df) < n:
+        df = pd.concat([df, pd.DataFrame([blank_row()] * (n - len(df)))],
+                       ignore_index=True)
+    elif len(df) > n:
+        df = df.iloc[:n].reset_index(drop=True)
+    return df[COLS]
+
+
 REBAL_DAILY = "매일 (고정비중 유지)"
 REBAL_MONTH = "월별"
 REBAL_QUARTER = "분기별"
@@ -620,6 +652,50 @@ def build_excel(series: dict, comp: pd.DataFrame, prices: pd.DataFrame,
         ws.set_column(1, 1, 64)
 
     return buf.getvalue()
+
+
+OPT_STORE_KEY = "_opt_saved_store"
+OPT_SAVE_PATH = Path(__file__).parent / "optimizations.json"
+
+
+def load_opt_saved() -> dict:
+    if OPT_STORE_KEY not in st.session_state:
+        try:
+            st.session_state[OPT_STORE_KEY] = (
+                json.loads(OPT_SAVE_PATH.read_text(encoding="utf-8"))
+                if OPT_SAVE_PATH.exists() else {})
+        except Exception:
+            st.session_state[OPT_STORE_KEY] = {}
+    return st.session_state[OPT_STORE_KEY]
+
+
+def write_opt_saved(data: dict) -> bool:
+    st.session_state[OPT_STORE_KEY] = data
+    try:
+        OPT_SAVE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+    except Exception:
+        pass
+    return True
+
+
+def opt_snapshot(df, goal, risk_name, cut_label, train_label, rebal,
+                 bench_tk, min_ret, max_vol, reopt, label="") -> dict:
+    return {
+        "label": label,
+        "saved_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+        "goal": goal, "risk": risk_name, "cutoff": cut_label,
+        "train": train_label, "rebalance": rebal, "benchmark": bench_tk,
+        "reopt": reopt,
+        "min_ret": None if min_ret is None else float(min_ret),
+        "max_vol": None if max_vol is None else float(max_vol),
+        "holdings": [
+            {"ticker": str(r["티커"]).strip(),
+             "weight": (None if pd.isna(r["현재 비중(%)"]) else float(r["현재 비중(%)"])),
+             "min": float(r["최소(%)"]), "max": float(r["최대(%)"])}
+            for _, r in df.iterrows() if str(r["티커"]).strip()
+        ],
+    }
 
 
 def build_opt_excel(alloc, t_oos, t_ins, oos_rows, bdf, rdf, corr,
@@ -1506,11 +1582,79 @@ def _cmp_table(rows: dict, rf: float) -> pd.DataFrame:
 
 def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
     key = "_opt_df"
+
+    # 저장된 설정 적용 (위젯이 그려지기 전에 처리해야 함)
+    if "_opt_pending_load" in st.session_state:
+        cfg = load_opt_saved().get(st.session_state.pop("_opt_pending_load"))
+        if cfg:
+            for k in ["_opt_editor", "_opt_n", "_opt_eq", "_opt_goal", "_opt_risk",
+                      "_opt_cut", "_opt_train", "_opt_rebal", "_opt_bench",
+                      "_opt_reopt", "_opt_useret", "_opt_usevol"]:
+                st.session_state.pop(k, None)
+            rows = [{"티커": h["ticker"], "종목명": "",
+                     "현재 비중(%)": h.get("weight"),
+                     "최소(%)": h.get("min", 0.0), "최대(%)": h.get("max", 100.0)}
+                    for h in cfg.get("holdings", [])]
+            if rows:
+                st.session_state[key] = pd.DataFrame(rows)[OPT_COLS]
+                st.session_state["_opt_n"] = len(rows)
+            for sk, ck in [("_opt_goal", "goal"), ("_opt_risk", "risk"),
+                           ("_opt_cut", "cutoff"), ("_opt_train", "train"),
+                           ("_opt_rebal", "rebalance"), ("_opt_bench", "benchmark"),
+                           ("_opt_reopt", "reopt")]:
+                if cfg.get(ck) is not None:
+                    st.session_state[sk] = cfg[ck]
+            st.success(f"**{cfg.get('label', '')}** 설정을 불러왔습니다.")
+
     if key not in st.session_state:
         st.session_state[key] = pd.DataFrame([
             {"티커": t, "종목명": "", "현재 비중(%)": w, "최소(%)": 0.0, "최대(%)": 100.0}
             for t, w in [("AAPL", 25.0), ("NVDA", 25.0), ("SCHD", 25.0), ("SPMO", 25.0)]
         ])[OPT_COLS]
+
+    # ---------------- 저장 / 불러오기 ----------------
+    saved_opt = load_opt_saved()
+    with st.expander("💾 최적화 설정 저장 / 불러오기", expanded=False):
+        s1, s2 = st.columns([2, 1])
+        if saved_opt:
+            pick = s1.selectbox("저장된 설정", ["(선택)"] + sorted(saved_opt.keys()),
+                                key="_opt_pick")
+            b1, b2, b3 = s2.columns(3)
+            if b1.button("📂", key="_opt_load", help="불러오기",
+                         disabled=(pick == "(선택)")):
+                st.session_state["_opt_pending_load"] = pick
+                st.rerun()
+            if b2.button("🗑", key="_opt_del", help="삭제", disabled=(pick == "(선택)")):
+                saved_opt.pop(pick, None)
+                write_opt_saved(saved_opt)
+                st.rerun()
+            b3.download_button("📥", json.dumps(saved_opt, ensure_ascii=False,
+                                                indent=2).encode("utf-8"),
+                               "optimizations.json", "application/json",
+                               key="_opt_dl", help="전체 내보내기")
+        else:
+            s1.caption("저장된 설정이 없습니다.")
+        n1, n2 = st.columns([2, 1])
+        opt_name = n1.text_input("저장할 이름", key="_opt_save_name",
+                                 placeholder="예: 미국 3종 · 샤프 최대")
+        n2.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        do_opt_save = n2.button("💾 저장", width="stretch",
+                                disabled=not opt_name.strip())
+        up_o = st.file_uploader("설정 파일 가져오기", type=["json"],
+                                key="_opt_up", label_visibility="collapsed")
+        if up_o is not None and not st.session_state.get("_opt_imported"):
+            try:
+                inc = json.loads(up_o.getvalue().decode("utf-8"))
+                if isinstance(inc, dict):
+                    merged = dict(load_opt_saved()); merged.update(inc)
+                    write_opt_saved(merged)
+                    st.session_state["_opt_imported"] = True
+                    st.success(f"{len(inc)}개 설정을 불러왔습니다.")
+                    st.rerun()
+            except Exception as ex:
+                st.error(f"파일을 읽지 못했습니다: {ex}")
+        st.caption("설정은 브라우저 세션에 보관됩니다. 오래 쓰실 구성은 "
+                   "**📥 내보내기**로 파일을 받아두세요.")
 
     # ------------------------------------------------------------------
     st.subheader("1️⃣ 현재 포트폴리오 (Current Holdings)")
@@ -1598,14 +1742,14 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
     # ------------------------------------------------------------------
     st.subheader("2️⃣ 최적화 설정 (Settings)")
     o1, o2 = st.columns([1, 1])
-    goal = o1.selectbox("목적", list(OPT_GOALS))
+    goal = o1.selectbox("목적", list(OPT_GOALS), key="_opt_goal")
     o1.caption(OPT_GOALS[goal])
 
     groups = {}
     for k, v in RISK_DEFS.items():
         groups.setdefault(v["group"], []).append(k)
     risk_labels = [f"{g} · {k}" for g in groups for k in groups[g]]
-    risk_pick = o2.selectbox("위험을 정의하는 방법", risk_labels,
+    risk_pick = o2.selectbox("위험을 정의하는 방법", risk_labels, key="_opt_risk",
                              disabled=goal.startswith(("위험균형", "계층적")),
                              help="목적 계산에 쓰이는 위험 척도입니다.")
     risk_name = risk_pick.split(" · ", 1)[1]
@@ -1626,24 +1770,34 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                    "동시에 만족할 수 없으면 달성 가능한 수치를 알려드립니다.")
 
     p1, p2, p3, p4 = st.columns(4)
-    reopt = p4.selectbox("재최적화 주기", list(REOPT_FREQ), index=0,
+    reopt = p4.selectbox("재최적화 주기", list(REOPT_FREQ), index=0, key="_opt_reopt",
                          help="'한 번만'은 기준일에 정한 비중을 끝까지 유지합니다. "
                               "분기·매년을 고르면 그 주기마다 그 시점까지의 데이터로 "
                               "비중을 다시 계산해, 실제 운용을 재현합니다.")
-    cut_label = p1.selectbox("최적화 기준일 (Optimization Date)", list(CUTOFFS), index=2,
+    cut_label = p1.selectbox("최적화 기준일 (Optimization Date)", list(CUTOFFS),
+                             index=2, key="_opt_cut",
                              help="이 시점까지의 데이터로만 비중을 계산하고, "
                                   "이후 구간으로 실제 성과를 채점합니다.")
-    train_label = p2.selectbox("학습 기간 (Training Period)", list(TRAIN_WINDOWS), index=1,
+    train_label = p2.selectbox("학습 기간 (Training Period)", list(TRAIN_WINDOWS),
+                               index=1, key="_opt_train",
                                help="비중을 계산하는 데 쓸 과거 데이터의 길이입니다.")
-    rebal = p3.selectbox("리밸런싱", REBAL_OPTIONS, index=2)
+    rebal = p3.selectbox("리밸런싱", REBAL_OPTIONS, index=2, key="_opt_rebal")
 
     custom_date = None
     if cut_label == "직접 지정":
         custom_date = st.date_input("기준일 직접 지정",
                                     pd.Timestamp.today() - pd.DateOffset(years=1))
 
-    bench_tk = st.text_input("벤치마크", value="^GSPC",
+    bench_tk = st.text_input("벤치마크", value="^GSPC", key="_opt_bench",
                              help="비워두면 벤치마크 없이 비교합니다.").strip()
+
+    if do_opt_save:
+        store = load_opt_saved()
+        nm = opt_name.strip()
+        store[nm] = opt_snapshot(f, goal, risk_name, cut_label, train_label,
+                                 rebal, bench_tk, min_ret, max_vol, reopt, label=nm)
+        write_opt_saved(store)
+        st.success(f"**{nm}** 으로 저장했습니다.")
 
     run_opt = st.button("🎯 포트폴리오 최적화", type="primary", width="stretch",
                         disabled=bool(bad) or live.empty)
@@ -2114,9 +2268,14 @@ with st.sidebar:
                                    "0이면 비용을 반영하지 않습니다.")
     fx_hedge = st.checkbox("환헤지 가정 (환율 고정)", value=False,
                            help="체크하면 환율 변동을 제거하고 종목 자체 수익률만 봅니다.")
-    gap_fill = st.checkbox("휴장일 직전값으로 채우기", value=False,
-                           help="국가별 휴장일이 다를 때 공통 거래일이 크게 줄어드는 것을 "
-                                "막습니다. 체크하면 없는 날은 직전 종가로 채웁니다.")
+    gap_mode = st.selectbox(
+        "휴장일 처리", ["공통 거래일만 사용", "직전 종가로 채우기"], index=0,
+        help="국가를 섞으면 휴장일이 달라 공통 거래일이 크게 줄어듭니다.\n\n"
+             "· 공통 거래일만 사용 — 모든 종목이 거래된 날만 씁니다. 가장 엄밀하지만 "
+             "기간이 줄어듭니다.\n"
+             "· 직전 종가로 채우기 — 휴장한 종목은 직전 가격을 유지한 것으로 봅니다. "
+             "기간은 보존되지만 그날 수익률은 0으로 잡혀 변동성이 다소 낮게 나옵니다.")
+    gap_fill = gap_mode.startswith("직전")
 
     rf_rate = st.number_input("무위험 수익률 (연, %)", value=3.0, step=0.25,
                               help="Sharpe·Sortino 계산에만 쓰입니다. "
@@ -2228,38 +2387,6 @@ st.caption("여러 포트폴리오와 벤치마크를 한 화면에서 비교합
 # ======================================================================
 # 포트폴리오 입력
 # ======================================================================
-COLS = ["티커", "비중(%)", "종목명"]
-DEFAULT_ROWS = 3
-MIN_ROWS, MAX_ROWS = 1, 30
-PRESETS = [
-    [("005930.KS", 60.0), ("SPY", 40.0)],
-    [("SPY", 60.0), ("AGG", 40.0)],
-]
-
-
-def blank_row():
-    return {"티커": "", "비중(%)": np.nan, "종목명": ""}
-
-
-def default_holdings(i: int) -> pd.DataFrame:
-    rows = list(PRESETS[i]) if i < len(PRESETS) else []
-    data = [{"티커": t, "비중(%)": w, "종목명": ""} for t, w in rows]
-    while len(data) < DEFAULT_ROWS:
-        data.append(blank_row())
-    return pd.DataFrame(data)[COLS]
-
-
-def fit_rows(df: pd.DataFrame, n: int) -> pd.DataFrame:
-    """행 수를 n개로 맞춘다 (모자라면 빈 행 추가, 남으면 뒤에서 자름)."""
-    df = df.copy()
-    if len(df) < n:
-        df = pd.concat([df, pd.DataFrame([blank_row()] * (n - len(df)))],
-                       ignore_index=True)
-    elif len(df) > n:
-        df = df.iloc[:n].reset_index(drop=True)
-    return df[COLS]
-
-
 # --- 저장된 구성 불러오기 (위젯이 그려지기 전에 적용해야 함) ---
 if "_pending_load" in st.session_state:
     key = st.session_state.pop("_pending_load")
