@@ -2107,8 +2107,11 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
             st.info("제약 조건이 빡빡해 투자선을 그릴 수 없습니다.")
 
     # ---------------- 추가 분석 ----------------
-    st.subheader("8️⃣ 시간에 따른 비중 변화 (Allocation Over Time)")
-    st.caption("검증 구간에서 실제 보유 비중이 어떻게 흘러갔는지 보여줍니다. "
+    st.subheader("8️⃣ 추가 분석 (Deeper Analysis)")
+    st.caption("검증 구간을 여러 각도에서 살펴봅니다.")
+
+    st.markdown("#### 시간에 따른 비중 변화 (Allocation Over Time)")
+    st.caption("실제 보유 비중이 어떻게 흘러갔는지 보여줍니다. "
                "리밸런싱 주기에 따라 모양이 달라집니다.")
     wd = pd.DataFrame()
     try:
@@ -2129,7 +2132,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                            format_func=lambda x: {63: "3개월", 126: "6개월", 252: "1년"}[x],
                            help="아래 세 차트의 이동 계산 구간입니다.")
 
-    st.subheader("9️⃣ 샤프지수 추이 (Rolling Sharpe)")
+    st.markdown("#### 샤프지수 추이 (Rolling Sharpe)")
     st.caption(f"{'3개월' if win==63 else '6개월' if win==126 else '1년'} 이동 샤프지수입니다. "
                "특정 시기에만 좋았는지, 꾸준했는지를 보여줍니다.")
     fs = go.Figure()
@@ -2146,7 +2149,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                      legend=dict(orientation="h", y=1.02, yanchor="bottom"))
     st.plotly_chart(fs, width="stretch")
 
-    st.subheader("🔟 낙폭 (Drawdowns)")
+    st.markdown("#### 낙폭 (Drawdowns)")
     st.caption("직전 고점 대비 얼마나 내려와 있는지를 매일 표시한 것입니다. "
                "가장 깊이 파인 지점이 곧 위 비교표의 **최대낙폭(MDD)** 이며, "
                "0으로 돌아오는 데 걸린 기간이 원금 회복에 걸린 시간입니다.")
@@ -2163,7 +2166,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                      legend=dict(orientation="h", y=1.02, yanchor="bottom"))
     st.plotly_chart(fd, width="stretch")
 
-    st.subheader("1️⃣1️⃣ 변동성 추이 (Rolling Volatility)")
+    st.markdown("#### 변동성 추이 (Rolling Volatility)")
     st.caption(f"일별 수익률의 이동 표준편차를 연율화(×√252)한 값입니다. "
                f"위 슬라이더에서 고른 {'3개월' if win==63 else '6개월' if win==126 else '1년'} "
                f"구간을 뒤돌아보며 계산하므로, 값이 치솟은 시점은 그 직전에 큰 등락이 "
@@ -2181,7 +2184,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                      legend=dict(orientation="h", y=1.02, yanchor="bottom"))
     st.plotly_chart(fv, width="stretch")
 
-    st.subheader("1️⃣2️⃣ 자산 상관관계 (Asset Correlations)")
+    st.markdown("#### 자산 상관관계 (Asset Correlations)")
     st.caption("검증 구간의 일별 수익률 기준입니다. 1에 가까우면 같이 움직이고, "
                "0에 가까우면 서로 무관하며, 음수면 반대로 움직입니다. "
                "낮은 값이 많을수록 분산 효과가 큽니다.")
@@ -2282,43 +2285,29 @@ with st.sidebar:
                                    "기준 통화에 맞는 금리를 넣으세요.") / 100
 
     st.divider()
-    st.subheader("벤치마크")
-    bench_raw = st.text_area(
-        "벤치마크 티커 (콤마 또는 줄바꿈으로 구분)",
-        value="^KS11, ^GSPC",
-        height=80,
-        help="^KS11 코스피 · ^KQ11 코스닥 · ^GSPC S&P500 · ^N225 닛케이225 · ^IXIC 나스닥",
-    )
-    bench_list = []
-    for b in bench_raw.replace("\n", ",").split(","):
-        b = b.strip()
-        if b:
-            cands = normalize_ticker(b)
-            bench_list.append(cands[0] if cands else b)
+    st.caption("**티커 예시**\n\n"
+               "한국 `005930.KS` `086520.KQ`\n\n"
+               "미국 `NVDA` `SPY` `QQQ`\n\n"
+               "일본 `7203.T`  홍콩 `0700.HK`")
 
-    if st.button("🔍 벤치마크 티커 확인", width="stretch"):
-        if not bench_list:
-            st.caption("확인할 티커가 없습니다.")
-        else:
-            with st.spinner("확인 중..."):
-                results = []
-                for b in bench_list:
-                    tk, ccy = quick_check(tuple(normalize_ticker(b)))
-                    results.append((b, tk, ccy, get_name(tk) if tk else ""))
-            for b, tk, ccy, nm in results:
-                if tk:
-                    st.markdown(
-                        f"<div style='font-size:0.8rem;line-height:1.35'>"
-                        f"<b>{tk}</b><br>{nm or '(종목명 없음)'} · {ccy}</div>",
-                        unsafe_allow_html=True)
-                else:
-                    st.markdown(
-                        f"<div style='font-size:0.8rem;line-height:1.35;color:#dc2626'>"
-                        f"<b>{b}</b><br>❌ 확인 불가</div>", unsafe_allow_html=True)
-            st.markdown("<div style='margin-bottom:0.5rem'></div>", unsafe_allow_html=True)
 
-    st.divider()
-    st.subheader("💾 저장 / 불러오기")
+IS_OPT = tool.endswith("최적화")
+
+if IS_OPT:
+    st.title("🎯 포트폴리오 최적화")
+    st.caption("종목을 넣으면 목적에 맞는 최적 비중을 계산합니다. "
+               "과거 데이터 기반이며 미래 성과를 보장하지 않습니다.")
+    render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate)
+    st.stop()
+
+st.title("📊 포트폴리오 분석")
+st.caption("여러 포트폴리오와 벤치마크를 한 화면에서 비교합니다. 통화는 자동으로 인식됩니다.")
+
+
+# ======================================================================
+# 저장 / 불러오기 · 벤치마크
+# ======================================================================
+with st.expander("💾 구성 저장 / 불러오기", expanded=False):
     saved = load_saved()
     if saved:
         pick = st.selectbox("저장된 구성", ["(선택)"] + sorted(saved.keys()))
@@ -2364,24 +2353,33 @@ with st.sidebar:
         except Exception as ex:
             st.error(f"파일을 읽지 못했습니다: {ex}")
 
-    st.divider()
-    st.caption("**티커 예시**\n\n"
-               "한국 `005930.KS` `086520.KQ`\n\n"
-               "미국 `NVDA` `SPY` `QQQ`\n\n"
-               "일본 `7203.T`  홍콩 `0700.HK`")
 
+st.subheader("벤치마크 (Benchmark)")
+bc1, bc2 = st.columns([3, 1])
+bench_raw = bc1.text_input(
+    "벤치마크 티커 — 콤마로 구분", value="^KS11, ^GSPC",
+    help="^KS11 코스피 · ^KQ11 코스닥 · ^GSPC S&P500 · ^N225 닛케이225 · ^IXIC 나스닥")
+bench_list = []
+for b in bench_raw.replace("\n", ",").split(","):
+    b = b.strip()
+    if b:
+        cands = normalize_ticker(b)
+        bench_list.append(cands[0] if cands else b)
 
-IS_OPT = tool.endswith("최적화")
-
-if IS_OPT:
-    st.title("🎯 포트폴리오 최적화")
-    st.caption("종목을 넣으면 목적에 맞는 최적 비중을 계산합니다. "
-               "과거 데이터 기반이며 미래 성과를 보장하지 않습니다.")
-    render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate)
-    st.stop()
-
-st.title("📊 포트폴리오 분석")
-st.caption("여러 포트폴리오와 벤치마크를 한 화면에서 비교합니다. 통화는 자동으로 인식됩니다.")
+bc2.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+if bc2.button("🔍 티커 확인", width="stretch"):
+    if not bench_list:
+        st.caption("확인할 티커가 없습니다.")
+    else:
+        with st.spinner("확인 중..."):
+            rows_b = []
+            for b in bench_list:
+                tk, ccy = quick_check(tuple(normalize_ticker(b)))
+                rows_b.append({"": "✅" if tk else "❌", "입력": b,
+                               "티커": tk or "-",
+                               "종목명": (get_name(tk) or "(종목명 없음)") if tk else "확인 불가",
+                               "통화": ccy or "-"})
+        st.dataframe(pd.DataFrame(rows_b), width="stretch", hide_index=True)
 
 
 # ======================================================================
