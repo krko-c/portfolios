@@ -2139,7 +2139,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                 "최대(%)", min_value=0.0, max_value=100.0, step=1.0,
                 format="%.0f", width="small"),
             "🗑": st.column_config.CheckboxColumn(
-                "삭제", width="small", help="체크하면 그 행이 바로 삭제됩니다."),
+                "✕", width="small", help="체크하면 해당 행이 삭제됩니다."),
         })
 
     _odel = ed["🗑"].fillna(False).astype(bool)
@@ -2148,7 +2148,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         if _okept.empty:
             _okept = pd.DataFrame([_opt_blank()])[OPT_COLS]
         st.session_state[key] = _okept
-        st.session_state["_opt_n"] = len(_okept)
+        st.session_state.pop("_opt_n", None)
         st.session_state.pop("_opt_editor", None)
         st.rerun()
     ed = ed[OPT_COLS]
@@ -2428,9 +2428,9 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         st.session_state["nrow_0"] = len(tickers)
         st.session_state["name_0"] = f"최적화 ({goal})"
         st.session_state["rebal_0"] = rebal
-        st.session_state["_tool"] = "📊 포트폴리오 분석"
+        # 라디오 위젯은 이미 그려진 뒤이므로 직접 바꿀 수 없다. 다음 실행에서 반영한다.
+        st.session_state["_pending_tool"] = "📊 포트폴리오 분석"
         st.session_state["_has_run"] = False
-        st.success("포트폴리오 분석 화면으로 옮겼습니다. 왼쪽 도구에서 확인하세요.")
         st.rerun()
 
     # ---------------- 성과 비교 ----------------
@@ -2706,6 +2706,10 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
 # ======================================================================
 # 사이드바
 # ======================================================================
+# 다른 화면에서 요청한 도구 전환을 위젯 생성 전에 반영한다
+if "_pending_tool" in st.session_state:
+    st.session_state["_tool"] = st.session_state.pop("_pending_tool")
+
 with st.sidebar:
     tool = st.radio("도구", ["📊 포트폴리오 분석", "🎯 포트폴리오 최적화", "📖 도움말"],
                     label_visibility="collapsed", key="_tool")
@@ -2923,7 +2927,7 @@ for i, tab in enumerate(tabs):
                 "종목명": st.column_config.TextColumn(
                     "종목명 (자동)", disabled=True, width="large"),
                 "🗑": st.column_config.CheckboxColumn(
-                    "삭제", width="small", help="체크하면 그 행이 바로 삭제됩니다."),
+                    "✕", width="small", help="체크하면 해당 행이 삭제됩니다."),
             },
         )
 
@@ -2934,7 +2938,8 @@ for i, tab in enumerate(tabs):
             if _kept.empty:
                 _kept = pd.DataFrame([blank_row()])[COLS]
             st.session_state[dfkey] = _kept
-            st.session_state[f"nrow_{i}"] = len(_kept)
+            # 이미 그려진 위젯의 값은 직접 바꿀 수 없으므로 상태를 지워 재초기화한다
+            st.session_state.pop(f"nrow_{i}", None)
             st.session_state.pop(f"hold_{i}", None)
             st.rerun()
         edited = edited[COLS]
