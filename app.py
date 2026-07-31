@@ -434,15 +434,20 @@ def render_etf_loader(target_key: str, gen_key: str, editor_key: str,
         st.caption(f"**{sym}** 상위 {len(hold)}종목 · 합계 **{tot:.2f}%** "
                    f"(나머지 {max(0.0, 100-tot):.2f}%는 그 외 종목)")
 
-        mode = st.radio(
-            "나머지 비중 처리", ["상위 종목만으로 100% 재조정", f"나머지는 {sym} 자체로 채우기"],
-            key=f"etf_mode_{target_key}", horizontal=False,
-            help="상위 종목의 합이 100%에 못 미칩니다. 부족분을 어떻게 다룰지 정하세요.")
+        mode = None
+        if weight_col:
+            mode = st.radio(
+                "나머지 비중 처리",
+                ["상위 종목만으로 100% 재조정", f"나머지는 {sym} 자체로 채우기"],
+                key=f"etf_mode_{target_key}", horizontal=False,
+                help="상위 종목의 합이 100%에 못 미칩니다. 부족분을 어떻게 다룰지 정하세요.")
 
         if st.button("⬇️ 아래 표에 채우기", key=f"etf_fill_{target_key}",
                      type="primary", width="stretch"):
             rows = []
-            if mode.startswith("상위"):
+            if weight_col is None:
+                rows = [{"티커": r["티커"]} for _, r in hold.iterrows()]
+            elif mode.startswith("상위"):
                 scale = 100.0 / tot if tot > 0 else 1.0
                 for _, r in hold.iterrows():
                     rows.append({"티커": r["티커"],
@@ -453,12 +458,12 @@ def render_etf_loader(target_key: str, gen_key: str, editor_key: str,
                 rest = round(100.0 - tot, 2)
                 if rest > 0.01:
                     rows.append({"티커": sym, weight_col: rest})
-            # 합계를 정확히 100으로 맞춤
-            s = sum(r[weight_col] for r in rows)
-            if rows and abs(s - 100) > 1e-9:
-                rows[-1][weight_col] = round(rows[-1][weight_col] + (100 - s), 2)
+            if weight_col:
+                s = sum(r[weight_col] for r in rows)
+                if rows and abs(s - 100) > 1e-9:
+                    rows[-1][weight_col] = round(rows[-1][weight_col] + (100 - s), 2)
 
-            base = {c: ("" if c not in (weight_col,) else np.nan) for c in cols}
+            base = {c: (np.nan if c == weight_col else "") for c in cols}
             if extra_defaults:
                 base.update(extra_defaults)
             full = [{**base, **r} for r in rows]
@@ -2089,6 +2094,736 @@ def render_help():
                      "투자 판단과 그 결과는 이용자 본인의 책임입니다.")
 
 
+# ======================================================================
+# 자산 상관관계 화면
+# ======================================================================
+# ======================================================================
+# 종목 추가 탐색
+# ======================================================================
+CAND_COLS = ["티커", "종목명"]
+CAND_MAX_COMB = 1000          # 전수 탐색 한도
+CAND_MAX_ADD = 3
+CAND_TOPN = 10
+
+
+def _cand_blank():
+    return {"티커": "", "종목명": ""}
+
+
+def objective_score(R: pd.DataFrame, w, goal: str, risk_name: str, rf: float):
+    """조합의 우열을 가릴 스칼라 점수. 클수록 좋다."""
+    mu, cov = ann_stats(R)
+    w = np.asarray(w, dtype=float)
+    if goal.startswith("수익률"):
+        return float(w @ mu)
+    if goal.startswith(("위험균형", "계층적")):
+        # 두 방식은 목적함수가 따로 없으므로 샤프로 비교한다
+        v = float(np.sqrt(w @ cov @ w))
+        return (float(w @ mu) - rf) / v if v > 0 else -1e9
+    d = RISK_DEFS[risk_name]
+    s = _series(R, w)
+    val = float(d["fn"](s, rf=rf))
+    if goal.startswith("위험 최소화"):
+        return val if d["kind"] == "ratio" else -val
+    if d["kind"] == "ratio":
+        return val
+    return (float(w @ mu) - rf) / val if val > 1e-12 else -1e9
+
+
+def solve_combo(R: pd.DataFrame, goal, risk_name, rf, wmin, wmax, min_ret, max_vol):
+    if goal.startswith("계층적"):
+        return hrp_weights(R)
+    w, _, _ = optimize(R, goal, risk_name, rf, wmin, wmax, min_ret, max_vol)
+    return w
+
+
+def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
+                            fx_hedge, gap_fill):
+    st.title("➕ 종목 추가 탐색")
+    st.caption("기존 포트폴리오에 후보 종목 중 몇 개를 더했을 때 가장 좋아지는 조합을 찾습니다. "
+               "선정은 **학습 구간** 데이터로만 하고, 결과는 **표본외 성과**와 함께 보여드립니다.")
+
+    bkey, ckey = "_opt_df", "_cand_df"
+    if bkey not in st.session_state:
+        st.session_state[bkey] = pd.DataFrame([
+            {"티커": t, "종목명": "", "현재 비중(%)": w, "최소(%)": 0.0, "최대(%)": 100.0}
+            for t, w in [("SPY", 60.0), ("AGG", 40.0)]])[OPT_COLS]
+    if ckey not in st.session_state:
+        st.session_state[ckey] = pd.DataFrame(
+            [{"티커": t, "종목명": ""} for t in ("QQQ", "GLD", "EFA", "VNQ")])[CAND_COLS]
+    st.session_state.setdefault("_cand_gen", 0)
+
+    # ---------------- 기존 포트폴리오 ----------------
+    st.subheader("1️⃣ 기존 포트폴리오 (Current Holdings)")
+    st.caption("포트폴리오 최적화 화면과 같은 표를 사용합니다. 한쪽에서 고치면 양쪽에 반영됩니다.")
+    bed = st.data_editor(
+        st.session_state[bkey], num_rows="dynamic", width="stretch",
+        key="_cand_base_editor", column_order=OPT_COLS, hide_index=True,
+        column_config={
+            "티커": st.column_config.TextColumn("티커", width="small"),
+            "종목명": st.column_config.TextColumn("종목명 (자동)", disabled=True, width="medium"),
+            "현재 비중(%)": st.column_config.NumberColumn(
+                "현재 비중(%)", min_value=0.0, max_value=100.0, step=0.01,
+                format="%.2f", width="small"),
+            "최소(%)": st.column_config.NumberColumn("최소(%)", min_value=0.0,
+                                                   max_value=100.0, step=1.0,
+                                                   format="%.0f", width="small"),
+            "최대(%)": st.column_config.NumberColumn("최대(%)", min_value=0.0,
+                                                   max_value=100.0, step=1.0,
+                                                   format="%.0f", width="small"),
+        })
+    base_df = bed.copy()
+    base_df["티커"] = base_df["티커"].fillna("").astype(str).str.strip()
+    base_df = base_df[base_df["티커"] != ""].reset_index(drop=True)
+    base_tk = list(base_df["티커"])
+    bw = pd.to_numeric(base_df["현재 비중(%)"], errors="coerce").fillna(0)
+    st.caption(f"기존 {len(base_tk)}종목 · 비중 합계 **{bw.sum():.2f}%**")
+
+    # ---------------- 후보 종목 ----------------
+    st.subheader("2️⃣ 후보 종목 (Candidates)")
+    st.caption("추가를 고민 중인 종목을 넣으세요. **15~30개**가 적당합니다. "
+               "너무 많으면 계산이 길어지고, 1등이 우연일 가능성도 커집니다.")
+    render_etf_loader(target_key=ckey, gen_key="_cand_gen",
+                      editor_key="_cand_editor", cols=CAND_COLS, weight_col=None)
+
+    q1, q2 = st.columns([1, 5])
+    _qn = len(st.session_state[ckey])
+    cn = q1.number_input("후보 수", 2, 50, _qn, step=1,
+                         key=f"_cand_n_{st.session_state['_cand_gen']}")
+    if int(cn) != _qn:
+        cur = st.session_state[ckey]
+        cur = (pd.concat([cur, pd.DataFrame([_cand_blank()] * (int(cn) - len(cur)))],
+                         ignore_index=True) if int(cn) > len(cur)
+               else cur.iloc[:int(cn)].reset_index(drop=True))
+        st.session_state[ckey] = cur[CAND_COLS]
+        st.session_state["_cand_gen"] += 1
+        st.session_state.pop("_cand_editor", None)
+        st.rerun()
+
+    _cd = st.session_state[ckey].copy()
+    _cd["🗑"] = False
+    ced = st.data_editor(
+        _cd, num_rows="fixed", width="stretch", key="_cand_editor",
+        column_order=CAND_COLS + ["🗑"], hide_index=True,
+        column_config={
+            "티커": st.column_config.TextColumn("티커", width="small"),
+            "종목명": st.column_config.TextColumn("종목명 (자동)", disabled=True, width="large"),
+            "🗑": st.column_config.CheckboxColumn("삭제", width="small"),
+        })
+    _cdel = ced["🗑"].fillna(False).astype(bool)
+    if _cdel.any():
+        kept = ced.loc[~_cdel, CAND_COLS].reset_index(drop=True)
+        if kept.empty:
+            kept = pd.DataFrame([_cand_blank()])[CAND_COLS]
+        st.session_state[ckey] = kept
+        st.session_state["_cand_gen"] += 1
+        st.session_state.pop("_cand_editor", None)
+        st.rerun()
+
+    cf = ced[CAND_COLS].copy()
+    cf["티커"] = cf["티커"].fillna("").astype(str).str.strip()
+    labs, bad = [], []
+    if any(t for t in cf["티커"]):
+        with st.spinner("티커 확인 중..."):
+            res = []
+            for t in cf["티커"]:
+                if not t:
+                    res.append(""); labs.append(""); continue
+                r = probe_ticker(tuple(normalize_ticker(t)))
+                if r["ticker"] is None:
+                    res.append(t); labs.append("❌ 확인 불가"); bad.append(t)
+                else:
+                    res.append(r["ticker"])
+                    labs.append(f"✅ {r.get('name') or '(종목명 없음)'} · {r['currency']}")
+        cf["티커"] = res
+    cf["종목명"] = labs if labs else ""
+    if not _frames_equal(cf, st.session_state[ckey]):
+        st.session_state[ckey] = cf
+        st.session_state.pop("_cand_editor", None)
+        st.rerun()
+
+    cand_tk = [t for t in cf["티커"] if t and t not in base_tk]
+    dup = [t for t in cf["티커"] if t and t in base_tk]
+    if bad:
+        st.error(f"확인되지 않는 티커: {', '.join(bad)}")
+    if dup:
+        st.info(f"기존 포트폴리오에 이미 있어 후보에서 제외했습니다: {', '.join(dup)}")
+
+    # ---------------- 설정 ----------------
+    st.subheader("3️⃣ 탐색 설정 (Settings)")
+    a1, a2, a3 = st.columns(3)
+    n_add = a1.number_input("추가할 종목 수", 1, CAND_MAX_ADD, 1, step=1, key="_cand_add")
+    goal = a2.selectbox("목적", list(OPT_GOALS), key="_cand_goal")
+    groups = {}
+    for k, v in RISK_DEFS.items():
+        groups.setdefault(v["group"], []).append(k)
+    risk_labels = [f"{g} · {k}" for g in groups for k in groups[g]]
+    rp = a3.selectbox("위험 정의", risk_labels, key="_cand_risk",
+                      disabled=goal.startswith(("위험균형", "계층적")))
+    risk_name = rp.split(" · ", 1)[1]
+
+    b1, b2, b3 = st.columns(3)
+    cut_label = b1.selectbox("최적화 기준일", list(CUTOFFS), index=2, key="_cand_cut")
+    train_label = b2.selectbox("학습 기간", list(TRAIN_WINDOWS), index=1, key="_cand_train")
+    rebal = b3.selectbox("리밸런싱", REBAL_OPTIONS, index=2, key="_cand_rebal")
+    d1, d2 = st.columns(2)
+    wmax_pct = d1.slider("종목별 최대 비중 (%)", 10, 100, 100, step=5, key="_cand_wmax",
+                         help="한 종목에 비중이 쏠리는 것을 막습니다.")
+    bench_tk = d2.text_input("벤치마크", value="^GSPC", key="_cand_bench")
+
+    n_c = len(cand_tk)
+    from math import comb
+    n_comb = comb(n_c, int(n_add)) if n_c >= int(n_add) else 0
+    mode = "전수 탐색" if n_comb <= CAND_MAX_COMB else "단계적 선택"
+    if n_comb == 0:
+        st.warning("후보가 부족합니다.")
+    else:
+        st.caption(f"후보 **{n_c}개** 중 **{n_add}개** 조합 → **{n_comb:,}가지** · 방식 **{mode}**"
+                   + ("" if mode == "전수 탐색" else
+                      f" (한도 {CAND_MAX_COMB:,}가지 초과. 1개씩 순차로 고릅니다)"))
+
+    run = st.button("🔎 조합 탐색", type="primary", width="stretch",
+                    disabled=bool(bad) or n_comb == 0 or len(base_tk) < 1)
+    if run:
+        st.session_state["_cand_has_run"] = True
+    if not st.session_state.get("_cand_has_run"):
+        st.info("👆 기존 포트폴리오와 후보를 입력한 뒤 **조합 탐색**을 눌러주세요.")
+        return
+
+    # ---------------- 데이터 ----------------
+    bench_norm = normalize_ticker(bench_tk)[0] if bench_tk.strip() else None
+    need = base_tk + cand_tk + ([bench_norm] if bench_norm else [])
+    try:
+        with st.spinner(f"{len(need)}개 종목 데이터 수집 중..."):
+            prices, meta, _fx = build_price_frame(need, start_date, end_date,
+                                                  base_ccy, use_div, fx_hedge, gap_fill)
+    except Exception as ex:
+        st.error(f"데이터를 가져오지 못했습니다: {ex}")
+        return
+
+    have = [t for t in base_tk + cand_tk if t in prices.columns]
+    missing = [t for t in base_tk + cand_tk if t not in prices.columns]
+    if missing:
+        st.warning(f"데이터가 없어 제외합니다: {', '.join(missing)}")
+    base_use = [t for t in base_tk if t in have]
+    cand_use = [t for t in cand_tk if t in have]
+    if not base_use or not cand_use:
+        st.error("기존 종목과 후보가 각각 1개 이상 필요합니다.")
+        return
+
+    last = prices.index[-1]
+    opt_date = last - CUTOFFS[cut_label] if CUTOFFS[cut_label] else last - pd.DateOffset(years=1)
+    tw = TRAIN_WINDOWS[train_label]
+    tr_start = prices.index[0] if tw is None else max(prices.index[0], opt_date - tw)
+    train_px, oos_px = prices.loc[tr_start:opt_date], prices.loc[opt_date:]
+    if len(train_px) < MIN_TRAIN_DAYS or len(oos_px) < MIN_OOS_DAYS:
+        st.error(f"학습 {len(train_px)}일 / 검증 {len(oos_px)}일 — 기간이 부족합니다.")
+        return
+
+    wmax = wmax_pct / 100.0
+    if wmax * (len(base_use) + int(n_add)) < 1.0:
+        st.error(f"최대 비중 {wmax_pct}% 로는 100%를 채울 수 없습니다. 값을 높여주세요.")
+        return
+
+    # ---------------- 탐색 ----------------
+    import itertools
+
+    def evaluate(combo):
+        tks = base_use + list(combo)
+        Rtr = train_px[tks].pct_change().dropna()
+        if len(Rtr) < MIN_TRAIN_DAYS:
+            return None
+        try:
+            w = solve_combo(Rtr, goal, risk_name, rf_rate, 0.0, wmax, None, None)
+            score = objective_score(Rtr, w, goal, risk_name, rf_rate)
+        except Exception:
+            return None
+        return {"combo": tuple(combo), "tickers": tks, "w": w, "score": score}
+
+    results = []
+    bar = st.progress(0.0, text="조합 평가 중...")
+    if mode == "전수 탐색":
+        combos = list(itertools.combinations(cand_use, int(n_add)))
+        for i, cb in enumerate(combos):
+            r = evaluate(cb)
+            if r:
+                results.append(r)
+            if i % 5 == 0 or i == len(combos) - 1:
+                bar.progress((i + 1) / len(combos),
+                             text=f"조합 평가 중... {i+1}/{len(combos)}")
+    else:
+        chosen, pool = [], list(cand_use)
+        total = sum(len(pool) - k for k in range(int(n_add)))
+        done = 0
+        for _ in range(int(n_add)):
+            best = None
+            for c in pool:
+                r = evaluate(chosen + [c])
+                done += 1
+                bar.progress(min(1.0, done / max(1, total)),
+                             text=f"조합 평가 중... {done}/{total}")
+                if r and (best is None or r["score"] > best["score"]):
+                    best = r
+            if best is None:
+                break
+            newly = [x for x in best["combo"] if x not in chosen]
+            chosen = list(best["combo"])
+            results.append(best)
+            for x in newly:
+                if x in pool:
+                    pool.remove(x)
+        # 단계적 선택은 각 단계 최선만 남으므로, 마지막 단계의 후보들도 함께 평가
+        if chosen:
+            for c in cand_use:
+                if c in chosen:
+                    continue
+                r = evaluate(chosen[:-1] + [c]) if len(chosen) >= 1 else None
+                if r:
+                    results.append(r)
+    bar.empty()
+
+    if not results:
+        st.error("평가 가능한 조합이 없습니다. 기간이나 후보를 조정해주세요.")
+        return
+
+    # 중복 조합 제거 후 학습 구간 점수로 정렬
+    uniq = {}
+    for r in results:
+        uniq[tuple(sorted(r["combo"]))] = r
+    ranked = sorted(uniq.values(), key=lambda x: -x["score"])[:CAND_TOPN]
+
+    # ---------------- 기존 포트폴리오 기준선 ----------------
+    W_base = {t: float(x) for t, x in zip(base_df["티커"], bw) if t in base_use}
+    if sum(W_base.values()) <= 0:
+        W_base = {t: 1.0 for t in base_use}
+
+    def bt(px, W):
+        try:
+            r = portfolio_returns(px, W, rebal)
+            tno = turnover_series(px, W, rebal).reindex(r.index).fillna(0)
+            return apply_cost(r, tno, cost_bp)
+        except Exception:
+            return None
+
+    base_oos = bt(oos_px, W_base)
+    bench_oos = None
+    if bench_norm and bench_norm in oos_px.columns:
+        bench_oos = bt(oos_px, {bench_norm: 100.0})
+
+    st.success(f"✅ 탐색 완료 · {mode} · 평가한 조합 **{len(uniq):,}가지** · "
+               f"학습 {train_px.index[0].date()}~{opt_date.date()} · "
+               f"검증 {opt_date.date()}~{last.date()}")
+
+    # ---------------- 결과 ----------------
+    st.subheader("4️⃣ 상위 조합 (Top Combinations)")
+    st.warning("**순위는 학습 구간 기준입니다.** 표본외 성과로 순위를 매기면 검증의 의미가 "
+               "사라지기 때문입니다. 오른쪽 표본외 지표를 보고 순위가 실제로 유지되는지 "
+               "확인하세요. 1등과 5등의 차이가 미미하다면 그 순위는 큰 의미가 없습니다.")
+
+    rows = []
+    for rank, r in enumerate(ranked, start=1):
+        W = {t: float(x) * 100 for t, x in zip(r["tickers"], r["w"])}
+        oos = bt(oos_px, W)
+        m = perf_row(oos, rf_rate) if oos is not None else {}
+        added = " + ".join(r["combo"])
+        rows.append({
+            "순위": rank, "추가 종목": added,
+            "학습 점수": r["score"],
+            "표본외 수익률(%)": m.get("수익률(연,%)", np.nan),
+            "표본외 변동성(%)": m.get("변동성(연,%)", np.nan),
+            "표본외 샤프": m.get("샤프지수", np.nan),
+            "표본외 MDD(%)": m.get("최대낙폭(%)", np.nan),
+        })
+    rdf = pd.DataFrame(rows).set_index("순위")
+
+    if base_oos is not None:
+        bm = perf_row(base_oos, rf_rate)
+        rdf.loc["기존"] = ["(추가 없음)", np.nan, bm["수익률(연,%)"], bm["변동성(연,%)"],
+                          bm["샤프지수"], bm["최대낙폭(%)"]]
+    if bench_oos is not None:
+        cm = perf_row(bench_oos, rf_rate)
+        rdf.loc["벤치마크"] = [bench_norm, np.nan, cm["수익률(연,%)"], cm["변동성(연,%)"],
+                            cm["샤프지수"], cm["최대낙폭(%)"]]
+    st.dataframe(rdf.style.format({"학습 점수": "{:.3f}", "표본외 수익률(%)": "{:.2f}",
+                                   "표본외 변동성(%)": "{:.2f}", "표본외 샤프": "{:.2f}",
+                                   "표본외 MDD(%)": "{:.2f}"}, na_rep="-"),
+                 width="stretch")
+
+    # 순위 유지 여부 진단
+    valid = rdf.iloc[:len(ranked)]["표본외 샤프"].dropna()
+    if len(valid) >= 3:
+        spread = float(valid.max() - valid.min())
+        top_is_best = bool(valid.index[0] == valid.idxmax())
+        if base_oos is not None:
+            better = int((valid > perf_row(base_oos, rf_rate)["샤프지수"]).sum())
+            st.caption(f"상위 {len(valid)}개 중 **{better}개**가 표본외에서 기존 구성보다 "
+                       f"샤프지수가 높았습니다. "
+                       + ("학습 구간 1위가 표본외에서도 최고였습니다."
+                          if top_is_best else
+                          "학습 구간 1위가 표본외 최고는 아니었습니다 — 순위의 신뢰도가 "
+                          "높지 않다는 신호입니다.")
+                       + f" 상위권 표본외 샤프 편차는 {spread:.2f} 입니다.")
+
+    # ---------------- 채택 빈도 ----------------
+    st.subheader("5️⃣ 후보별 채택 빈도 (Selection Frequency)")
+    st.caption("상위 조합에 자주 등장하는 종목일수록, 특정 조합의 우연이 아니라 "
+               "실제로 도움이 되는 후보일 가능성이 큽니다.")
+    cnt = {}
+    for r in ranked:
+        for t in r["combo"]:
+            cnt[t] = cnt.get(t, 0) + 1
+    fdf = pd.DataFrame([{"티커": t, "종목명": meta.get(t, {}).get("name", t),
+                         "상위 조합 등장": c, "비율(%)": c / len(ranked) * 100}
+                        for t, c in sorted(cnt.items(), key=lambda x: -x[1])])
+    if not fdf.empty:
+        fb = go.Figure(go.Bar(x=fdf["비율(%)"], y=fdf["티커"], orientation="h",
+                              marker_color="#0d9488",
+                              text=[f"{v:.0f}%" for v in fdf["비율(%)"]],
+                              textposition="outside"))
+        fb.update_layout(height=60 + 38 * len(fdf), margin=dict(l=0, r=40, t=10, b=0),
+                         xaxis=dict(title=None, ticksuffix="%"),
+                         yaxis=dict(autorange="reversed"))
+        st.plotly_chart(fb, width="stretch")
+        st.dataframe(fdf.style.format({"비율(%)": "{:.0f}"}), width="stretch",
+                     hide_index=True)
+
+    # ---------------- 1위 조합 상세 ----------------
+    st.subheader("6️⃣ 1위 조합 비중 (Best Combination)")
+    best = ranked[0]
+    bw2 = pd.DataFrame({
+        "티커": best["tickers"],
+        "종목명": [meta.get(t, {}).get("name", t) for t in best["tickers"]],
+        "구분": ["기존" if t in base_use else "추가" for t in best["tickers"]],
+        "최적 비중(%)": best["w"] * 100,
+    }).sort_values("최적 비중(%)", ascending=False)
+    st.dataframe(bw2.style.format({"최적 비중(%)": "{:.2f}"}), width="stretch",
+                 hide_index=True)
+
+    oos_best = bt(oos_px, {t: float(x) * 100 for t, x in zip(best["tickers"], best["w"])})
+    curves = {}
+    if base_oos is not None:
+        curves["기존 포트폴리오"] = base_oos
+    if oos_best is not None:
+        curves[f"1위 조합 (+{' + '.join(best['combo'])})"] = oos_best
+    if bench_oos is not None:
+        curves[f"벤치마크 ({bench_norm})"] = bench_oos
+    if curves:
+        fg = go.Figure()
+        for nm, rr in curves.items():
+            ec = equity_curve(rr)
+            fg.add_trace(go.Scatter(x=ec.index, y=ec.values, name=nm, line=dict(width=2)))
+        fg.update_layout(height=380, hovermode="x unified",
+                         margin=dict(l=0, r=0, t=30, b=0),
+                         legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+        st.plotly_chart(fg, width="stretch")
+        st.caption("검증 구간(표본외) 성과입니다.")
+
+    st.divider()
+    st.download_button("📄 결과 CSV", rdf.to_csv().encode("utf-8-sig"),
+                       f"candidate_search_{pd.Timestamp.now():%Y%m%d_%H%M}.csv",
+                       "text/csv", width="stretch")
+    st.caption("후보가 많을수록 상위권이 우연히 좋아 보일 가능성이 커집니다. "
+               "1등 하나만 보지 말고 상위 조합 전반과 채택 빈도를 함께 참고하세요. "
+               "교육·참고용이며 투자 자문이 아닙니다.")
+
+
+CORR_COLS = ["티커", "종목명"]
+CORR_FREQ = {"일별": None, "주별": "W", "월별": "ME"}
+CORR_PERIODS = {"1년": 1, "3년": 3, "5년": 5, "10년": 10, "전체 기간": None}
+CORR_MAX_HINT = 15
+
+
+def _corr_blank():
+    return {"티커": "", "종목명": ""}
+
+
+def corr_returns(prices: pd.DataFrame, freq_label: str) -> pd.DataFrame:
+    """선택한 주기로 환산한 수익률."""
+    rule = CORR_FREQ[freq_label]
+    px = prices if rule is None else prices.resample(rule).last()
+    return px.pct_change().dropna(how="any")
+
+
+def diversification_stats(corr: pd.DataFrame):
+    """평균 상관계수와 실효 종목 수. 실효 = N / (1 + (N-1)ρ̄)"""
+    n = corr.shape[0]
+    if n < 2:
+        return np.nan, float(n)
+    off = corr.values[~np.eye(n, dtype=bool)]
+    rho = float(np.nanmean(off))
+    denom = 1 + (n - 1) * rho
+    eff = float(n / denom) if denom > 1e-9 else float(n)
+    # 평균 상관이 음수면 실효 종목 수가 실제 종목 수를 넘을 수 있다.
+    # 서로 헤지되는 구성이라는 뜻이므로 상한을 두지 않는다.
+    return rho, max(1.0, eff)
+
+
+def corr_pairs(corr: pd.DataFrame) -> pd.DataFrame:
+    """중복 없이 모든 쌍을 나열."""
+    rows = []
+    cols = list(corr.columns)
+    for a in range(len(cols)):
+        for b in range(a + 1, len(cols)):
+            rows.append({"종목 A": cols[a], "종목 B": cols[b],
+                         "상관계수": float(corr.iloc[a, b])})
+    return pd.DataFrame(rows).sort_values("상관계수").reset_index(drop=True)
+
+
+def render_correlations(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
+    st.title("🔗 자산 상관관계")
+    st.caption("종목들이 서로 얼마나 함께 움직이는지 확인합니다. "
+               "낮은 상관관계가 많을수록 분산 효과가 큽니다.")
+
+    key = "_corr_df"
+    if key not in st.session_state:
+        st.session_state[key] = pd.DataFrame(
+            [{"티커": t, "종목명": ""} for t in ("005930.KS", "SPY", "QQQ", "GLD")])[CORR_COLS]
+    st.session_state.setdefault("_corr_gen", 0)
+
+    # ---------------- 종목 입력 ----------------
+    st.subheader("1️⃣ 종목 (Holdings)")
+    render_etf_loader(target_key=key, gen_key="_corr_gen", editor_key="_corr_editor",
+                      cols=CORR_COLS, weight_col=None)
+
+    cc1, cc2 = st.columns([1, 5])
+    _cnt = len(st.session_state[key])
+    n = cc1.number_input("종목 수", 2, 30, _cnt, step=1,
+                         key=f"_corr_n_{st.session_state['_corr_gen']}")
+    if int(n) != _cnt:
+        cur = st.session_state[key]
+        cur = (pd.concat([cur, pd.DataFrame([_corr_blank()] * (int(n) - len(cur)))],
+                         ignore_index=True) if int(n) > len(cur)
+               else cur.iloc[:int(n)].reset_index(drop=True))
+        st.session_state[key] = cur[CORR_COLS]
+        st.session_state["_corr_gen"] += 1
+        st.session_state.pop("_corr_editor", None)
+        st.rerun()
+
+    _cd = st.session_state[key].copy()
+    _cd["🗑"] = False
+    ced = st.data_editor(
+        _cd, num_rows="fixed", width="stretch", key="_corr_editor",
+        column_order=CORR_COLS + ["🗑"], hide_index=True,
+        column_config={
+            "티커": st.column_config.TextColumn("티커", width="small"),
+            "종목명": st.column_config.TextColumn("종목명 (자동)", disabled=True, width="large"),
+            "🗑": st.column_config.CheckboxColumn("삭제", width="small",
+                                                help="체크하면 해당 행이 삭제됩니다."),
+        })
+    _cdel = ced["🗑"].fillna(False).astype(bool)
+    if _cdel.any():
+        kept = ced.loc[~_cdel, CORR_COLS].reset_index(drop=True)
+        if kept.empty:
+            kept = pd.DataFrame([_corr_blank()])[CORR_COLS]
+        st.session_state[key] = kept
+        st.session_state["_corr_gen"] += 1
+        st.session_state.pop("_corr_editor", None)
+        st.rerun()
+
+    f = ced[CORR_COLS].copy()
+    f["티커"] = f["티커"].fillna("").astype(str).str.strip()
+    labels, bad = [], []
+    if any(t for t in f["티커"]):
+        with st.spinner("티커 확인 중..."):
+            res = []
+            for t in f["티커"]:
+                if not t:
+                    res.append(""); labels.append(""); continue
+                r = probe_ticker(tuple(normalize_ticker(t)))
+                if r["ticker"] is None:
+                    res.append(t); labels.append("❌ 확인 불가"); bad.append(t)
+                else:
+                    res.append(r["ticker"])
+                    labels.append(f"✅ {r.get('name') or '(종목명 없음)'} · {r['currency']}")
+        f["티커"] = res
+    f["종목명"] = labels if labels else ""
+    if not _frames_equal(f, st.session_state[key]):
+        st.session_state[key] = f
+        st.session_state.pop("_corr_editor", None)
+        st.rerun()
+
+    tickers = [t for t in f["티커"] if t]
+    if bad:
+        st.error(f"확인되지 않는 티커: {', '.join(bad)}")
+    if len(tickers) > CORR_MAX_HINT:
+        st.info(f"종목이 {len(tickers)}개입니다. {CORR_MAX_HINT}개를 넘으면 행렬이 커져 "
+                f"화면에서 읽기 어려울 수 있습니다.")
+
+    # ---------------- 설정 ----------------
+    st.subheader("2️⃣ 계산 설정 (Settings)")
+    s1, s2 = st.columns([1, 2])
+    freq = s1.selectbox("계산 주기", list(CORR_FREQ), index=0, key="_corr_freq")
+    s2.markdown("&nbsp;", unsafe_allow_html=True)
+    if freq == "일별":
+        s2.caption("⚠️ 거래 시간대가 다른 국가를 섞으면 일별 상관계수가 실제보다 **낮게** "
+                   "나옵니다. 미국 시장의 밤사이 움직임이 한국에는 다음 날 반영되기 "
+                   "때문입니다. 국가를 섞었다면 **주별 또는 월별**을 권합니다.")
+    else:
+        s2.caption(f"{freq} 수익률로 계산합니다. 표본 수는 줄지만 시차 문제가 완화됩니다.")
+
+    go = st.button("🔗 상관관계 계산", type="primary", width="stretch",
+                   disabled=bool(bad) or len(tickers) < 2)
+    if go:
+        st.session_state["_corr_has_run"] = True
+    if not st.session_state.get("_corr_has_run"):
+        st.info("👆 종목을 2개 이상 입력한 뒤 **상관관계 계산**을 눌러주세요.")
+        return
+    if len(tickers) < 2:
+        st.error("최소 2개 종목이 필요합니다.")
+        return
+
+    # ---------------- 데이터 ----------------
+    try:
+        with st.spinner("데이터 수집 중..."):
+            prices, meta, fx_used = build_price_frame(
+                tickers, start_date, end_date, base_ccy, use_div, fx_hedge, gap_fill)
+    except Exception as ex:
+        st.error(f"데이터를 가져오지 못했습니다: {ex}")
+        return
+    if prices.empty or len(prices) < 30:
+        st.error("공통 거래일이 부족합니다. 기간이나 종목을 확인해주세요.")
+        return
+
+    R = corr_returns(prices[tickers], freq)
+    if len(R) < 10:
+        st.error(f"{freq} 표본이 {len(R)}개뿐입니다. 기간을 늘리거나 주기를 짧게 바꿔주세요.")
+        return
+    corr = R.corr().round(3)
+
+    st.success(f"✅ 계산 완료 · {freq} 수익률 {len(R):,}개 "
+               f"({prices.index[0].date()} ~ {prices.index[-1].date()}) · 기준통화 {base_ccy}")
+
+    # ---------------- 행렬 ----------------
+    st.subheader("3️⃣ 상관관계 행렬 (Correlation Matrix)")
+    st.caption("1에 가까우면 함께 움직이고, 0이면 서로 무관하며, 음수면 반대로 움직입니다. "
+               "**푸른색일수록 분산 효과가 큽니다.**")
+    st.dataframe(corr.style.format("{:.2f}").map(_corr_color), width="stretch")
+
+    # ---------------- 요약 ----------------
+    st.subheader("4️⃣ 분산 효과 요약 (Diversification)")
+    rho, eff = diversification_stats(corr)
+    pairs = corr_pairs(corr)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("종목 수", f"{len(tickers)}개")
+    k2.metric("평균 상관계수", f"{rho:.2f}")
+    k3.metric("실효 종목 수", f"{eff:.1f}개",
+              help="등가중 가정에서 위험 분산 효과가 몇 종목에 해당하는지입니다. "
+                   "N / (1 + (N−1)×평균상관) 으로 계산합니다.")
+    k4.metric("분산 활용도", f"{eff/len(tickers)*100:.0f}%",
+              help="실효 종목 수 ÷ 실제 종목 수. 낮을수록 비슷한 종목이 많다는 뜻입니다. "
+                   "평균 상관계수가 음수이면 100%를 넘을 수 있습니다.")
+
+    if eff > len(tickers):
+        st.success(f"평균 상관계수가 **{rho:+.2f}** 로 음수입니다. 종목들이 서로 반대 방향으로 "
+                   f"움직여, 서로 무관한 {len(tickers)}종목보다도 분산 효과가 큽니다.")
+
+    if rho > 0.7:
+        st.warning(f"평균 상관계수가 **{rho:.2f}** 로 높습니다. {len(tickers)}종목을 담았지만 "
+                   f"분산 효과는 사실상 **{eff:.1f}종목** 수준입니다. "
+                   f"성격이 다른 자산군을 추가하는 것을 고려해보세요.")
+    elif rho < 0.3:
+        st.success(f"평균 상관계수가 **{rho:.2f}** 로 낮아 분산 효과가 잘 나타나고 있습니다.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**분산 효과가 큰 쌍** (상관계수 낮은 순)")
+        st.dataframe(pairs.head(5).style.format({"상관계수": "{:.2f}"}),
+                     width="stretch", hide_index=True)
+    with c2:
+        st.markdown("**서로 비슷하게 움직이는 쌍** (상관계수 높은 순)")
+        st.dataframe(pairs.tail(5).iloc[::-1].style.format({"상관계수": "{:.2f}"}),
+                     width="stretch", hide_index=True)
+
+    # ---------------- 기간별 ----------------
+    st.subheader("5️⃣ 기간별 상관관계 (By Period)")
+    st.caption("상관관계는 고정된 값이 아닙니다. 기간에 따라 크게 달라지며, "
+               "특히 **위기 국면에서는 대부분의 자산이 함께 움직입니다.**")
+    last = prices.index[-1]
+    prows = {}
+    for lbl, yrs in CORR_PERIODS.items():
+        sub = prices[tickers] if yrs is None else \
+            prices[tickers].loc[last - pd.DateOffset(years=yrs):]
+        Rp = corr_returns(sub, freq)
+        if len(Rp) < 10:
+            continue
+        cp = Rp.corr()
+        r_, e_ = diversification_stats(cp)
+        prows[lbl] = {"표본 수": len(Rp), "평균 상관계수": r_,
+                      "실효 종목 수": e_,
+                      "최저 쌍": float(corr_pairs(cp)["상관계수"].min()),
+                      "최고 쌍": float(corr_pairs(cp)["상관계수"].max())}
+    pdf = pd.DataFrame(prows).T
+    if not pdf.empty:
+        st.dataframe(pdf.style.format({"표본 수": "{:.0f}", "평균 상관계수": "{:.2f}",
+                                       "실효 종목 수": "{:.1f}", "최저 쌍": "{:.2f}",
+                                       "최고 쌍": "{:.2f}"}), width="stretch")
+
+    # ---------------- 롤링 ----------------
+    st.subheader("6️⃣ 상관관계 추이 (Rolling Correlation)")
+    r1, r2, r3 = st.columns([2, 2, 1])
+    pick_a = r1.selectbox("종목 A", tickers, index=0, key="_corr_a")
+    others = [t for t in tickers if t != pick_a] or tickers
+    pick_b = r2.selectbox("종목 B", others, index=0, key="_corr_b")
+    win_map = {"일별": [63, 126, 252], "주별": [26, 52, 104], "월별": [12, 24, 36]}[freq]
+    unit = {"일별": "일", "주별": "주", "월별": "개월"}[freq]
+    win = r3.selectbox("구간", win_map, index=1, key="_corr_win",
+                       format_func=lambda x: f"{x}{unit}")
+    if pick_a != pick_b and len(R) > win + 5:
+        roll = R[pick_a].rolling(win).corr(R[pick_b]).dropna()
+        fr = go.Figure()
+        fr.add_trace(go.Scatter(x=roll.index, y=roll.values,
+                                name=f"{pick_a} ↔ {pick_b}",
+                                line=dict(color="#2563eb", width=2)))
+        fr.add_hline(y=roll.mean(), line_dash="dot", line_color="#94a3b8",
+                     annotation_text=f"평균 {roll.mean():.2f}")
+        fr.add_hline(y=0, line_dash="dot", line_color="#e2e8f0")
+        fr.update_layout(height=340, hovermode="x unified",
+                         yaxis=dict(range=[-1.05, 1.05], title=None),
+                         margin=dict(l=0, r=0, t=20, b=0))
+        st.plotly_chart(fr, width="stretch")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("평균", f"{roll.mean():.2f}")
+        m2.metric("최저", f"{roll.min():.2f}")
+        m3.metric("최고", f"{roll.max():.2f}")
+        st.caption(f"{win}{unit} 구간을 뒤돌아보며 계산합니다. 값이 치솟은 시점은 "
+                   f"두 종목이 함께 움직인 국면이며, 그때는 분산 효과가 약해집니다.")
+    else:
+        st.info("서로 다른 두 종목을 선택하거나 기간을 늘려주세요.")
+
+    # ---------------- 내보내기 ----------------
+    st.divider()
+    try:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
+            corr.to_excel(xw, sheet_name="1_상관관계행렬")
+            pairs.to_excel(xw, sheet_name="2_쌍별상관", index=False)
+            if not pdf.empty:
+                pdf.to_excel(xw, sheet_name="3_기간별")
+            info = pd.DataFrame([
+                {"티커": t, "종목명": meta.get(t, {}).get("name", t),
+                 "통화": meta.get(t, {}).get("currency", "-")} for t in tickers])
+            info.to_excel(xw, sheet_name="4_종목정보", index=False)
+            pd.DataFrame(list({
+                "계산 주기": freq, "기준 통화": base_ccy,
+                "기간": f"{prices.index[0].date()} ~ {prices.index[-1].date()}",
+                "표본 수": f"{len(R):,}",
+                "평균 상관계수": f"{rho:.3f}",
+                "실효 종목 수": f"{eff:.2f}",
+                "배당 처리": "재투자" if use_div else "주가만",
+                "환헤지": "적용" if fx_hedge else "미적용",
+            }.items()), columns=["항목", "값"]).to_excel(
+                xw, sheet_name="5_설정", index=False)
+        st.download_button("📊 엑셀 파일 받기", buf.getvalue(),
+                           f"correlations_{pd.Timestamp.now():%Y%m%d_%H%M}.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           width="stretch")
+    except Exception as ex:
+        st.error(f"엑셀 생성 실패: {ex}")
+    st.caption("상관관계는 과거 데이터에서 계산된 값이며 앞으로도 유지된다는 보장이 없습니다. "
+               "특히 시장 급락 국면에서는 대부분의 자산이 함께 움직이는 경향이 있어, "
+               "분산이 가장 필요한 순간에 효과가 줄어들 수 있습니다.")
+
+
 OPT_COLS = ["티커", "종목명", "현재 비중(%)", "최소(%)", "최대(%)"]
 
 TRAIN_WINDOWS = {
@@ -2830,7 +3565,8 @@ if "_pending_tool" in st.session_state:
     st.session_state["_tool"] = st.session_state.pop("_pending_tool")
 
 with st.sidebar:
-    tool = st.radio("도구", ["📊 포트폴리오 분석", "🎯 포트폴리오 최적화", "📖 도움말"],
+    tool = st.radio("도구", ["📊 포트폴리오 분석", "🎯 포트폴리오 최적화",
+                            "➕ 종목 추가 탐색", "🔗 자산 상관관계", "📖 도움말"],
                     label_visibility="collapsed", key="_tool")
 
 # 도움말은 설정이 필요 없으므로 사이드바를 더 그리지 않고 바로 표시한다
@@ -2883,7 +3619,18 @@ with st.sidebar:
                "일본 `7203.T`  홍콩 `0700.HK`")
 
 
+IS_CAND = tool.endswith("추가 탐색")
+IS_CORR = tool.endswith("상관관계")
 IS_OPT = tool.endswith("최적화")
+
+if IS_CAND:
+    render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
+                            fx_hedge, gap_fill)
+    st.stop()
+
+if IS_CORR:
+    render_correlations(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill)
+    st.stop()
 
 if IS_OPT:
     st.title("🎯 포트폴리오 최적화")
