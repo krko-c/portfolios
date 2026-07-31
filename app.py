@@ -2101,6 +2101,407 @@ def render_help():
 # ======================================================================
 # 시장 국면 분석
 # ======================================================================
+# ======================================================================
+# 뷰 기반 자산배분 (블랙-리터만)
+# ======================================================================
+BL_COLS = ["티커", "종목명", "시장 비중(%)"]
+BL_VIEW_COLS = ["유형", "자산 A", "자산 B", "연 수익률(%)", "확신도"]
+BL_CONF = {"상": 0.25, "중": 1.0, "하": 4.0}
+
+
+def _bl_blank():
+    return {"티커": "", "종목명": "", "시장 비중(%)": np.nan}
+
+
+def _bl_view_blank():
+    return {"유형": "절대", "자산 A": "", "자산 B": "", "연 수익률(%)": np.nan, "확신도": "중"}
+
+
+def implied_returns(delta: float, cov: np.ndarray, w_mkt: np.ndarray) -> np.ndarray:
+    """역최적화. 시장 비중이 최적이 되게 하는 균형 기대수익률 Π = δΣw."""
+    return delta * (cov @ w_mkt)
+
+
+def black_litterman(cov, w_mkt, delta, tau, P, Q, conf_scale):
+    """
+    사후 기대수익률
+      E[R] = [(τΣ)⁻¹ + PᵀΩ⁻¹P]⁻¹ · [(τΣ)⁻¹Π + PᵀΩ⁻¹Q]
+      Ω = diag(확신도계수 × P(τΣ)Pᵀ)
+    뷰가 없으면 균형 수익률을 그대로 돌려준다.
+    """
+    pi = implied_returns(delta, cov, w_mkt)
+    if P is None or len(P) == 0:
+        return pi, pi.copy()
+    P = np.atleast_2d(np.asarray(P, dtype=float))
+    Q = np.asarray(Q, dtype=float).reshape(-1)
+    tS = tau * cov
+    omega = np.diag(np.maximum(
+        np.diag(P @ tS @ P.T) * np.asarray(conf_scale, dtype=float), 1e-12))
+    inv_tS = np.linalg.inv(tS)
+    inv_om = np.linalg.inv(omega)
+    A = inv_tS + P.T @ inv_om @ P
+    b = inv_tS @ pi + P.T @ inv_om @ Q
+    return pi, np.linalg.solve(A, b)
+
+
+def bl_weights(mu, cov, delta, wmin=0.0, wmax=1.0, allow_short=False):
+    """사후 기대수익률로 비중 산출. 제약이 있으면 최적화로, 없으면 해석해로."""
+    n = len(mu)
+    if allow_short and wmin <= -1:
+        w = np.linalg.solve(delta * cov, mu)
+        s = w.sum()
+        return w / s if abs(s) > 1e-12 else np.ones(n) / n
+
+    def obj(w):
+        return float(0.5 * delta * (w @ cov @ w) - w @ mu)
+    lo = -abs(wmin) if allow_short else max(0.0, wmin)
+    return _opt_solve(obj, n, lo, wmax)
+
+
+def render_black_litterman(base_ccy, start_date, end_date, use_div,
+                           fx_hedge, gap_fill, rf_rate):
+    st.title("🧭 뷰 기반 자산배분")
+    st.caption("시장 균형에서 출발해, 내가 가진 전망(뷰)을 **확신도만큼만** 반영해 "
+               "자산배분을 산출합니다. 뷰를 넣지 않으면 시장 비중이 그대로 나옵니다.")
+
+    akey, vkey = "_bl_df", "_bl_views"
+    if akey not in st.session_state:
+        st.session_state[akey] = pd.DataFrame([
+            {"티커": t, "종목명": "", "시장 비중(%)": w}
+            for t, w in [("SPY", 45.0), ("EFA", 25.0), ("EEM", 12.0),
+                         ("AGG", 13.0), ("GLD", 5.0)]])[BL_COLS]
+    if vkey not in st.session_state:
+        st.session_state[vkey] = pd.DataFrame([_bl_view_blank()])[BL_VIEW_COLS]
+    st.session_state.setdefault("_bl_gen", 0)
+
+    # ---------------- 자산 ----------------
+    st.subheader("1️⃣ 자산과 시장 비중 (Market Portfolio)")
+    st.caption("**시장 비중**은 출발점이 되는 기준 배분입니다. 시가총액 비중이 이상적이지만, "
+               "실무에서는 벤치마크 비중이나 현재 전략적 배분을 넣어도 됩니다. "
+               "뷰가 없으면 이 비중이 그대로 결과가 됩니다.")
+    render_etf_loader(target_key=akey, gen_key="_bl_gen", editor_key="_bl_editor",
+                      cols=BL_COLS, weight_col="시장 비중(%)")
+
+    z1, z2 = st.columns([1, 5])
+    _bn = len(st.session_state[akey])
+    bn = z1.number_input("자산 수", 2, 20, _bn, step=1,
+                         key=f"_bl_n_{st.session_state['_bl_gen']}")
+    if int(bn) != _bn:
+        cur = st.session_state[akey]
+        cur = (pd.concat([cur, pd.DataFrame([_bl_blank()] * (int(bn) - len(cur)))],
+                         ignore_index=True) if int(bn) > len(cur)
+               else cur.iloc[:int(bn)].reset_index(drop=True))
+        st.session_state[akey] = cur[BL_COLS]
+        st.session_state["_bl_gen"] += 1
+        st.session_state.pop("_bl_editor", None)
+        st.rerun()
+
+    _bd = st.session_state[akey].copy()
+    _bd["🗑"] = False
+    bed = st.data_editor(
+        _bd, num_rows="fixed", width="stretch", key="_bl_editor",
+        column_order=BL_COLS + ["🗑"], hide_index=True,
+        column_config={
+            "티커": st.column_config.TextColumn("티커", width="small"),
+            "종목명": st.column_config.TextColumn("종목명 (자동)", disabled=True,
+                                              width="medium"),
+            "시장 비중(%)": st.column_config.NumberColumn(
+                "시장 비중(%)", min_value=0.0, max_value=100.0, step=0.1,
+                format="%.2f", width="small"),
+            "🗑": st.column_config.CheckboxColumn("삭제", width="small"),
+        })
+    _bdel = bed["🗑"].fillna(False).astype(bool)
+    if _bdel.any():
+        kept = bed.loc[~_bdel, BL_COLS].reset_index(drop=True)
+        if kept.empty:
+            kept = pd.DataFrame([_bl_blank()])[BL_COLS]
+        st.session_state[akey] = kept
+        st.session_state["_bl_gen"] += 1
+        st.session_state.pop("_bl_editor", None)
+        st.rerun()
+
+    bf = bed[BL_COLS].copy()
+    bf["티커"] = bf["티커"].fillna("").astype(str).str.strip()
+    bf["시장 비중(%)"] = pd.to_numeric(bf["시장 비중(%)"], errors="coerce")
+    labs, bad = [], []
+    if any(t for t in bf["티커"]):
+        with st.spinner("티커 확인 중..."):
+            res = []
+            for t in bf["티커"]:
+                if not t:
+                    res.append(""); labs.append(""); continue
+                r = probe_ticker(tuple(normalize_ticker(t)))
+                if r["ticker"] is None:
+                    res.append(t); labs.append("❌ 확인 불가"); bad.append(t)
+                else:
+                    res.append(r["ticker"])
+                    labs.append(f"✅ {r.get('name') or '(종목명 없음)'} · {r['currency']}")
+        bf["티커"] = res
+    bf["종목명"] = labs if labs else ""
+    if not _frames_equal(bf, st.session_state[akey]):
+        st.session_state[akey] = bf
+        st.session_state.pop("_bl_editor", None)
+        st.rerun()
+
+    live = bf[bf["티커"] != ""].copy()
+    tickers = list(live["티커"])
+    wsum = float(live["시장 비중(%)"].fillna(0).sum())
+    st.caption(f"자산 {len(tickers)}개 · 시장 비중 합계 **{wsum:.2f}%**"
+               + ("" if abs(wsum - 100) < 0.01 else " · 100%가 아니면 자동 정규화됩니다"))
+    if bad:
+        st.error(f"확인되지 않는 티커: {', '.join(bad)}")
+
+    # ---------------- 뷰 ----------------
+    st.subheader("2️⃣ 전망 입력 (Views)")
+    st.caption("**절대** — 특정 자산이 연 몇 %를 낼 것이다.  |  "
+               "**상대** — 자산 A가 자산 B보다 연 몇 %p 나을 것이다.\n\n"
+               "확신도가 낮으면 시장 비중에서 거의 움직이지 않고, 높을수록 뷰 쪽으로 "
+               "크게 기울어집니다. 비워두면 뷰 없이 계산합니다.")
+    ved = st.data_editor(
+        st.session_state[vkey], num_rows="dynamic", width="stretch",
+        key="_bl_view_editor", column_order=BL_VIEW_COLS, hide_index=True,
+        column_config={
+            "유형": st.column_config.SelectboxColumn("유형", options=["절대", "상대"],
+                                                   width="small"),
+            "자산 A": st.column_config.SelectboxColumn("자산 A", options=tickers,
+                                                    width="medium"),
+            "자산 B": st.column_config.SelectboxColumn(
+                "자산 B (상대일 때)", options=tickers, width="medium"),
+            "연 수익률(%)": st.column_config.NumberColumn(
+                "연 수익률(%)", step=0.5, format="%.2f", width="small",
+                help="절대: 예상 연 수익률 · 상대: A가 B보다 얼마나 나은지(%p)"),
+            "확신도": st.column_config.SelectboxColumn("확신도", options=list(BL_CONF),
+                                                    width="small"),
+        })
+    st.session_state[vkey] = ved
+
+    # ---------------- 설정 ----------------
+    st.subheader("3️⃣ 모형 설정 (Model Settings)")
+    p1, p2, p3 = st.columns(3)
+    auto_delta = p1.checkbox("위험회피계수 자동 추정", value=True, key="_bl_autod",
+                             help="시장 포트폴리오의 과거 초과수익과 변동성에서 "
+                                  "δ = (수익률 − 무위험) / 변동성² 로 추정합니다.")
+    delta_in = p1.number_input("위험회피계수 δ", 0.5, 10.0, 2.5, step=0.1,
+                               key="_bl_delta", disabled=auto_delta,
+                               help="클수록 위험을 싫어해 보수적인 배분이 나옵니다. "
+                                    "통상 2~3을 씁니다.")
+    tau = p2.number_input("τ (균형 추정의 불확실성)", 0.01, 1.0, 0.05, step=0.01,
+                          key="_bl_tau",
+                          help="작을수록 시장 균형을 신뢰하고 뷰의 영향이 줄어듭니다. "
+                               "통상 0.025~0.05를 씁니다.")
+    lookback = p3.selectbox("공분산 추정 기간", list(TRAIN_WINDOWS), index=4,
+                            key="_bl_look",
+                            help="상관·변동성을 추정할 과거 구간입니다. "
+                                 "길수록 안정적이지만 최근 변화를 늦게 반영합니다.")
+    q1, q2 = st.columns(2)
+    wmax_bl = q1.slider("자산별 최대 비중 (%)", 10, 100, 60, step=5, key="_bl_wmax")
+    allow_short = q2.checkbox("공매도 허용", value=False, key="_bl_short",
+                              help="허용하면 음(−)의 비중이 나올 수 있습니다.")
+
+    run_bl = st.button("🧭 자산배분 계산", type="primary", width="stretch",
+                       disabled=bool(bad) or len(tickers) < 2 or wsum <= 0)
+    if run_bl:
+        st.session_state["_bl_has_run"] = True
+    if not st.session_state.get("_bl_has_run"):
+        st.info("👆 자산과 시장 비중을 입력한 뒤 **자산배분 계산**을 눌러주세요. "
+                "뷰는 비워두셔도 됩니다.")
+        return
+
+    # ---------------- 데이터 ----------------
+    try:
+        with st.spinner("데이터 수집 중..."):
+            prices, meta, _fx = build_price_frame(tickers, start_date, end_date,
+                                                  base_ccy, use_div, fx_hedge, gap_fill)
+    except Exception as ex:
+        st.error(f"데이터를 가져오지 못했습니다: {ex}")
+        return
+    use_tk = [t for t in tickers if t in prices.columns]
+    if len(use_tk) < 2:
+        st.error("최소 2개 자산의 데이터가 필요합니다.")
+        return
+    miss = [t for t in tickers if t not in use_tk]
+    if miss:
+        st.warning(f"데이터가 없어 제외합니다: {', '.join(miss)}")
+
+    lb = TRAIN_WINDOWS[lookback]
+    px = prices[use_tk] if lb is None else \
+        prices[use_tk].loc[max(prices.index[0], prices.index[-1] - lb):]
+    R = px.pct_change().dropna()
+    if len(R) < MIN_TRAIN_DAYS:
+        st.error(f"공분산 추정 표본이 {len(R)}일뿐입니다. 기간을 늘려주세요.")
+        return
+    cov = (R.cov() * TRADING_DAYS).values
+
+    w_mkt = live.set_index("티커")["시장 비중(%)"].reindex(use_tk).fillna(0).values
+    if w_mkt.sum() <= 0:
+        w_mkt = np.ones(len(use_tk))
+    w_mkt = w_mkt / w_mkt.sum()
+
+    if auto_delta:
+        r_mkt = (R.values @ w_mkt)
+        mu_m = float(np.mean(r_mkt) * TRADING_DAYS)
+        var_m = float(np.var(r_mkt) * TRADING_DAYS)
+        delta = float(np.clip((mu_m - rf_rate) / var_m, 0.5, 10.0)) if var_m > 1e-12 else 2.5
+    else:
+        delta = float(delta_in)
+
+    # ---------------- 뷰 파싱 ----------------
+    P, Q, conf, vdesc = [], [], [], []
+    vv = ved.copy()
+    for _, r in vv.iterrows():
+        a = str(r.get("자산 A") or "").strip()
+        val = pd.to_numeric(r.get("연 수익률(%)"), errors="coerce")
+        if a not in use_tk or pd.isna(val):
+            continue
+        row = np.zeros(len(use_tk))
+        if str(r.get("유형")) == "상대":
+            b = str(r.get("자산 B") or "").strip()
+            if b not in use_tk or b == a:
+                continue
+            row[use_tk.index(a)] = 1.0
+            row[use_tk.index(b)] = -1.0
+            vdesc.append(f"{a} 가 {b} 보다 연 {val:+.2f}%p 우위 (확신 {r.get('확신도')})")
+        else:
+            row[use_tk.index(a)] = 1.0
+            vdesc.append(f"{a} 연 수익률 {val:.2f}% (확신 {r.get('확신도')})")
+        P.append(row); Q.append(float(val) / 100.0)
+        conf.append(BL_CONF.get(str(r.get("확신도")), 1.0))
+
+    pi, post = black_litterman(cov, w_mkt, delta, tau,
+                               P if P else None, Q if Q else None,
+                               conf if conf else None)
+    w_bl = bl_weights(post, cov, delta, 0.0, wmax_bl / 100.0, allow_short)
+
+    st.success(f"✅ 계산 완료 · 자산 {len(use_tk)}개 · 뷰 **{len(P)}개** · "
+               f"위험회피계수 δ = **{delta:.2f}**{' (자동 추정)' if auto_delta else ''} · "
+               f"공분산 {lookback} ({R.index[0].date()} ~ {R.index[-1].date()}, {len(R):,}일)")
+    if vdesc:
+        st.markdown("**반영된 전망**\n\n" + "\n".join(f"- {v}" for v in vdesc))
+    else:
+        st.info("뷰가 없어 **시장 비중이 그대로** 결과가 됩니다. "
+                "위 표에 전망을 넣으면 배분이 조정됩니다.")
+
+    # ---------------- 기대수익률 ----------------
+    st.subheader("4️⃣ 기대수익률 (Expected Returns)")
+    st.caption("**균형**은 시장 비중이 최적이 되도록 역산한 값이고, "
+               "**사후**는 거기에 내 전망을 확신도만큼 섞은 값입니다.")
+    edf = pd.DataFrame({
+        "티커": use_tk,
+        "종목명": [meta.get(t, {}).get("name", t) for t in use_tk],
+        "균형 기대수익률(%)": pi * 100,
+        "사후 기대수익률(%)": post * 100,
+        "변화(%p)": (post - pi) * 100,
+        "연 변동성(%)": np.sqrt(np.diag(cov)) * 100,
+    })
+    st.dataframe(edf.style.format({"균형 기대수익률(%)": "{:.2f}",
+                                   "사후 기대수익률(%)": "{:.2f}",
+                                   "변화(%p)": "{:+.2f}",
+                                   "연 변동성(%)": "{:.2f}"}),
+                 width="stretch", hide_index=True)
+
+    # ---------------- 배분 ----------------
+    st.subheader("5️⃣ 제안 배분 (Suggested Allocation)")
+    adf = pd.DataFrame({
+        "티커": use_tk,
+        "시장 비중(%)": w_mkt * 100,
+        "제안 비중(%)": w_bl * 100,
+    })
+    adf["변화(%p)"] = adf["제안 비중(%)"] - adf["시장 비중(%)"]
+    adf = adf.sort_values("제안 비중(%)", ascending=False)
+
+    fa = go.Figure()
+    fa.add_trace(go.Bar(y=adf["티커"], x=adf["시장 비중(%)"], name="시장 비중",
+                        orientation="h", marker_color="#cbd5e1",
+                        text=[f"{v:.1f}%" for v in adf["시장 비중(%)"]],
+                        textposition="outside"))
+    fa.add_trace(go.Bar(y=adf["티커"], x=adf["제안 비중(%)"], name="제안 비중",
+                        orientation="h", marker_color="#4f46e5",
+                        text=[f"{v:.1f}%" for v in adf["제안 비중(%)"]],
+                        textposition="outside"))
+    fa.update_layout(barmode="group", height=90 + 56 * len(adf),
+                     margin=dict(l=0, r=60, t=30, b=0),
+                     xaxis=dict(title=None, ticksuffix="%"),
+                     yaxis=dict(autorange="reversed"),
+                     legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+    st.plotly_chart(fa, width="stretch")
+    st.dataframe(adf.style.format({"시장 비중(%)": "{:.2f}", "제안 비중(%)": "{:.2f}",
+                                   "변화(%p)": "{:+.2f}"}),
+                 width="stretch", hide_index=True)
+
+    # ---------------- 기대 성과 ----------------
+    st.subheader("6️⃣ 기대 성과 비교 (Expected Performance)")
+    st.caption("사후 기대수익률과 공분산으로 계산한 **예상치**입니다. "
+               "과거 실현 성과가 아니라 모형이 내다본 값입니다.")
+    rows = []
+    for lbl, w_ in [("시장 비중", w_mkt), ("제안 배분", w_bl)]:
+        r_, v_, s_ = port_perf(w_, post, cov, rf_rate)
+        rows.append({"구성": lbl, "기대수익률(%)": r_ * 100,
+                     "예상 변동성(%)": v_ * 100, "예상 샤프": s_})
+    pdf_ = pd.DataFrame(rows).set_index("구성")
+    if len(pdf_) == 2:
+        pdf_.loc["차이"] = pdf_.iloc[1] - pdf_.iloc[0]
+    st.dataframe(pdf_.style.format("{:.2f}"), width="stretch")
+
+    with st.expander("과거 성과로 확인해보기 (참고용)", expanded=False):
+        st.caption("두 배분을 **과거에 적용했다면** 어땠을지입니다. 지금의 전망을 과거에 "
+                   "적용한 것이므로 검증이 아니라 참고 자료로만 보세요.")
+        try:
+            W_m = {t: float(x) * 100 for t, x in zip(use_tk, w_mkt)}
+            W_b = {t: float(x) * 100 for t, x in zip(use_tk, np.clip(w_bl, 0, None))}
+            rows2 = {}
+            for lbl, W in [("시장 비중", W_m), ("제안 배분", W_b)]:
+                if sum(W.values()) <= 0:
+                    continue
+                rr = portfolio_returns(px, W, REBAL_QUARTER)
+                rows2[lbl] = perf_row(rr, rf_rate)
+            if rows2:
+                st.dataframe(pd.DataFrame(rows2).T.style.format("{:.2f}", na_rep="-"),
+                             width="stretch")
+                fh = go.Figure()
+                for lbl, W in [("시장 비중", W_m), ("제안 배분", W_b)]:
+                    if sum(W.values()) <= 0:
+                        continue
+                    ec = equity_curve(portfolio_returns(px, W, REBAL_QUARTER))
+                    fh.add_trace(go.Scatter(x=ec.index, y=ec.values, name=lbl,
+                                            line=dict(width=2)))
+                fh.update_layout(height=340, hovermode="x unified",
+                                 margin=dict(l=0, r=0, t=30, b=0),
+                                 legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+                st.plotly_chart(fh, width="stretch")
+        except Exception as ex:
+            st.caption(f"과거 성과를 계산하지 못했습니다: {ex}")
+
+    # ---------------- 내보내기 ----------------
+    st.divider()
+    try:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
+            adf.to_excel(xw, sheet_name="1_제안배분", index=False)
+            edf.to_excel(xw, sheet_name="2_기대수익률", index=False)
+            pdf_.to_excel(xw, sheet_name="3_기대성과")
+            pd.DataFrame({"전망": vdesc or ["(없음)"]}).to_excel(
+                xw, sheet_name="4_전망", index=False)
+            pd.DataFrame(cov, index=use_tk, columns=use_tk).to_excel(
+                xw, sheet_name="5_공분산")
+            pd.DataFrame(list({
+                "위험회피계수 δ": f"{delta:.3f}" + (" (자동)" if auto_delta else ""),
+                "τ": f"{tau:.3f}", "공분산 추정 기간": lookback,
+                "표본": f"{len(R):,}일", "자산별 최대 비중": f"{wmax_bl}%",
+                "공매도": "허용" if allow_short else "금지",
+                "기준 통화": base_ccy, "무위험 수익률": f"{rf_rate*100:.2f}%",
+            }.items()), columns=["항목", "값"]).to_excel(xw, sheet_name="6_설정",
+                                                       index=False)
+        st.download_button("📊 엑셀 파일 받기", buf.getvalue(),
+                           f"black_litterman_{pd.Timestamp.now():%Y%m%d_%H%M}.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           width="stretch")
+    except Exception as ex:
+        st.error(f"엑셀 생성 실패: {ex}")
+    st.caption("이 모형은 시장 비중이 합리적인 출발점이라는 가정에 기대며, 공분산은 과거에서 "
+               "추정합니다. 전망이 빗나가면 결과도 빗나갑니다. "
+               "교육·참고용이며 투자 자문이 아닙니다.")
+
+
 REG_COLS = ["티커", "종목명"]
 REG_COLORS = {"강세": "#dcfce7", "약세": "#fee2e2", "횡보": "#f1f5f9"}
 REG_LINE = {"강세": "#16a34a", "약세": "#dc2626", "횡보": "#94a3b8"}
@@ -3948,8 +4349,8 @@ if "_pending_tool" in st.session_state:
 
 with st.sidebar:
     tool = st.radio("도구", ["📊 포트폴리오 분석", "🎯 포트폴리오 최적화",
-                            "➕ 종목 추가 탐색", "🔗 자산 상관관계",
-                            "📉 시장 국면 분석", "📖 도움말"],
+                            "➕ 종목 추가 탐색", "🧭 뷰 기반 자산배분",
+                            "🔗 자산 상관관계", "📉 시장 국면 분석", "📖 도움말"],
                     label_visibility="collapsed", key="_tool")
 
 # 도움말은 설정이 필요 없으므로 사이드바를 더 그리지 않고 바로 표시한다
@@ -4002,7 +4403,13 @@ with st.sidebar:
                "일본 `7203.T`  홍콩 `0700.HK`")
 
 
+IS_BL = tool.endswith("자산배분")
 IS_REG = tool.endswith("국면 분석")
+
+if IS_BL:
+    render_black_litterman(base_ccy, start_date, end_date, use_div,
+                           fx_hedge, gap_fill, rf_rate)
+    st.stop()
 IS_CAND = tool.endswith("추가 탐색")
 
 if IS_REG:
