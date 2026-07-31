@@ -1612,8 +1612,6 @@ def optimize(R: pd.DataFrame, goal: str, risk_name: str, rf=0.0,
         return hrp_weights(R), mu, cov
 
     if goal.startswith("위험균형"):
-        cons = [{"type": "eq", "fun": lambda w: w.sum() - 1.0}] + extra
-
         def rp_obj(w):
             rc = risk_contributions(w, cov)
             return float(((rc - rc.mean()) ** 2).sum()) * 1e4
@@ -2661,9 +2659,9 @@ def render_correlations(base_ccy, start_date, end_date, use_div, fx_hedge, gap_f
     else:
         s2.caption(f"{freq} 수익률로 계산합니다. 표본 수는 줄지만 시차 문제가 완화됩니다.")
 
-    go = st.button("🔗 상관관계 계산", type="primary", width="stretch",
-                   disabled=bool(bad) or len(tickers) < 2)
-    if go:
+    run_corr = st.button("🔗 상관관계 계산", type="primary", width="stretch",
+                         disabled=bool(bad) or len(tickers) < 2)
+    if run_corr:
         st.session_state["_corr_has_run"] = True
     if not st.session_state.get("_corr_has_run"):
         st.info("👆 종목을 2개 이상 입력한 뒤 **상관관계 계산**을 눌러주세요.")
