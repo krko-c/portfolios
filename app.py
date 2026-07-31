@@ -359,6 +359,117 @@ def get_name(ticker: str) -> str:
 
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_etf_holdings(ticker: str):
+    """
+    ETF 상위 보유종목을 조회한다.
+    반환: (DataFrame|None, 안내문)
+    야후는 상위 10개 내외만 제공하며, 국내 ETF는 대부분 데이터가 없다.
+    """
+    try:
+        fd = yf.Ticker(ticker).funds_data
+        df = fd.top_holdings
+    except Exception as ex:
+        return None, f"보유종목 정보를 제공하지 않는 종목입니다. ({type(ex).__name__})"
+
+    if df is None or len(df) == 0:
+        return None, "보유종목 정보가 비어 있습니다."
+
+    pct_col = next((c for c in df.columns if "percent" in str(c).lower()), None)
+    name_col = next((c for c in df.columns if "name" in str(c).lower()), None)
+    if pct_col is None:
+        return None, "비중 정보를 찾을 수 없습니다."
+
+    w = pd.to_numeric(df[pct_col], errors="coerce")
+    if w.max() is not None and w.max() <= 1.5:      # 0~1 소수로 오는 경우
+        w = w * 100
+    out = pd.DataFrame({
+        "티커": [str(x).strip() for x in df.index],
+        "종목명": (df[name_col].astype(str).values if name_col else ""),
+        "비중(%)": w.round(2).values,
+    })
+    out = out[out["티커"].str.strip() != ""].reset_index(drop=True)
+    if out.empty:
+        return None, "유효한 보유종목이 없습니다."
+    return out, ""
+
+
+def render_etf_loader(target_key: str, gen_key: str, editor_key: str,
+                      cols: list, weight_col: str, extra_defaults: dict = None):
+    """
+    ETF 구성종목 불러오기 UI. 조회 후 버튼을 누르면 대상 표를 덮어쓴다.
+    target_key : 종목 표를 담고 있는 session_state 키
+    gen_key    : 행 수 위젯 재생성용 세대 키
+    """
+    with st.expander("📦 ETF 구성종목 불러오기", expanded=False):
+        st.caption("ETF 티커를 넣으면 상위 보유종목과 비중을 가져와 아래 표에 채웁니다. "
+                   "**야후가 제공하는 범위가 상위 10개 내외**라 전체 구성종목은 아니며, "
+                   "**국내 ETF는 대부분 지원되지 않습니다.** "
+                   "미국 ETF에서 주로 동작합니다.")
+        e1, e2 = st.columns([3, 1])
+        etf = e1.text_input("ETF 티커", key=f"etf_in_{target_key}",
+                            placeholder="예: QQQ, SPY, SCHD, XLK")
+        e2.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        if e2.button("조회", key=f"etf_go_{target_key}", width="stretch",
+                     disabled=not etf.strip()):
+            cands = normalize_ticker(etf)
+            sym = cands[0] if cands else etf.strip().upper()
+            with st.spinner(f"{sym} 구성종목 조회 중..."):
+                hold, msg = load_etf_holdings(sym)
+            st.session_state[f"etf_res_{target_key}"] = (sym, hold, msg)
+
+        res = st.session_state.get(f"etf_res_{target_key}")
+        if not res:
+            return
+        sym, hold, msg = res
+        if hold is None:
+            st.warning(f"**{sym}** — {msg}\n\n"
+                       f"국내 ETF이거나 야후가 구성 정보를 제공하지 않는 상품일 수 있습니다. "
+                       f"이 경우 종목을 직접 입력해주세요.")
+            return
+
+        tot = float(hold["비중(%)"].sum())
+        st.dataframe(hold.style.format({"비중(%)": "{:.2f}"}),
+                     width="stretch", hide_index=True)
+        st.caption(f"**{sym}** 상위 {len(hold)}종목 · 합계 **{tot:.2f}%** "
+                   f"(나머지 {max(0.0, 100-tot):.2f}%는 그 외 종목)")
+
+        mode = st.radio(
+            "나머지 비중 처리", ["상위 종목만으로 100% 재조정", f"나머지는 {sym} 자체로 채우기"],
+            key=f"etf_mode_{target_key}", horizontal=False,
+            help="상위 종목의 합이 100%에 못 미칩니다. 부족분을 어떻게 다룰지 정하세요.")
+
+        if st.button("⬇️ 아래 표에 채우기", key=f"etf_fill_{target_key}",
+                     type="primary", width="stretch"):
+            rows = []
+            if mode.startswith("상위"):
+                scale = 100.0 / tot if tot > 0 else 1.0
+                for _, r in hold.iterrows():
+                    rows.append({"티커": r["티커"],
+                                 weight_col: round(float(r["비중(%)"]) * scale, 2)})
+            else:
+                for _, r in hold.iterrows():
+                    rows.append({"티커": r["티커"], weight_col: round(float(r["비중(%)"]), 2)})
+                rest = round(100.0 - tot, 2)
+                if rest > 0.01:
+                    rows.append({"티커": sym, weight_col: rest})
+            # 합계를 정확히 100으로 맞춤
+            s = sum(r[weight_col] for r in rows)
+            if rows and abs(s - 100) > 1e-9:
+                rows[-1][weight_col] = round(rows[-1][weight_col] + (100 - s), 2)
+
+            base = {c: ("" if c not in (weight_col,) else np.nan) for c in cols}
+            if extra_defaults:
+                base.update(extra_defaults)
+            full = [{**base, **r} for r in rows]
+            st.session_state[target_key] = pd.DataFrame(full)[cols]
+            st.session_state[gen_key] = st.session_state.get(gen_key, 0) + 1
+            st.session_state.pop(editor_key, None)
+            st.session_state.pop(f"etf_res_{target_key}", None)
+            st.success(f"{len(rows)}종목을 표에 채웠습니다.")
+            st.rerun()
+
+
 def _frames_equal(a: pd.DataFrame, b: pd.DataFrame) -> bool:
     """무한 재실행을 막기 위한 비교 (문자열로 변환해 안전하게 대조)."""
     try:
@@ -2109,6 +2220,10 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                "특정 종목을 제한하려면 최소·최대 편입비중을 조정하세요.")
 
     c1, c2, c3 = st.columns([1, 1.2, 4])
+    render_etf_loader(target_key=key, gen_key="_opt_gen", editor_key="_opt_editor",
+                      cols=OPT_COLS, weight_col="현재 비중(%)",
+                      extra_defaults={"최소(%)": 0.0, "최대(%)": 100.0})
+
     st.session_state.setdefault("_opt_gen", 0)
     _ocnt = len(st.session_state[key])
     n = c1.number_input("종목 수", 2, 20, _ocnt, step=1,
@@ -2903,6 +3018,9 @@ for i, tab in enumerate(tabs):
         dfkey = f"df_{i}"
         if dfkey not in st.session_state:
             st.session_state[dfkey] = default_holdings(i)
+
+        render_etf_loader(target_key=dfkey, gen_key=f"gen_{i}",
+                          editor_key=f"hold_{i}", cols=COLS, weight_col="비중(%)")
 
         # 행 수가 프로그램에 의해 바뀔 때마다 세대 번호를 올려 위젯을 새로 만든다.
         # (같은 행 수로 되돌아왔을 때 이전 입력값이 되살아나는 것을 막는다)
