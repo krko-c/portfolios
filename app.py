@@ -2098,6 +2098,390 @@ def render_help():
 # ======================================================================
 # 종목 추가 탐색
 # ======================================================================
+# ======================================================================
+# 시장 국면 분석
+# ======================================================================
+REG_COLS = ["티커", "종목명"]
+REG_COLORS = {"강세": "#dcfce7", "약세": "#fee2e2", "횡보": "#f1f5f9"}
+REG_LINE = {"강세": "#16a34a", "약세": "#dc2626", "횡보": "#94a3b8"}
+
+
+def _reg_blank():
+    return {"티커": "", "종목명": ""}
+
+
+def classify_regime(px: pd.Series, bear=0.20, bull=0.20,
+                    side_win=126, side_band=0.05, min_days=60) -> pd.Series:
+    """
+    통용되는 정의를 따른다.
+      · 고점 대비 -bear% 하락 → 약세장. 시작일은 그 '고점'으로 소급한다.
+      · 저점 대비 +bull% 반등 → 강세장. 시작일은 그 '저점'으로 소급한다.
+      · 강세 구간 중 최근 side_win일 수익률이 ±side_band 이내면 횡보로 세분한다.
+    너무 짧은 구간은 이웃에 흡수시키되, 약세는 길이와 무관하게 보존한다.
+    """
+    px = px.dropna()
+    if len(px) < 20:
+        return pd.Series("강세", index=px.index)
+
+    state, lab = "강세", []
+    peak = trough = float(px.iloc[0])
+    peak_i = trough_i = 0
+    for i, v in enumerate(px.values):
+        v = float(v)
+        if state == "강세":
+            if v > peak:
+                peak, peak_i = v, i
+            if v <= peak * (1 - bear):
+                state = "약세"
+                for j in range(peak_i, i):
+                    lab[j] = "약세"
+                trough, trough_i = v, i
+        else:
+            if v < trough:
+                trough, trough_i = v, i
+            if v >= trough * (1 + bull):
+                state = "강세"
+                for j in range(trough_i, i):
+                    lab[j] = "강세"
+                peak, peak_i = v, i
+        lab.append(state)
+
+    s = pd.Series(lab, index=px.index)
+    if side_win and side_band:
+        r = px.pct_change(side_win)
+        s[(s == "강세") & (r.abs() < side_band)] = "횡보"
+
+    if min_days and min_days > 1:
+        arr = list(s.values)
+        guard = 0
+        while guard <= len(arr):
+            guard += 1
+            bounds = [0] + [i for i in range(1, len(arr)) if arr[i] != arr[i - 1]] + [len(arr)]
+            segs = [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
+            tgt = next((k for k, (a, b) in enumerate(segs)
+                        if (b - a) < min_days and arr[a] != "약세"), None)
+            if tgt is None:
+                break
+            a, b = segs[tgt]
+            src = segs[tgt - 1][0] if tgt > 0 else (
+                segs[tgt + 1][0] if tgt + 1 < len(segs) else None)
+            if src is None:
+                break
+            for j in range(a, b):
+                arr[j] = arr[src]
+        s = pd.Series(arr, index=s.index)
+    return s
+
+
+def regime_segments(px: pd.Series, lab: pd.Series) -> pd.DataFrame:
+    g = (lab != lab.shift()).cumsum()
+    rows = []
+    for _, idx in lab.groupby(g).groups.items():
+        a, b = idx[0], idx[-1]
+        yrs = max((b - a).days / 365.25, 1 / 365.25)
+        rows.append({"국면": lab[a], "시작": a.date(), "종료": b.date(),
+                     "거래일": len(idx), "기간(년)": round(yrs, 2),
+                     "구간 수익률(%)": (float(px[b]) / float(px[a]) - 1) * 100})
+    return pd.DataFrame(rows)
+
+
+def render_regimes(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, rf_rate):
+    st.title("📉 시장 국면 분석")
+    st.caption("시장을 강세·약세·횡보로 나누고, 국면마다 자산들이 어떻게 움직였는지 봅니다. "
+               "**상관관계가 국면에 따라 어떻게 달라지는지**가 핵심입니다.")
+
+    key = "_reg_df"
+    if key not in st.session_state:
+        st.session_state[key] = pd.DataFrame(
+            [{"티커": t, "종목명": ""} for t in ("SPY", "AGG", "GLD", "005930.KS")])[REG_COLS]
+    st.session_state.setdefault("_reg_gen", 0)
+
+    # ---------------- 종목 ----------------
+    st.subheader("1️⃣ 분석할 종목 (Assets)")
+    render_etf_loader(target_key=key, gen_key="_reg_gen", editor_key="_reg_editor",
+                      cols=REG_COLS, weight_col=None)
+    g1, g2 = st.columns([1, 5])
+    _rn = len(st.session_state[key])
+    rn = g1.number_input("종목 수", 1, 20, _rn, step=1,
+                         key=f"_reg_n_{st.session_state['_reg_gen']}")
+    if int(rn) != _rn:
+        cur = st.session_state[key]
+        cur = (pd.concat([cur, pd.DataFrame([_reg_blank()] * (int(rn) - len(cur)))],
+                         ignore_index=True) if int(rn) > len(cur)
+               else cur.iloc[:int(rn)].reset_index(drop=True))
+        st.session_state[key] = cur[REG_COLS]
+        st.session_state["_reg_gen"] += 1
+        st.session_state.pop("_reg_editor", None)
+        st.rerun()
+
+    _rd = st.session_state[key].copy()
+    _rd["🗑"] = False
+    red = st.data_editor(
+        _rd, num_rows="fixed", width="stretch", key="_reg_editor",
+        column_order=REG_COLS + ["🗑"], hide_index=True,
+        column_config={
+            "티커": st.column_config.TextColumn("티커", width="small"),
+            "종목명": st.column_config.TextColumn("종목명 (자동)", disabled=True, width="large"),
+            "🗑": st.column_config.CheckboxColumn("삭제", width="small"),
+        })
+    _rdel = red["🗑"].fillna(False).astype(bool)
+    if _rdel.any():
+        kept = red.loc[~_rdel, REG_COLS].reset_index(drop=True)
+        if kept.empty:
+            kept = pd.DataFrame([_reg_blank()])[REG_COLS]
+        st.session_state[key] = kept
+        st.session_state["_reg_gen"] += 1
+        st.session_state.pop("_reg_editor", None)
+        st.rerun()
+
+    rf_ = red[REG_COLS].copy()
+    rf_["티커"] = rf_["티커"].fillna("").astype(str).str.strip()
+    labs, bad = [], []
+    if any(t for t in rf_["티커"]):
+        with st.spinner("티커 확인 중..."):
+            res = []
+            for t in rf_["티커"]:
+                if not t:
+                    res.append(""); labs.append(""); continue
+                r = probe_ticker(tuple(normalize_ticker(t)))
+                if r["ticker"] is None:
+                    res.append(t); labs.append("❌ 확인 불가"); bad.append(t)
+                else:
+                    res.append(r["ticker"])
+                    labs.append(f"✅ {r.get('name') or '(종목명 없음)'} · {r['currency']}")
+        rf_["티커"] = res
+    rf_["종목명"] = labs if labs else ""
+    if not _frames_equal(rf_, st.session_state[key]):
+        st.session_state[key] = rf_
+        st.session_state.pop("_reg_editor", None)
+        st.rerun()
+
+    tickers = [t for t in rf_["티커"] if t]
+    if bad:
+        st.error(f"확인되지 않는 티커: {', '.join(bad)}")
+
+    # ---------------- 국면 기준 ----------------
+    st.subheader("2️⃣ 국면 구분 기준 (Regime Rules)")
+    m1, m2 = st.columns([2, 3])
+    ref_tk = m1.text_input("기준 지수", value="^GSPC", key="_reg_ref",
+                           help="이 지수를 기준으로 국면을 나눕니다. "
+                                "^GSPC S&P500 · ^KS11 코스피 · ^IXIC 나스닥")
+    m2.caption("국면은 **기준 지수 하나**로 정의하고, 그 구간을 모든 자산에 동일하게 "
+               "적용합니다. 자산마다 다르게 나누면 비교가 불가능해지기 때문입니다.")
+
+    n1, n2, n3 = st.columns(3)
+    bear_th = n1.slider("약세장 기준 (고점 대비 하락 %)", 5, 40, 20, step=1,
+                        key="_reg_bear",
+                        help="통용되는 정의는 -20%입니다. 낮추면 구간이 잘게 나뉩니다.") / 100
+    side_band = n2.slider("횡보 판정 폭 (±%)", 0, 15, 5, step=1, key="_reg_side",
+                          help="최근 6개월 수익률이 이 범위 안이면 횡보로 봅니다. "
+                               "0이면 횡보를 쓰지 않고 강세·약세로만 나눕니다.") / 100
+    min_days = n3.slider("최소 지속 (거래일)", 0, 250, 60, step=10, key="_reg_min",
+                         help="이보다 짧은 구간은 이웃에 흡수시킵니다. "
+                              "약세장은 길이와 무관하게 보존됩니다.")
+
+    run_reg = st.button("📉 국면 분석", type="primary", width="stretch",
+                        disabled=bool(bad) or not tickers or not ref_tk.strip())
+    if run_reg:
+        st.session_state["_reg_has_run"] = True
+    if not st.session_state.get("_reg_has_run"):
+        st.info("👆 종목과 기준 지수를 정한 뒤 **국면 분석**을 눌러주세요.")
+        return
+
+    # ---------------- 데이터 ----------------
+    ref = normalize_ticker(ref_tk)[0] if ref_tk.strip() else "^GSPC"
+    need = list(dict.fromkeys(tickers + [ref]))
+    try:
+        with st.spinner("데이터 수집 중..."):
+            prices, meta, _fx = build_price_frame(need, start_date, end_date,
+                                                  base_ccy, use_div, fx_hedge, gap_fill)
+    except Exception as ex:
+        st.error(f"데이터를 가져오지 못했습니다: {ex}")
+        return
+    if prices.empty or ref not in prices.columns or len(prices) < 60:
+        st.error("데이터가 부족하거나 기준 지수를 가져오지 못했습니다.")
+        return
+    use_tk = [t for t in tickers if t in prices.columns]
+    if not use_tk:
+        st.error("분석할 종목 데이터가 없습니다.")
+        return
+
+    lab = classify_regime(prices[ref], bear=bear_th, bull=bear_th,
+                          side_band=(side_band if side_band > 0 else None),
+                          min_days=min_days)
+    segs = regime_segments(prices[ref], lab)
+    R = prices[use_tk].pct_change().dropna()
+    lab_r = lab.reindex(R.index).ffill()
+
+    st.success(f"✅ 분석 완료 · 기준 **{ref}** · {len(segs)}개 구간 · "
+               f"{prices.index[0].date()} ~ {prices.index[-1].date()}")
+
+    # ---------------- 구간 ----------------
+    st.subheader("3️⃣ 국면 구간 (Regimes)")
+    ec = prices[ref] / float(prices[ref].iloc[0])
+    fg = go.Figure()
+    fg.add_trace(go.Scatter(x=ec.index, y=ec.values, name=ref,
+                            line=dict(color="#1e293b", width=1.8)))
+    for _, s in segs.iterrows():
+        fg.add_vrect(x0=pd.Timestamp(s["시작"]), x1=pd.Timestamp(s["종료"]),
+                     fillcolor=REG_COLORS.get(s["국면"], "#f8fafc"),
+                     opacity=0.55, line_width=0, layer="below")
+    fg.update_layout(height=380, hovermode="x unified",
+                     margin=dict(l=0, r=0, t=20, b=0), showlegend=False,
+                     yaxis=dict(title=None))
+    st.plotly_chart(fg, width="stretch")
+    st.caption("초록 = 강세 · 빨강 = 약세 · 회색 = 횡보")
+    st.dataframe(segs.style.format({"구간 수익률(%)": "{:+.2f}", "기간(년)": "{:.2f}"}),
+                 width="stretch", hide_index=True)
+
+    tally = segs.groupby("국면").agg(구간수=("국면", "size"),
+                                    총거래일=("거래일", "sum")).reset_index()
+    tally["비중(%)"] = tally["총거래일"] / tally["총거래일"].sum() * 100
+    st.dataframe(tally.style.format({"비중(%)": "{:.1f}"}), width="stretch", hide_index=True)
+
+    # ---------------- 국면별 성과 ----------------
+    st.subheader("4️⃣ 국면별 자산 성과 (Performance by Regime)")
+    st.caption("같은 자산도 국면에 따라 전혀 다르게 움직입니다. "
+               "**약세장에서 무엇이 버텼는지**를 눈여겨보세요.")
+    prow = []
+    for reg in ["강세", "횡보", "약세"]:
+        m = lab_r == reg
+        if m.sum() < 10:
+            continue
+        for t in use_tk:
+            rr = R.loc[m, t]
+            eqc = (1 + rr).cumprod()
+            prow.append({"국면": reg, "티커": t,
+                         "누적 수익률(%)": (float(eqc.iloc[-1]) - 1) * 100,
+                         "연율 수익률(%)": ((float(eqc.iloc[-1]) ** (TRADING_DAYS / len(rr))) - 1) * 100,
+                         "변동성(%)": float(rr.std() * np.sqrt(TRADING_DAYS)) * 100,
+                         "최대낙폭(%)": float((eqc / eqc.cummax() - 1).min()) * 100,
+                         "거래일": int(len(rr))})
+    pdf = pd.DataFrame(prow)
+    if not pdf.empty:
+        piv = pdf.pivot(index="티커", columns="국면", values="연율 수익률(%)")
+        piv = piv[[c for c in ["강세", "횡보", "약세"] if c in piv.columns]]
+        st.markdown("**국면별 연율 수익률 (%)**")
+        st.dataframe(piv.style.format("{:.2f}", na_rep="-").map(_heat_color),
+                     width="stretch")
+        with st.expander("상세 지표 보기", expanded=False):
+            st.dataframe(pdf.style.format({"누적 수익률(%)": "{:.2f}",
+                                           "연율 수익률(%)": "{:.2f}",
+                                           "변동성(%)": "{:.2f}",
+                                           "최대낙폭(%)": "{:.2f}"}),
+                         width="stretch", hide_index=True)
+        if "약세" in piv.columns:
+            best = piv["약세"].idxmax()
+            st.info(f"약세장에서 가장 잘 버틴 자산은 **{best}** "
+                    f"(연율 {piv.loc[best, '약세']:+.2f}%)입니다.")
+
+    # ---------------- 국면별 상관관계 ----------------
+    st.subheader("5️⃣ 국면별 상관관계 (Correlation by Regime)")
+    st.caption("**분산투자의 가장 큰 취약점이 드러나는 곳입니다.** "
+               "평상시 낮던 상관관계가 약세장에서 함께 올라가면, "
+               "정작 방어가 필요한 순간에 분산 효과가 줄어듭니다.")
+    if len(use_tk) < 2:
+        st.info("상관관계를 보려면 2개 이상의 종목이 필요합니다.")
+    else:
+        crow = {}
+        cmats = {}
+        for reg in ["강세", "횡보", "약세"]:
+            m = lab_r == reg
+            if m.sum() < 20:
+                continue
+            cm = R.loc[m].corr()
+            cmats[reg] = cm
+            rho, eff = diversification_stats(cm)
+            crow[reg] = {"표본(거래일)": int(m.sum()), "평균 상관계수": rho,
+                         "실효 종목 수": eff}
+        allc = R.corr()
+        rho_a, eff_a = diversification_stats(allc)
+        crow["전체"] = {"표본(거래일)": len(R), "평균 상관계수": rho_a, "실효 종목 수": eff_a}
+        cdf = pd.DataFrame(crow).T
+        st.dataframe(cdf.style.format({"표본(거래일)": "{:.0f}", "평균 상관계수": "{:.3f}",
+                                       "실효 종목 수": "{:.2f}"}), width="stretch")
+
+        if "강세" in crow and "약세" in crow:
+            d = crow["약세"]["평균 상관계수"] - crow["강세"]["평균 상관계수"]
+            if d > 0.1:
+                st.warning(f"약세장 평균 상관계수가 강세장보다 **{d:+.2f}** 높습니다. "
+                           f"실효 종목 수도 {crow['강세']['실효 종목 수']:.1f}개 → "
+                           f"{crow['약세']['실효 종목 수']:.1f}개로 줄어듭니다. "
+                           f"하락 국면에서 분산 효과가 약해진다는 뜻입니다.")
+            elif d < -0.05:
+                st.success(f"약세장 평균 상관계수가 강세장보다 **{d:+.2f}** 낮습니다. "
+                           f"하락 국면에서도 분산 효과가 유지되는 구성입니다.")
+
+        tabs_c = st.tabs([f"{k} 행렬" for k in cmats])
+        for tb, (reg, cm) in zip(tabs_c, cmats.items()):
+            with tb:
+                st.dataframe(cm.round(2).style.format("{:.2f}").map(_corr_color),
+                             width="stretch")
+
+    # ---------------- 상관 추이 ----------------
+    if len(use_tk) >= 2:
+        st.subheader("6️⃣ 상관관계 추이와 국면 (Rolling Correlation)")
+        q1, q2, q3 = st.columns([2, 2, 1])
+        pa = q1.selectbox("종목 A", use_tk, index=0, key="_reg_a")
+        rest = [t for t in use_tk if t != pa] or use_tk
+        pb = q2.selectbox("종목 B", rest, index=0, key="_reg_b")
+        win = q3.selectbox("구간", [63, 126, 252], index=1, key="_reg_win",
+                           format_func=lambda x: f"{x}일")
+        if pa != pb and len(R) > win + 5:
+            roll = R[pa].rolling(win).corr(R[pb]).dropna()
+            fr = go.Figure()
+            for _, s in segs.iterrows():
+                fr.add_vrect(x0=pd.Timestamp(s["시작"]), x1=pd.Timestamp(s["종료"]),
+                             fillcolor=REG_COLORS.get(s["국면"], "#f8fafc"),
+                             opacity=0.5, line_width=0, layer="below")
+            fr.add_trace(go.Scatter(x=roll.index, y=roll.values,
+                                    name=f"{pa} ↔ {pb}",
+                                    line=dict(color="#1e293b", width=2)))
+            fr.add_hline(y=0, line_dash="dot", line_color="#cbd5e1")
+            fr.update_layout(height=360, hovermode="x unified", showlegend=False,
+                             yaxis=dict(range=[-1.05, 1.05], title=None),
+                             margin=dict(l=0, r=0, t=20, b=0))
+            st.plotly_chart(fr, width="stretch")
+            byreg = {reg: float(roll[lab.reindex(roll.index).ffill() == reg].mean())
+                     for reg in ["강세", "횡보", "약세"]
+                     if (lab.reindex(roll.index).ffill() == reg).sum() > 5}
+            if byreg:
+                cols = st.columns(len(byreg))
+                for c, (reg, v) in zip(cols, byreg.items()):
+                    c.metric(f"{reg} 평균 상관", f"{v:+.2f}")
+            st.caption("배경색이 국면입니다. 약세 구간에서 선이 올라간다면 "
+                       "그 시기에 두 자산이 함께 움직였다는 뜻입니다.")
+
+    # ---------------- 내보내기 ----------------
+    st.divider()
+    try:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
+            segs.to_excel(xw, sheet_name="1_국면구간", index=False)
+            if not pdf.empty:
+                pdf.to_excel(xw, sheet_name="2_국면별성과", index=False)
+            if len(use_tk) >= 2:
+                cdf.to_excel(xw, sheet_name="3_국면별상관요약")
+                for reg, cm in cmats.items():
+                    cm.round(3).to_excel(xw, sheet_name=f"4_{reg}행렬")
+            pd.DataFrame(list({
+                "기준 지수": ref, "약세장 기준": f"-{bear_th*100:.0f}%",
+                "횡보 판정 폭": f"±{side_band*100:.0f}%" if side_band else "미사용",
+                "최소 지속": f"{min_days}거래일", "기준 통화": base_ccy,
+                "기간": f"{prices.index[0].date()} ~ {prices.index[-1].date()}",
+                "배당 처리": "재투자" if use_div else "주가만",
+            }.items()), columns=["항목", "값"]).to_excel(xw, sheet_name="5_설정", index=False)
+        st.download_button("📊 엑셀 파일 받기", buf.getvalue(),
+                           f"regimes_{pd.Timestamp.now():%Y%m%d_%H%M}.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           width="stretch")
+    except Exception as ex:
+        st.error(f"엑셀 생성 실패: {ex}")
+    st.caption("국면 구분은 사후적으로 나눈 것이며, 실시간으로는 지금이 어느 국면인지 "
+               "확정할 수 없습니다. 과거 국면별 특성이 앞으로도 반복된다는 보장도 없습니다. "
+               "교육·참고용이며 투자 자문이 아닙니다.")
+
+
 CAND_COLS = ["티커", "종목명"]
 CAND_MAX_COMB = 1000          # 전수 탐색 한도
 CAND_MAX_ADD = 3
@@ -3564,7 +3948,8 @@ if "_pending_tool" in st.session_state:
 
 with st.sidebar:
     tool = st.radio("도구", ["📊 포트폴리오 분석", "🎯 포트폴리오 최적화",
-                            "➕ 종목 추가 탐색", "🔗 자산 상관관계", "📖 도움말"],
+                            "➕ 종목 추가 탐색", "🔗 자산 상관관계",
+                            "📉 시장 국면 분석", "📖 도움말"],
                     label_visibility="collapsed", key="_tool")
 
 # 도움말은 설정이 필요 없으므로 사이드바를 더 그리지 않고 바로 표시한다
@@ -3617,7 +4002,12 @@ with st.sidebar:
                "일본 `7203.T`  홍콩 `0700.HK`")
 
 
+IS_REG = tool.endswith("국면 분석")
 IS_CAND = tool.endswith("추가 탐색")
+
+if IS_REG:
+    render_regimes(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, rf_rate)
+    st.stop()
 IS_CORR = tool.endswith("상관관계")
 IS_OPT = tool.endswith("최적화")
 
