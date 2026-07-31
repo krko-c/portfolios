@@ -2034,7 +2034,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
     if "_opt_pending_load" in st.session_state:
         cfg = load_opt_saved().get(st.session_state.pop("_opt_pending_load"))
         if cfg:
-            for k in ["_opt_editor", "_opt_n", "_opt_eq", "_opt_goal", "_opt_risk",
+            for k in ["_opt_editor", "_opt_eq", "_opt_goal", "_opt_risk",
                       "_opt_cut", "_opt_train", "_opt_rebal", "_opt_bench",
                       "_opt_reopt", "_opt_useret", "_opt_usevol"]:
                 st.session_state.pop(k, None)
@@ -2044,7 +2044,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                     for h in cfg.get("holdings", [])]
             if rows:
                 st.session_state[key] = pd.DataFrame(rows)[OPT_COLS]
-                st.session_state["_opt_n"] = len(rows)
+                st.session_state["_opt_gen"] = st.session_state.get("_opt_gen", 0) + 1
             for sk, ck in [("_opt_goal", "goal"), ("_opt_risk", "risk"),
                            ("_opt_cut", "cutoff"), ("_opt_train", "train"),
                            ("_opt_rebal", "rebalance"), ("_opt_bench", "benchmark"),
@@ -2109,13 +2109,17 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                "특정 종목을 제한하려면 최소·최대 편입비중을 조정하세요.")
 
     c1, c2, c3 = st.columns([1, 1.2, 4])
-    n = c1.number_input("종목 수", 2, 20, len(st.session_state[key]), step=1, key="_opt_n")
-    if int(n) != len(st.session_state[key]):
+    st.session_state.setdefault("_opt_gen", 0)
+    _ocnt = len(st.session_state[key])
+    n = c1.number_input("종목 수", 2, 20, _ocnt, step=1,
+                        key=f"_opt_n_{st.session_state['_opt_gen']}")
+    if int(n) != _ocnt:
         cur = st.session_state[key]
         cur = (pd.concat([cur, pd.DataFrame([_opt_blank()] * (int(n) - len(cur)))],
                          ignore_index=True) if int(n) > len(cur)
                else cur.iloc[:int(n)].reset_index(drop=True))
         st.session_state[key] = cur[OPT_COLS]
+        st.session_state["_opt_gen"] += 1
         st.session_state.pop("_opt_editor", None)
         st.rerun()
     c2.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
@@ -2139,7 +2143,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                 "최대(%)", min_value=0.0, max_value=100.0, step=1.0,
                 format="%.0f", width="small"),
             "🗑": st.column_config.CheckboxColumn(
-                "✕", width="small", help="체크하면 해당 행이 삭제됩니다."),
+                "삭제", width="small", help="체크하면 해당 행이 삭제됩니다."),
         })
 
     _odel = ed["🗑"].fillna(False).astype(bool)
@@ -2148,7 +2152,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         if _okept.empty:
             _okept = pd.DataFrame([_opt_blank()])[OPT_COLS]
         st.session_state[key] = _okept
-        st.session_state.pop("_opt_n", None)
+        st.session_state["_opt_gen"] = st.session_state.get("_opt_gen", 0) + 1
         st.session_state.pop("_opt_editor", None)
         st.rerun()
     ed = ed[OPT_COLS]
@@ -2875,7 +2879,7 @@ if "_pending_load" in st.session_state:
             if not rows:
                 rows = [blank_row()]
             st.session_state[f"df_{i}"] = pd.DataFrame(rows)[COLS]
-            st.session_state[f"nrow_{i}"] = len(rows)
+            st.session_state[f"gen_{i}"] = st.session_state.get(f"gen_{i}", 0) + 1
             st.session_state[f"name_{i}"] = p.get("name", f"포트{i+1}")
             st.session_state[f"rebal_{i}"] = p.get("rebalance", REBAL_QUARTER)
         st.success(f"**{cfg.get('label', key)}** 구성을 불러왔습니다.")
@@ -2900,10 +2904,16 @@ for i, tab in enumerate(tabs):
         if dfkey not in st.session_state:
             st.session_state[dfkey] = default_holdings(i)
 
-        n_rows = c3.number_input("종목 수", MIN_ROWS, MAX_ROWS,
-                                 len(st.session_state[dfkey]), step=1, key=f"nrow_{i}")
-        if int(n_rows) != len(st.session_state[dfkey]):
+        # 행 수가 프로그램에 의해 바뀔 때마다 세대 번호를 올려 위젯을 새로 만든다.
+        # (같은 행 수로 되돌아왔을 때 이전 입력값이 되살아나는 것을 막는다)
+        genkey = f"gen_{i}"
+        st.session_state.setdefault(genkey, 0)
+        _cnt = len(st.session_state[dfkey])
+        n_rows = c3.number_input("종목 수", MIN_ROWS, MAX_ROWS, _cnt, step=1,
+                                 key=f"nrow_{i}_{st.session_state[genkey]}")
+        if int(n_rows) != _cnt:
             st.session_state[dfkey] = fit_rows(st.session_state[dfkey], int(n_rows))
+            st.session_state[genkey] += 1
             st.session_state.pop(f"hold_{i}", None)
             st.rerun()
 
@@ -2927,7 +2937,7 @@ for i, tab in enumerate(tabs):
                 "종목명": st.column_config.TextColumn(
                     "종목명 (자동)", disabled=True, width="large"),
                 "🗑": st.column_config.CheckboxColumn(
-                    "✕", width="small", help="체크하면 해당 행이 삭제됩니다."),
+                    "삭제", width="small", help="체크하면 해당 행이 삭제됩니다."),
             },
         )
 
@@ -2938,8 +2948,7 @@ for i, tab in enumerate(tabs):
             if _kept.empty:
                 _kept = pd.DataFrame([blank_row()])[COLS]
             st.session_state[dfkey] = _kept
-            # 이미 그려진 위젯의 값은 직접 바꿀 수 없으므로 상태를 지워 재초기화한다
-            st.session_state.pop(f"nrow_{i}", None)
+            st.session_state[genkey] += 1
             st.session_state.pop(f"hold_{i}", None)
             st.rerun()
         edited = edited[COLS]
