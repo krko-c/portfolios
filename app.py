@@ -19,7 +19,7 @@ import json
 import re
 from pathlib import Path
 
-from scipy.cluster.hierarchy import linkage, to_tree
+from scipy.cluster.hierarchy import fcluster, linkage, to_tree
 from scipy.optimize import minimize
 from scipy.spatial.distance import squareform
 
@@ -31,6 +31,15 @@ import streamlit as st
 
 TRADING_DAYS = 252
 MAX_PORTFOLIOS = 6
+
+# 사이드바 메뉴 — 성격별로 묶어 표시한다
+TOOL_GROUPS = [
+    ("분석", ["📊 포트폴리오 분석", "📉 시장 국면 분석", "🔗 자산 상관관계",
+              "🌩 스트레스 테스트"]),
+    ("배분", ["🎯 포트폴리오 최적화", "🧭 뷰 기반 자산배분", "➕ 자산 추가 효과"]),
+    ("", ["📖 도움말"]),
+]
+TOOL_DEFAULT = "📊 포트폴리오 분석"
 
 COLS = ["티커", "비중(%)", "종목명"]
 DEFAULT_ROWS = 3
@@ -473,6 +482,48 @@ def render_etf_loader(target_key: str, gen_key: str, editor_key: str,
             st.session_state.pop(f"etf_res_{target_key}", None)
             st.success(f"{len(rows)}종목을 표에 채웠습니다.")
             st.rerun()
+
+
+def validate_setup(tickers, bad=None, weights=None, min_n=1,
+                   need_weight=False, label="종목"):
+    """
+    화면마다 흩어져 있던 입력 검증을 한 곳에서 처리한다.
+    반환: (진행 가능 여부, 안내문 리스트)
+    """
+    msgs = []
+    ok = True
+    if bad:
+        msgs.append(("error", f"확인되지 않는 티커: {', '.join(bad)}"))
+        ok = False
+    n = len([t for t in tickers if str(t).strip()])
+    if n < min_n:
+        msgs.append(("error", f"{label}을 최소 {min_n}개 이상 입력해주세요. (현재 {n}개)"))
+        ok = False
+    if need_weight:
+        s = float(pd.to_numeric(pd.Series(weights), errors="coerce").fillna(0).sum()) \
+            if weights is not None else 0.0
+        if s <= 0:
+            msgs.append(("error", "비중을 입력해주세요. 합계가 0입니다."))
+            ok = False
+        elif abs(s - 100) > 0.01:
+            msgs.append(("info", f"비중 합계가 {s:.2f}% 입니다. 100%로 자동 정규화합니다."))
+    return ok, msgs
+
+
+def show_msgs(msgs):
+    for kind, m in msgs:
+        getattr(st, kind)(m)
+
+
+def send_to(target_tool: str, **payload):
+    """
+    다른 화면으로 구성을 넘긴다. 위젯이 이미 그려진 뒤일 수 있으므로
+    다음 실행에서 반영되도록 예약만 걸고 재실행한다.
+    """
+    for k, v in payload.items():
+        st.session_state[k] = v
+    st.session_state["_pending_tool"] = target_tool
+    st.rerun()
 
 
 def _frames_equal(a: pd.DataFrame, b: pd.DataFrame) -> bool:
@@ -1676,7 +1727,10 @@ METRIC_DOCS = {
          "직전 고점 대비 가장 깊이 떨어졌던 폭입니다.",
          "낙폭 시계열의 최솟값",
          "실제로 견뎌야 했던 최악의 순간을 보여줍니다. "
-         "−50%를 회복하려면 +100%가 필요하므로 체감 충격이 큽니다."),
+         "−50%를 회복하려면 +100%가 필요하므로 체감 충격이 큽니다.\n\n"
+         "**항상 음수이므로 비교할 때 주의가 필요합니다.** −20%에서 −15%로 바뀌면 "
+         "숫자는 커졌지만 낙폭은 얕아진 것이므로 **개선**입니다. 이 도구에서는 "
+         "그런 경우를 '개선(%p)'으로 표기해 혼동을 줄였습니다."),
         ("낙폭 (Drawdown)",
          "매 시점의 '직전 고점 대비 하락률'입니다. MDD는 이 시계열의 최저점입니다.",
          "현재자산 / 그때까지의 최고자산 − 1",
@@ -1726,6 +1780,26 @@ METRIC_DOCS = {
          "평균과 표준편차만 보는 지표와 달리 분포 전체 모양을 반영합니다. "
          "1보다 크면 이익 쪽이 우세합니다."),
     ],
+    "자산배분 모형": [
+        ("균형 기대수익률 (Implied Returns)",
+         "시장 비중이 최적이 되려면 각 자산이 얼마를 내야 하는지 역산한 값입니다.",
+         "Π = δ × Σ × w(시장비중)",
+         "과거 평균을 그대로 쓰지 않고 시장이 암묵적으로 기대하는 수익률을 뽑아냅니다. "
+         "추정 오차가 큰 과거 평균의 대안입니다."),
+        ("사후 기대수익률 (Posterior Returns)",
+         "균형 기대수익률에 내 전망을 확신도만큼 섞은 결과입니다.",
+         "[(τΣ)⁻¹ + PᵀΩ⁻¹P]⁻¹ · [(τΣ)⁻¹Π + PᵀΩ⁻¹Q]",
+         "뷰를 넣지 않으면 균형 값과 같습니다. 확신도가 극단적으로 높으면 뷰 값에 "
+         "수렴합니다."),
+        ("위험회피계수 (δ)",
+         "위험 한 단위를 감수하는 대가로 얼마의 수익을 요구하는지를 나타냅니다.",
+         "δ = (시장수익률 − 무위험수익률) / 시장분산",
+         "클수록 위험을 싫어해 안전자산 비중이 늘어납니다. 통상 2~3을 씁니다."),
+        ("τ (타우)",
+         "균형 기대수익률 추정 자체의 불확실성입니다.",
+         "공분산에 곱하는 스칼라 (통상 0.025~0.05)",
+         "작을수록 시장 균형을 신뢰해 뷰의 영향이 줄어듭니다."),
+    ],
     "벤치마크 대비": [
         ("알파 (Alpha)",
          "시장 노출만으로는 설명되지 않는 초과수익입니다.",
@@ -1763,6 +1837,11 @@ METRIC_DOCS = {
          "−1에서 +1 사이의 값",
          "1에 가까우면 같이, 0이면 무관하게, 음수면 반대로 움직입니다. "
          "낮은 값이 많을수록 분산 효과가 큽니다."),
+        ("실효 종목 수 (Effective N)",
+         "분산 효과가 실제로는 몇 종목에 해당하는지를 나타냅니다.",
+         "N / (1 + (N−1) × 평균 상관계수)",
+         "10종목을 담아도 서로 비슷하게 움직이면 실효는 2~3종목에 그칩니다. "
+         "평균 상관이 음수이면 종목 수보다 커질 수 있으며, 서로 헤지된다는 뜻입니다."),
         ("성장 기여도 (Contribution to Growth)",
          "포트폴리오 총 성장률 중 각 종목이 만들어낸 몫입니다.",
          "Σ (그 시점 자산가치 × 시작비중 × 그날 수익률)",
@@ -1782,13 +1861,17 @@ def render_help():
     with tab1:
         st.subheader("이 도구는 무엇인가")
         st.markdown(
-            "여러 종목을 조합한 **포트폴리오가 과거에 어떤 성과를 냈는지** 계산하고, "
-            "**어떤 비중이 좋았을지** 찾아주는 도구입니다. "
-            "화면은 두 개입니다.\n\n"
-            "- **📊 포트폴리오 분석** — 내가 정한 비중으로 과거 성과를 확인합니다. "
-            "여러 조합과 벤치마크를 한 화면에서 비교할 수 있습니다.\n"
-            "- **🎯 포트폴리오 최적화** — 목적(예: 위험 대비 수익 최대화)을 정하면 "
-            "그에 맞는 비중을 계산하고, 지금 내 비중과 비교해줍니다.")
+            "종목을 조합해 **과거 성과를 계산하고, 더 나은 배분을 찾고, 위험 구조를 "
+            "들여다보는** 도구입니다. 왼쪽 사이드바에서 화면을 고릅니다.\n\n"
+            "| 화면 | 답하는 질문 |\n|---|---|\n"
+            "| **📊 포트폴리오 분석** | 이 구성은 과거에 어땠나 |\n"
+            "| **🎯 포트폴리오 최적화** | 비중을 어떻게 바꾸면 나아지나 |\n"
+            "| **➕ 자산 추가 효과** | 무엇을 얼마나 더하면 좋을까 |\n"
+            "| **🧭 뷰 기반 자산배분** | 내 전망을 배분에 어떻게 반영하나 |\n"
+            "| **🔗 자산 상관관계** | 이 종목들은 서로 얼마나 겹치나 |\n"
+            "| **📉 시장 국면 분석** | 강세장·약세장에서 각각 어땠나 |\n""| **🌩 스트레스 테스트** | 과거 위기에 얼마나 버텼나 |\n\n"
+            "**사이드바 설정(기준 통화·기간·배당·거래비용·환헤지 등)은 모든 화면에 "
+            "공통으로 적용**됩니다. 종목 표와 티커 입력 방식도 화면마다 동일합니다.")
 
         st.divider()
         st.subheader("1단계 · 종목 입력")
@@ -1829,6 +1912,83 @@ def render_help():
             "최적화가 보지 못한 기간의 성적이라 실제 실력에 가깝습니다. "
             "표본내(학습 구간) 성과는 좋게 나오는 것이 당연하므로 판단 근거로 삼지 "
             "않아야 합니다.")
+
+        st.divider()
+        st.subheader("화면별 사용법")
+        with st.expander("📊 포트폴리오 분석"):
+            st.markdown(
+                "종목과 비중을 넣고 **분석 실행**을 누르면 성과 차트·낙폭·종합 비교표가 "
+                "나옵니다. 포트폴리오를 여러 개 만들어 나란히 비교할 수 있고, 벤치마크도 "
+                "여러 개 넣을 수 있습니다.\n\n"
+                "연도별 성과, 적립식 투자(IRR 포함), 포트폴리오별 상세(성장 기여도·비중 "
+                "추이·월별 수익률)까지 이어집니다.")
+        with st.expander("🎯 포트폴리오 최적화"):
+            st.markdown(
+                "**현재 비중을 반드시 입력하세요.** 최적화 결과를 그 구성과 비교하는 것이 "
+                "이 화면의 핵심입니다.\n\n"
+                "목적과 위험 정의를 고르고, **최적화 기준일**과 **학습 기간**을 정합니다. "
+                "기준일까지의 데이터로만 비중을 계산하고, 그 이후 구간으로 채점합니다.\n\n"
+                "결과에서 **표본외 성과**를 먼저 보세요. 표본내는 좋게 나오는 것이 당연합니다. "
+                "**비중 안정성 점검**에서 학습 기간에 따라 비중이 크게 흔들린다면 그 결과는 "
+                "신뢰도가 낮습니다.")
+        with st.expander("➕ 자산 추가 효과"):
+            st.markdown(
+                "두 가지 방식이 있습니다.\n\n"
+                "- **📌 고정 비중 편입 효과** — 1·3·5·10% 같은 정해진 비중으로 넣어보고 "
+                "지표가 어떻게 달라지는지 봅니다. **재원을 어디서 빼느냐**(비례 축소 vs "
+                "특정 자산)에 따라 결과가 크게 달라지므로 함께 비교하세요.\n"
+                "- **🔎 최적 조합 탐색** — 후보 중 어떤 조합이 가장 좋은지 최적화로 찾습니다. "
+                "후보는 **15~30개**, 추가는 **1~3개**가 적당합니다.\n\n"
+                "조합이 1,000가지를 넘으면 전수 탐색 대신 단계적 선택으로 자동 전환됩니다. "
+                "순위는 학습 구간 기준이고 표본외 성과는 확인용으로 함께 표시됩니다.\n\n"
+                "**1등만 보지 마세요.** 상위 조합 전반과 **채택 빈도**를 함께 보는 것이 "
+                "중요합니다. 여러 조합에 반복해서 등장하는 종목이 실제로 유용한 후보입니다.")
+        with st.expander("🧭 뷰 기반 자산배분"):
+            st.markdown(
+                "**시장 비중**을 출발점으로 넣고, 전망이 있으면 뷰로 추가합니다. "
+                "뷰를 하나도 넣지 않으면 시장 비중이 그대로 결과가 됩니다.\n\n"
+                "- **절대 뷰** — 'A가 연 12%를 낼 것이다'\n"
+                "- **상대 뷰** — 'A가 B보다 연 3%p 나을 것이다'\n\n"
+                "**확신도**가 조절 밸브입니다. 낮으면 시장 비중에서 거의 안 움직이고, "
+                "높을수록 뷰 쪽으로 크게 기웁니다. 결과가 지나치게 쏠린다면 확신도를 낮추거나 "
+                "최대 비중을 조여보세요.")
+        with st.expander("🔗 자산 상관관계"):
+            st.markdown(
+                "종목들이 얼마나 함께 움직이는지 봅니다. **실효 종목 수**가 핵심 지표인데, "
+                "10종목을 담아도 서로 비슷하면 실효는 2~3종목에 불과할 수 있습니다.\n\n"
+                "**계산 주기 선택이 중요합니다.** 거래 시간대가 다른 국가를 섞으면 일별 "
+                "상관계수가 실제보다 낮게 나옵니다. 한국·미국·일본을 함께 볼 때는 "
+                "주별이나 월별을 쓰세요.")
+        with st.expander("🌩 스트레스 테스트"):
+            st.markdown(
+                "닷컴 붕괴·금융위기·코로나·긴축 발작 같은 **과거 위기 구간만 잘라내어** "
+                "포트폴리오가 얼마나 버텼는지 봅니다. 직접 날짜를 지정해 구간을 추가할 수도 "
+                "있습니다.\n\n"
+                "**고점→저점**은 그 구간의 최대 하락폭, **회복까지**는 저점에서 위기 직전 "
+                "수준을 되찾기까지 걸린 기간입니다. '미회복'이면 아직 되찾지 못했다는 "
+                "뜻입니다.\n\n"
+                "**위기 구간 상관관계**를 꼭 확인하세요. 평상시 낮던 상관이 위기에 함께 "
+                "올라간다면, 정작 방어가 필요한 순간에 분산 효과가 줄어든다는 신호입니다.")
+        with st.expander("📉 시장 국면 분석"):
+            st.markdown(
+                "기준 지수를 강세·약세·횡보로 나누고, 국면마다 자산들이 어땠는지 봅니다.\n\n"
+                "가장 중요한 부분은 **국면별 상관관계**입니다. 평상시 낮던 상관관계가 "
+                "약세장에서 함께 올라간다면, 정작 방어가 필요한 순간에 분산 효과가 "
+                "줄어든다는 뜻입니다.\n\n"
+                "국면 구분은 **사후적**입니다. 실시간으로는 지금이 어느 국면인지 확정할 수 "
+                "없다는 점을 감안해서 보세요.")
+
+        st.divider()
+        st.subheader("화면 사이 이동")
+        st.markdown(
+            "각 화면 아래쪽 **➡️ 다음 단계**에서 지금 구성을 다른 화면으로 넘길 수 있습니다. "
+            "종목을 다시 입력하지 않아도 됩니다.\n\n"
+            "```\n"
+            "🔗 자산 상관관계 ──▶ ➕ 자산 추가 효과 ──▶ 🎯 최적화 ──▶ 📊 분석\n"
+            "                                          🧭 뷰 기반 배분 ──▶ 📊 분석\n"
+            "```\n"
+            "상관관계로 후보를 걸러내고, 무엇을 얼마나 더할지 정하고, 비중을 최적화한 뒤, "
+            "최종 구성을 자세히 분석하는 흐름입니다.")
 
         st.divider()
         st.subheader("저장 · 내보내기")
@@ -1981,7 +2141,71 @@ def render_help():
                 "쓰지 않습니다. 종목이 많고 상관구조가 뚜렷할 때 특히 유리합니다.")
 
             st.divider()
-            st.subheader("7. 검증 — 표본내와 표본외")
+            st.subheader("7. 전망을 반영하는 방법 — 블랙-리터만")
+            st.markdown(
+                "5번에서 본 문제의 정공법 해법입니다. 과거 평균으로 기대수익률을 추정하는 "
+                "대신, **시장이 암묵적으로 기대하는 수익률에서 출발**합니다.\n\n"
+                "**1단계 · 역최적화** — 현재의 시장 비중이 최적이 되려면 각 자산이 얼마를 "
+                "내야 하는지 거꾸로 계산합니다.")
+            st.latex(r"\Pi = \delta\,\Sigma\,w_{\text{시장}}")
+            st.markdown(
+                "여기서 δ는 위험회피계수입니다. 이렇게 얻은 Π는 과거 평균과 달리 "
+                "**추정 오차가 작습니다.** 시장 참여자 전체의 판단이 반영된 값이기 "
+                "때문입니다.\n\n"
+                "**2단계 · 전망 결합** — 내 뷰를 확신도만큼만 섞습니다.")
+            st.latex(r"E[R] = \bigl[(\tau\Sigma)^{-1} + P^{\top}\Omega^{-1}P\bigr]^{-1}"
+                     r"\bigl[(\tau\Sigma)^{-1}\Pi + P^{\top}\Omega^{-1}Q\bigr]")
+            st.markdown(
+                "- **P** — 어느 자산에 대한 뷰인지 나타내는 행렬\n"
+                "- **Q** — 뷰의 값 (연 수익률 또는 우위 폭)\n"
+                "- **Ω** — 뷰의 불확실성. 확신도가 낮을수록 큰 값을 넣어 영향을 줄입니다\n"
+                "- **τ** — 균형 추정 자체의 불확실성\n\n"
+                "**세 가지 성질**이 이 모형의 장점입니다.\n\n"
+                "1. 뷰가 없으면 결과가 **시장 비중과 정확히 일치**합니다\n"
+                "2. 확신도가 낮으면 시장 비중에서 조금만 움직입니다\n"
+                "3. 뷰를 준 자산뿐 아니라 **상관관계로 연결된 다른 자산도 함께 조정**됩니다\n\n"
+                "특히 3번이 중요합니다. '신흥국이 좋을 것 같다'는 뷰 하나를 넣으면, "
+                "신흥국과 함께 움직이는 자산의 비중도 자연스럽게 따라 조정됩니다.")
+            st.warning("**한계** — 시장 비중이 합리적인 출발점이라는 가정에 기댑니다. "
+                       "시가총액 비중을 쓰기 어려운 자산군이라면 벤치마크나 현재 전략적 "
+                       "배분을 대신 넣게 되는데, 그러면 '균형'의 의미가 약해집니다. "
+                       "공분산도 여전히 과거에서 추정하므로, 상관 구조가 바뀌면 결과도 "
+                       "달라집니다.")
+
+            st.divider()
+            st.subheader("8. 시장 국면과 상관관계의 변화")
+            st.markdown(
+                "3번에서 분산투자의 근거가 **상관계수**라고 했습니다. 그런데 상관계수는 "
+                "고정된 값이 아닙니다.\n\n"
+                "특히 시장이 급락할 때 대부분의 위험자산이 함께 움직이는 경향이 있습니다. "
+                "평상시 0.3이던 상관이 위기 국면에 0.8까지 올라가면, "
+                "**분산이 가장 필요한 순간에 효과가 줄어드는** 셈입니다.\n\n"
+                "국면은 통용되는 정의를 따릅니다.\n\n"
+                "- **약세장** — 고점 대비 −20% 하락. 시작일은 하락을 확인한 날이 아니라 "
+                "그 **고점으로 소급**합니다\n"
+                "- **강세장** — 저점 대비 +20% 반등. 시작일은 그 **저점으로 소급**합니다\n"
+                "- **횡보** — 강세 구간 중 최근 수익률이 일정 범위 안에 머문 기간\n\n"
+                "다만 이 구분은 **사후적**입니다. −20%에 도달해야 약세장이었음을 알 수 "
+                "있으므로, 실시간으로 '지금이 약세장'이라고 확정할 수는 없습니다.")
+
+            st.divider()
+            st.subheader("9. 후보 종목 탐색과 데이터 스누핑")
+            st.markdown(
+                "'후보 30개 중 가장 좋은 조합'을 찾을 때도 5번과 같은 문제가 생깁니다. "
+                "오히려 더 심해집니다. **후보가 많을수록 순전히 우연만으로도 "
+                "매우 좋아 보이는 조합이 존재**하기 때문입니다. 이를 "
+                "**데이터 스누핑(data snooping)** 이라고 합니다.\n\n"
+                "이 도구는 세 가지로 대응합니다.\n\n"
+                "1. **순위는 학습 구간으로만** 매깁니다. 표본외 성과로 순위를 매기면 "
+                "검증의 의미가 사라집니다\n"
+                "2. **1등만 강조하지 않고 상위 10개**를 함께 보여줍니다. 1등과 5등의 "
+                "차이가 미미하다면 그 순위는 의미가 없습니다\n"
+                "3. **채택 빈도**를 제시합니다. 여러 조합에 반복해서 등장하는 종목이 "
+                "특정 조합의 우연이 아니라 실제로 유용한 후보일 가능성이 큽니다\n\n"
+                "후보를 15~30개로 좁히는 것을 권하는 것도 같은 이유입니다.")
+
+            st.divider()
+            st.subheader("10. 검증 — 표본내와 표본외")
             st.markdown(
                 "전체 기간을 모두 활용해 최적 비중을 구한 뒤 같은 기간의 성과를 제시하면 "
                 "결과가 좋게 나오는 것이 당연합니다. 이미 답을 알고 있는 상태에서 답을 "
@@ -2067,6 +2291,19 @@ def render_help():
                 "차이가 나타납니다. 낙폭을 견디기 어려운 성향이라면 낙폭 기반 지표가 목적에 맞습니다.")
 
             st.divider()
+            st.subheader("위기 구간 분석")
+            st.markdown(
+                "평균적으로 좋아 보이는 구성도 위기에는 전혀 다르게 움직입니다. "
+                "전체 기간의 평균 지표만 보면 이런 취약점이 드러나지 않습니다.\n\n"
+                "이 도구는 널리 쓰이는 위기 구간을 **S&P 500의 고점 → 저점** 기준으로 "
+                "미리 넣어두었습니다. 시장 국면 분석이 −20% 규칙으로 국면을 자동 구분하는 "
+                "것과 달리, 여기서는 **사건 단위로 날짜를 고정**해 서로 다른 포트폴리오를 "
+                "같은 잣대로 비교할 수 있게 했습니다.\n\n"
+                "**회복 기간**이 특히 중요합니다. 같은 −30% 하락이어도 6개월 만에 회복하는 "
+                "것과 3년이 걸리는 것은 전혀 다른 경험입니다. 낙폭의 비대칭성(이론 2번)과 "
+                "함께 보시면 이해가 분명해집니다.")
+
+            st.divider()
             st.subheader("적립식과 내부수익률")
             st.markdown(
                 "목돈을 한 번에 넣는 경우와 매달 나눠 넣는 경우는 결과가 다릅니다. "
@@ -2096,7 +2333,7 @@ def render_help():
 # 자산 상관관계 화면
 # ======================================================================
 # ======================================================================
-# 종목 추가 탐색
+# 자산 추가 효과
 # ======================================================================
 # ======================================================================
 # 시장 국면 분석
@@ -2104,9 +2341,432 @@ def render_help():
 # ======================================================================
 # 뷰 기반 자산배분 (블랙-리터만)
 # ======================================================================
+# ======================================================================
+# 스트레스 테스트
+# ======================================================================
+STRESS_COLS = ["티커", "종목명", "비중(%)"]
+
+# 널리 쓰이는 위기 구간 (S&P 500 고점 → 저점 기준)
+CRISIS_PRESETS = {
+    "닷컴 버블 붕괴 (2000~02)": ("2000-03-24", "2002-10-09"),
+    "글로벌 금융위기 (2007~09)": ("2007-10-09", "2009-03-09"),
+    "유럽 재정위기 (2011)": ("2011-04-29", "2011-10-03"),
+    "중국 쇼크·유가 급락 (2015~16)": ("2015-05-21", "2016-02-11"),
+    "2018년 4분기 조정": ("2018-09-20", "2018-12-24"),
+    "코로나 폭락 (2020)": ("2020-02-19", "2020-03-23"),
+    "긴축 발작 (2022)": ("2022-01-03", "2022-10-12"),
+}
+
+
+def _stress_blank():
+    return {"티커": "", "종목명": "", "비중(%)": np.nan}
+
+
+def crisis_stats(r: pd.Series, s, e) -> dict:
+    """
+    위기 구간 성과와 회복 기간.
+      · 저점은 반드시 위기 구간 [s, e] 안에서 찾는다
+      · 회복은 그 저점 이후, 위기 직전 수준을 되찾은 첫날로 본다
+    """
+    s, e = pd.Timestamp(s), pd.Timestamp(e)
+    seg = r.loc[s:e]
+    if len(seg) < 3:
+        return None
+    eq = (1 + seg).cumprod()
+    trough_d = eq.idxmin()
+    out = {
+        "구간 수익률(%)": (float(eq.iloc[-1]) - 1) * 100,
+        "고점→저점(%)": (float(eq.min()) - 1) * 100,
+        "최대낙폭(%)": float((eq / eq.cummax() - 1).min()) * 100,
+        "거래일": int(len(seg)),
+        "기간(개월)": round((e - s).days / 30.44, 1),
+        "저점일": trough_d.date(),
+    }
+    after = r.loc[s:]
+    eq_a = (1 + after).cumprod()
+    post = eq_a[eq_a.index > trough_d]
+    rec = post[post >= 1.0]
+    if len(rec):
+        d = rec.index[0]
+        out["회복일"] = d.date()
+        out["회복까지(개월)"] = round((d - trough_d).days / 30.44, 1)
+    else:
+        out["회복일"] = None
+        out["회복까지(개월)"] = np.nan
+    return out
+
+
+def render_stress(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, rf_rate):
+    st.title("🌩 스트레스 테스트")
+    st.caption("과거 위기 국면만 잘라내어, 그 시기에 포트폴리오가 어떻게 버텼는지 봅니다. "
+               "평균적으로 좋아 보이는 구성도 위기에는 전혀 다르게 움직일 수 있습니다.")
+
+    key = "_stress_df"
+    if key not in st.session_state:
+        st.session_state[key] = pd.DataFrame([
+            {"티커": t, "종목명": "", "비중(%)": w}
+            for t, w in [("SPY", 60.0), ("AGG", 40.0)]])[STRESS_COLS]
+    st.session_state.setdefault("_stress_gen", 0)
+
+    # ---------------- 종목 ----------------
+    st.subheader("1️⃣ 포트폴리오 (Holdings)")
+    render_etf_loader(target_key=key, gen_key="_stress_gen",
+                      editor_key="_stress_editor", cols=STRESS_COLS,
+                      weight_col="비중(%)")
+    z1, z2 = st.columns([1, 5])
+    _sn = len(st.session_state[key])
+    sn = z1.number_input("종목 수", 1, 30, _sn, step=1,
+                         key=f"_stress_n_{st.session_state['_stress_gen']}")
+    if int(sn) != _sn:
+        cur = st.session_state[key]
+        cur = (pd.concat([cur, pd.DataFrame([_stress_blank()] * (int(sn) - len(cur)))],
+                         ignore_index=True) if int(sn) > len(cur)
+               else cur.iloc[:int(sn)].reset_index(drop=True))
+        st.session_state[key] = cur[STRESS_COLS]
+        st.session_state["_stress_gen"] += 1
+        st.session_state.pop("_stress_editor", None)
+        st.rerun()
+
+    _sd = st.session_state[key].copy()
+    _sd["🗑"] = False
+    sed = st.data_editor(
+        _sd, num_rows="fixed", width="stretch", key="_stress_editor",
+        column_order=STRESS_COLS + ["🗑"], hide_index=True,
+        column_config={
+            "티커": st.column_config.TextColumn("티커", width="small"),
+            "종목명": st.column_config.TextColumn("종목명 (자동)", disabled=True,
+                                              width="medium"),
+            "비중(%)": st.column_config.NumberColumn(
+                "비중(%)", min_value=0.0, max_value=100.0, step=0.01,
+                format="%.2f", width="small"),
+            "🗑": st.column_config.CheckboxColumn("삭제", width="small"),
+        })
+    _sdel = sed["🗑"].fillna(False).astype(bool)
+    if _sdel.any():
+        kept = sed.loc[~_sdel, STRESS_COLS].reset_index(drop=True)
+        if kept.empty:
+            kept = pd.DataFrame([_stress_blank()])[STRESS_COLS]
+        st.session_state[key] = kept
+        st.session_state["_stress_gen"] += 1
+        st.session_state.pop("_stress_editor", None)
+        st.rerun()
+
+    sf = sed[STRESS_COLS].copy()
+    sf["티커"] = sf["티커"].fillna("").astype(str).str.strip()
+    sf["비중(%)"] = pd.to_numeric(sf["비중(%)"], errors="coerce")
+    labs, bad = [], []
+    if any(t for t in sf["티커"]):
+        with st.spinner("티커 확인 중..."):
+            res = []
+            for t in sf["티커"]:
+                if not t:
+                    res.append(""); labs.append(""); continue
+                rr_ = probe_ticker(tuple(normalize_ticker(t)))
+                if rr_["ticker"] is None:
+                    res.append(t); labs.append("❌ 확인 불가"); bad.append(t)
+                else:
+                    res.append(rr_["ticker"])
+                    labs.append(f"✅ {rr_.get('name') or '(종목명 없음)'} · {rr_['currency']}")
+        sf["티커"] = res
+    sf["종목명"] = labs if labs else ""
+    if not _frames_equal(sf, st.session_state[key]):
+        st.session_state[key] = sf
+        st.session_state.pop("_stress_editor", None)
+        st.rerun()
+
+    live = sf[sf["티커"] != ""].copy()
+    tickers = list(live["티커"])
+    ok_in, msgs = validate_setup(tickers, bad, live["비중(%)"], min_n=1,
+                                 need_weight=True)
+    show_msgs(msgs)
+
+    # ---------------- 구간 ----------------
+    st.subheader("2️⃣ 위기 구간 (Crisis Periods)")
+    st.caption("널리 쓰이는 구간을 고르거나, 직접 날짜를 지정할 수 있습니다. "
+               "구간은 S&P 500의 고점 → 저점을 기준으로 잡았습니다.")
+    picked = st.multiselect("분석할 구간", list(CRISIS_PRESETS),
+                            default=["글로벌 금융위기 (2007~09)", "코로나 폭락 (2020)",
+                                     "긴축 발작 (2022)"], key="_stress_pick")
+    with st.expander("직접 구간 추가", expanded=False):
+        u1, u2, u3 = st.columns([2, 1.5, 1.5])
+        cname = u1.text_input("구간 이름", key="_stress_cname",
+                              placeholder="예: 2024년 8월 엔캐리 청산")
+        cs = u2.date_input("시작일", pd.Timestamp("2024-07-31"), key="_stress_cs")
+        ce = u3.date_input("종료일", pd.Timestamp("2024-08-05"), key="_stress_ce")
+        if st.button("구간 추가", width="stretch",
+                     disabled=not cname.strip()):
+            cust = dict(st.session_state.get("_stress_custom", {}))
+            cust[cname.strip()] = (str(cs), str(ce))
+            st.session_state["_stress_custom"] = cust
+            st.rerun()
+        cust = st.session_state.get("_stress_custom", {})
+        if cust:
+            st.caption("추가한 구간 · " + " · ".join(
+                f"{k} ({v[0]}~{v[1]})" for k, v in cust.items()))
+            if st.button("추가 구간 모두 지우기", width="stretch"):
+                st.session_state.pop("_stress_custom", None)
+                st.rerun()
+
+    bench_s = st.text_input("벤치마크", value="^GSPC", key="_stress_bench")
+    rebal_s = st.selectbox("리밸런싱", REBAL_OPTIONS, index=2, key="_stress_rebal")
+
+    all_c = dict(CRISIS_PRESETS)
+    all_c.update(st.session_state.get("_stress_custom", {}))
+    use_c = {k: all_c[k] for k in picked if k in all_c}
+    use_c.update(st.session_state.get("_stress_custom", {}))
+
+    run_s = st.button("🌩 스트레스 테스트 실행", type="primary", width="stretch",
+                      disabled=not ok_in or not use_c)
+    if run_s:
+        st.session_state["_stress_has_run"] = True
+    if not st.session_state.get("_stress_has_run"):
+        st.info("👆 포트폴리오와 위기 구간을 정한 뒤 **스트레스 테스트 실행**을 눌러주세요.")
+        return
+    if not use_c:
+        st.error("분석할 구간을 하나 이상 선택해주세요.")
+        return
+
+    # ---------------- 데이터 ----------------
+    bench_n = normalize_ticker(bench_s)[0] if bench_s.strip() else None
+    need = tickers + ([bench_n] if bench_n else [])
+    # 위기 구간이 분석 기간 밖일 수 있으므로 넉넉히 받는다
+    lo = min(pd.Timestamp(v[0]) for v in use_c.values())
+    fetch_start = min(pd.Timestamp(start_date), lo - pd.DateOffset(months=6))
+    try:
+        with st.spinner("데이터 수집 중..."):
+            prices, meta, _fx = build_price_frame(need, fetch_start, end_date,
+                                                  base_ccy, use_div, fx_hedge, gap_fill)
+    except Exception as ex:
+        st.error(f"데이터를 가져오지 못했습니다: {ex}")
+        return
+    use_tk = [t for t in tickers if t in prices.columns]
+    if not use_tk:
+        st.error("종목 데이터를 가져오지 못했습니다.")
+        return
+
+    w = live.set_index("티커")["비중(%)"].reindex(use_tk).fillna(0)
+    if w.sum() <= 0:
+        w = pd.Series(1.0, index=use_tk)
+    W = {t: float(v) for t, v in w.items()}
+
+    try:
+        pr = portfolio_returns(prices, W, rebal_s)
+        tno = turnover_series(prices, W, rebal_s).reindex(pr.index).fillna(0)
+        pr = apply_cost(pr, tno, cost_bp)
+    except Exception as ex:
+        st.error(f"포트폴리오를 계산하지 못했습니다: {ex}")
+        return
+    br = None
+    if bench_n and bench_n in prices.columns:
+        try:
+            br = portfolio_returns(prices, {bench_n: 100.0}, REBAL_NONE)
+        except Exception:
+            br = None
+
+    st.success(f"✅ 실행 완료 · {len(use_tk)}종목 · 구간 {len(use_c)}개 · "
+               f"데이터 {prices.index[0].date()} ~ {prices.index[-1].date()}")
+
+    # ---------------- 구간별 성과 ----------------
+    st.subheader("3️⃣ 위기별 성과 (Performance in Crises)")
+    st.caption("**고점→저점**은 그 구간에서 가장 깊이 빠졌을 때의 낙폭이고, "
+               "**회복까지**는 저점에서 위기 직전 수준을 되찾기까지 걸린 기간입니다.")
+    rows, skipped = [], []
+    for nm, (a, b) in use_c.items():
+        x = crisis_stats(pr, a, b)
+        if x is None:
+            skipped.append(nm); continue
+        row = {"위기": nm, "시작": a, "종료": b,
+               "고점→저점(%)": x["고점→저점(%)"],
+               "구간 수익률(%)": x["구간 수익률(%)"],
+               "기간(개월)": x["기간(개월)"],
+               "저점일": x["저점일"],
+               "회복까지(개월)": x["회복까지(개월)"]}
+        if br is not None:
+            xb = crisis_stats(br, a, b)
+            row["벤치마크 고점→저점(%)"] = xb["고점→저점(%)"] if xb else np.nan
+            row["초과(%p)"] = (row["고점→저점(%)"] - row["벤치마크 고점→저점(%)"]
+                              if xb else np.nan)
+        rows.append(row)
+    if skipped:
+        st.warning(f"데이터가 없어 건너뛴 구간: {', '.join(skipped)}")
+    if not rows:
+        st.error("분석 가능한 구간이 없습니다. 사이드바의 시작일을 앞당겨보세요.")
+        return
+
+    cdf = pd.DataFrame(rows)
+    fmt = {"고점→저점(%)": "{:.2f}", "구간 수익률(%)": "{:.2f}",
+           "기간(개월)": "{:.1f}", "회복까지(개월)": "{:.1f}"}
+    if "벤치마크 고점→저점(%)" in cdf.columns:
+        fmt.update({"벤치마크 고점→저점(%)": "{:.2f}", "초과(%p)": "{:+.2f}"})
+    st.dataframe(cdf.style.format(fmt, na_rep="미회복")
+                 .highlight_max(subset=["고점→저점(%)"], color="#dcfce7"),
+                 width="stretch", hide_index=True)
+    st.caption("초록색 = 가장 덜 빠진 구간. **낙폭은 음수이므로 0에 가까울수록 좋습니다.** "
+               "회복까지가 '미회복'이면 아직 위기 이전 수준을 되찾지 못했다는 뜻입니다.")
+
+    fbar = go.Figure()
+    fbar.add_trace(go.Bar(x=cdf["위기"], y=cdf["고점→저점(%)"], name="포트폴리오",
+                          marker_color="#dc2626",
+                          text=[f"{v:.1f}%" for v in cdf["고점→저점(%)"]],
+                          textposition="outside"))
+    if "벤치마크 고점→저점(%)" in cdf.columns:
+        fbar.add_trace(go.Bar(x=cdf["위기"], y=cdf["벤치마크 고점→저점(%)"],
+                              name=f"벤치마크 ({bench_n})", marker_color="#cbd5e1",
+                              text=[f"{v:.1f}%" for v in cdf["벤치마크 고점→저점(%)"]],
+                              textposition="outside"))
+    fbar.update_layout(barmode="group", height=380,
+                       margin=dict(l=0, r=0, t=30, b=0),
+                       yaxis=dict(title=None, ticksuffix="%"),
+                       legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+    st.plotly_chart(fbar, width="stretch")
+
+    # ---------------- 자산별 ----------------
+    st.subheader("4️⃣ 위기별 자산 성과 (By Asset)")
+    st.caption("각 자산이 위기 구간에서 어떻게 움직였는지입니다. "
+               "**무엇이 방어 역할을 했는지** 확인해보세요.")
+    arows = []
+    R_all = prices[use_tk].pct_change().dropna()
+    for nm, (a, b) in use_c.items():
+        seg = R_all.loc[pd.Timestamp(a):pd.Timestamp(b)]
+        if len(seg) < 3:
+            continue
+        for t in use_tk:
+            eqx = (1 + seg[t]).cumprod()
+            arows.append({"위기": nm, "티커": t,
+                          "구간 수익률(%)": (float(eqx.iloc[-1]) - 1) * 100,
+                          "고점→저점(%)": (float(eqx.min()) - 1) * 100})
+    if arows:
+        adf = pd.DataFrame(arows)
+        piv = adf.pivot(index="티커", columns="위기", values="구간 수익률(%)")
+        piv = piv[[c for c in cdf["위기"] if c in piv.columns]]
+        st.dataframe(piv.style.format("{:.2f}", na_rep="-").map(_heat_color),
+                     width="stretch")
+        worst_c = cdf.loc[cdf["고점→저점(%)"].idxmin(), "위기"]
+        if worst_c in piv.columns:
+            best_a = piv[worst_c].idxmax()
+            st.info(f"가장 큰 낙폭을 기록한 **{worst_c}** 구간에서 가장 잘 버틴 자산은 "
+                    f"**{best_a}** ({piv.loc[best_a, worst_c]:+.2f}%)입니다.")
+
+    # ---------------- 위기 구간 상관관계 ----------------
+    st.subheader("5️⃣ 위기 구간 상관관계 (Correlation in Crises)")
+    st.caption("**분산투자가 가장 시험받는 지점입니다.** 평상시 낮던 상관관계가 위기에 "
+               "함께 올라가면, 정작 방어가 필요한 순간에 분산 효과가 줄어듭니다.")
+    if len(use_tk) < 2:
+        st.info("상관관계를 보려면 2개 이상의 종목이 필요합니다.")
+    else:
+        mask = pd.Series(False, index=R_all.index)
+        for nm, (a, b) in use_c.items():
+            mask |= (R_all.index >= pd.Timestamp(a)) & (R_all.index <= pd.Timestamp(b))
+        crows = {}
+        for lbl, sel in [("평상시", ~mask), ("위기 구간", mask), ("전체", None)]:
+            sub = R_all if sel is None else R_all[sel]
+            if len(sub) < 20:
+                continue
+            cm = sub.corr()
+            rho, eff = diversification_stats(cm)
+            crows[lbl] = {"표본(거래일)": len(sub), "평균 상관계수": rho,
+                          "실효 종목 수": eff}
+        if crows:
+            st.dataframe(pd.DataFrame(crows).T.style.format(
+                {"표본(거래일)": "{:.0f}", "평균 상관계수": "{:.3f}",
+                 "실효 종목 수": "{:.2f}"}), width="stretch")
+            if "평상시" in crows and "위기 구간" in crows:
+                d = crows["위기 구간"]["평균 상관계수"] - crows["평상시"]["평균 상관계수"]
+                if d > 0.1:
+                    st.warning(f"위기 구간 평균 상관계수가 평상시보다 **{d:+.2f}** 높습니다. "
+                               f"실효 종목 수도 {crows['평상시']['실효 종목 수']:.1f}개 → "
+                               f"**{crows['위기 구간']['실효 종목 수']:.1f}개** 로 줄어듭니다. "
+                               f"위기에 분산 효과가 약해진다는 뜻입니다.")
+                elif d < -0.05:
+                    st.success(f"위기 구간 평균 상관계수가 평상시보다 **{d:+.2f}** 낮습니다. "
+                               f"하락 국면에서도 분산이 유지되는 구성입니다.")
+        tabs_s = st.tabs(["평상시 행렬", "위기 구간 행렬"])
+        for tb, sel in zip(tabs_s, [~mask, mask]):
+            with tb:
+                sub = R_all[sel]
+                if len(sub) >= 20:
+                    st.dataframe(sub.corr().round(2).style.format("{:.2f}")
+                                 .map(_corr_color), width="stretch")
+                else:
+                    st.info("표본이 부족합니다.")
+
+    # ---------------- 회복 경로 ----------------
+    st.subheader("6️⃣ 회복 경로 (Recovery Path)")
+    pick_c2 = st.selectbox("구간 선택", list(cdf["위기"]), key="_stress_path")
+    a, b = use_c[pick_c2]
+    seg_r = pr.loc[pd.Timestamp(a):]
+    if len(seg_r) > 5:
+        eqp = (1 + seg_r).cumprod()
+        fpath = go.Figure()
+        fpath.add_trace(go.Scatter(x=eqp.index, y=(eqp.values - 1) * 100,
+                                   name="포트폴리오", line=dict(color="#2563eb", width=2)))
+        if br is not None:
+            bb = (1 + br.loc[pd.Timestamp(a):]).cumprod()
+            fpath.add_trace(go.Scatter(x=bb.index, y=(bb.values - 1) * 100,
+                                       name=f"벤치마크 ({bench_n})",
+                                       line=dict(color="#9ca3af", width=1.5, dash="dash")))
+        fpath.add_hline(y=0, line_dash="dot", line_color="#cbd5e1")
+        fpath.add_vrect(x0=pd.Timestamp(a), x1=pd.Timestamp(b),
+                        fillcolor="#fee2e2", opacity=0.5, line_width=0, layer="below")
+        fpath.update_layout(height=380, hovermode="x unified",
+                            margin=dict(l=0, r=0, t=30, b=0),
+                            yaxis=dict(title=None, ticksuffix="%"),
+                            legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+        st.plotly_chart(fpath, width="stretch")
+        st.caption("붉은 음영이 위기 구간입니다. 0%선을 다시 넘는 시점이 회복 시점입니다.")
+
+    # ---------------- 요약 ----------------
+    st.subheader("📝 요약 (Summary)")
+    worst = cdf.loc[cdf["고점→저점(%)"].idxmin()]
+    slines = [f"선택한 {len(cdf)}개 구간 중 가장 큰 낙폭은 **{worst['위기']}** 의 "
+              f"**{worst['고점→저점(%)']:.2f}%** 였습니다."]
+    if not pd.isna(worst["회복까지(개월)"]):
+        slines.append(f"저점에서 위기 이전 수준을 되찾기까지 "
+                      f"**{worst['회복까지(개월)']:.1f}개월**이 걸렸습니다.")
+    else:
+        slines.append("이 구간은 아직 위기 이전 수준을 되찾지 못했습니다.")
+    if "초과(%p)" in cdf.columns and cdf["초과(%p)"].notna().any():
+        avg_ex = float(cdf["초과(%p)"].mean())
+        slines.append(f"벤치마크 대비 평균 **{avg_ex:+.2f}%p** "
+                      f"{'덜 빠졌습니다' if avg_ex > 0 else '더 빠졌습니다'}.")
+    unrec = cdf[cdf["회복까지(개월)"].isna()]
+    if len(unrec):
+        slines.append(f"아직 회복되지 않은 구간: **{', '.join(unrec['위기'])}**")
+    st.markdown("\n\n".join(slines))
+
+    st.divider()
+    try:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
+            cdf.to_excel(xw, sheet_name="1_위기별성과", index=False)
+            if arows:
+                pd.DataFrame(arows).to_excel(xw, sheet_name="2_자산별", index=False)
+            if len(use_tk) >= 2 and crows:
+                pd.DataFrame(crows).T.to_excel(xw, sheet_name="3_상관요약")
+            pd.DataFrame([{"구간": k, "시작": v[0], "종료": v[1]}
+                          for k, v in use_c.items()]).to_excel(
+                xw, sheet_name="4_구간정의", index=False)
+        st.download_button("📊 엑셀 파일 받기", buf.getvalue(),
+                           f"stress_test_{pd.Timestamp.now():%Y%m%d_%H%M}.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           width="stretch")
+    except Exception as ex:
+        st.error(f"엑셀 생성 실패: {ex}")
+    st.caption("과거의 위기가 같은 형태로 반복된다는 보장은 없습니다. "
+               "특히 자산 간 상관관계는 위기마다 다르게 나타납니다. "
+               "교육·참고용이며 투자 자문이 아닙니다.")
+
+
 BL_COLS = ["티커", "종목명", "시장 비중(%)"]
 BL_VIEW_COLS = ["유형", "자산 A", "자산 B", "연 수익률(%)", "확신도"]
 BL_CONF = {"상": 0.25, "중": 1.0, "하": 4.0}
+
+# 간단 모드 — 전망 강도를 자산 변동성의 배수로 환산한다.
+# 변동성 16%인 주식의 '강한 긍정'은 +3.2%p, 변동성 6%인 채권은 +1.2%p 가 되어
+# 자산 성격에 맞는 크기가 자동으로 잡힌다.
+BL_SIMPLE = {"강한 긍정": 0.20, "긍정": 0.10, "중립": 0.0,
+             "부정": -0.10, "강한 부정": -0.20}
+BL_SIMPLE_COLS = ["티커", "전망"]
 
 
 def _bl_blank():
@@ -2246,37 +2906,82 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
     live = bf[bf["티커"] != ""].copy()
     tickers = list(live["티커"])
     wsum = float(live["시장 비중(%)"].fillna(0).sum())
-    st.caption(f"자산 {len(tickers)}개 · 시장 비중 합계 **{wsum:.2f}%**"
-               + ("" if abs(wsum - 100) < 0.01 else " · 100%가 아니면 자동 정규화됩니다"))
-    if bad:
-        st.error(f"확인되지 않는 티커: {', '.join(bad)}")
+    st.caption(f"자산 {len(tickers)}개")
+    ok_in, msgs = validate_setup(tickers, bad, live["시장 비중(%)"], min_n=2,
+                                 need_weight=True, label="자산")
+    show_msgs(msgs)
 
     # ---------------- 뷰 ----------------
     st.subheader("2️⃣ 전망 입력 (Views)")
-    st.caption("**절대** — 특정 자산이 연 몇 %를 낼 것이다.  |  "
-               "**상대** — 자산 A가 자산 B보다 연 몇 %p 나을 것이다.\n\n"
-               "확신도가 낮으면 시장 비중에서 거의 움직이지 않고, 높을수록 뷰 쪽으로 "
-               "크게 기울어집니다. 비워두면 뷰 없이 계산합니다.")
-    ved = st.data_editor(
-        st.session_state[vkey], num_rows="dynamic", width="stretch",
-        key="_bl_view_editor", column_order=BL_VIEW_COLS, hide_index=True,
-        column_config={
-            "유형": st.column_config.SelectboxColumn("유형", options=["절대", "상대"],
-                                                   width="small"),
-            "자산 A": st.column_config.SelectboxColumn("자산 A", options=tickers,
-                                                    width="medium"),
-            "자산 B": st.column_config.SelectboxColumn(
-                "자산 B (상대일 때)", options=tickers, width="medium"),
-            "연 수익률(%)": st.column_config.NumberColumn(
-                "연 수익률(%)", step=0.5, format="%.2f", width="small",
-                help="절대: 예상 연 수익률 · 상대: A가 B보다 얼마나 나은지(%p)"),
-            "확신도": st.column_config.SelectboxColumn("확신도", options=list(BL_CONF),
-                                                    width="small"),
-        })
-    st.session_state[vkey] = ved
+    mode = st.radio("입력 방식", ["간단 모드", "전문가 모드"], horizontal=True,
+                    key="_bl_mode",
+                    help="간단 모드는 자산별로 긍정·중립·부정만 고르면 됩니다. "
+                         "전문가 모드는 수치와 상대 뷰를 직접 지정합니다.")
+
+    ved = st.session_state[vkey]
+    simple_df = None
+    conf_pct = 60
+    strength = 1.0
+
+    if mode == "간단 모드":
+        st.caption("각 자산의 전망만 고르세요. 수치는 **자산의 변동성에 맞춰 자동 환산**됩니다. "
+                   "변동성이 큰 주식의 '긍정'과 변동성이 작은 채권의 '긍정'은 "
+                   "다른 크기로 반영됩니다.")
+        skey = "_bl_simple"
+        if skey not in st.session_state or \
+                list(st.session_state[skey]["티커"]) != tickers:
+            st.session_state[skey] = pd.DataFrame(
+                [{"티커": t, "전망": "중립"} for t in tickers])[BL_SIMPLE_COLS]
+        simple_df = st.data_editor(
+            st.session_state[skey], num_rows="fixed", width="stretch",
+            key="_bl_simple_editor", column_order=BL_SIMPLE_COLS, hide_index=True,
+            column_config={
+                "티커": st.column_config.TextColumn("티커", disabled=True, width="small"),
+                "전망": st.column_config.SelectboxColumn(
+                    "전망", options=list(BL_SIMPLE), width="medium"),
+            })
+        st.session_state[skey] = simple_df
+        f1, f2 = st.columns(2)
+        conf_pct = f1.slider("전망 확신도 (%)", 20, 100, 60, step=5, key="_bl_conf_pct",
+                             help="낮으면 시장 비중에서 거의 움직이지 않고, "
+                                  "높을수록 전망 쪽으로 크게 기울어집니다.")
+        strength = f2.slider("전망 강도", 0.5, 2.0, 1.0, step=0.1, key="_bl_strength",
+                             help="1.0 기준으로 '강한 긍정'은 해당 자산 변동성의 20% "
+                                  "만큼 초과수익을 기대한다는 뜻입니다.")
+    else:
+        st.caption("**절대** — 특정 자산이 연 몇 %를 낼 것이다.  |  "
+                   "**상대** — 자산 A가 자산 B보다 연 몇 %p 나을 것이다.\n\n"
+                   "확신도가 낮으면 시장 비중에서 거의 움직이지 않고, 높을수록 뷰 쪽으로 "
+                   "크게 기울어집니다. 비워두면 뷰 없이 계산합니다.")
+        ved = st.data_editor(
+            st.session_state[vkey], num_rows="dynamic", width="stretch",
+            key="_bl_view_editor", column_order=BL_VIEW_COLS, hide_index=True,
+            column_config={
+                "유형": st.column_config.SelectboxColumn("유형", options=["절대", "상대"],
+                                                       width="small"),
+                "자산 A": st.column_config.SelectboxColumn("자산 A", options=tickers,
+                                                        width="medium"),
+                "자산 B": st.column_config.SelectboxColumn(
+                    "자산 B (상대일 때)", options=tickers, width="medium"),
+                "연 수익률(%)": st.column_config.NumberColumn(
+                    "연 수익률(%)", step=0.5, format="%.2f", width="small",
+                    help="절대: 예상 연 수익률 · 상대: A가 B보다 얼마나 나은지(%p)"),
+                "확신도": st.column_config.SelectboxColumn("확신도", options=list(BL_CONF),
+                                                        width="small"),
+            })
+        st.session_state[vkey] = ved
 
     # ---------------- 설정 ----------------
     st.subheader("3️⃣ 모형 설정 (Model Settings)")
+    h1, h2 = st.columns([1, 3])
+    horizon = h1.selectbox("전망 기간", ["6개월", "1년", "2년", "3년"], index=1,
+                           key="_bl_horizon",
+                           help="이 전망이 어느 기간을 내다본 것인지입니다. "
+                                "기간이 짧을수록 같은 전망이라도 불확실성이 커집니다.")
+    h2.caption("전망 기간이 짧으면 **같은 확신도라도 반영 강도를 낮춥니다.** "
+               "6개월 앞을 3년 앞만큼 확신하기는 어렵기 때문입니다. "
+               "입력하신 수익률은 **연율 기준**으로 해석합니다.")
+
     p1, p2, p3 = st.columns(3)
     auto_delta = p1.checkbox("위험회피계수 자동 추정", value=True, key="_bl_autod",
                              help="시장 포트폴리오의 과거 초과수익과 변동성에서 "
@@ -2347,7 +3052,32 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
 
     # ---------------- 뷰 파싱 ----------------
     P, Q, conf, vdesc = [], [], [], []
-    vv = ved.copy()
+    sig = np.sqrt(np.diag(cov))          # 자산별 연 변동성
+
+    # 전망 기간이 짧을수록 불확실성을 키운다 (1년 기준 1.0)
+    HZ_MULT = {"6개월": 1.6, "1년": 1.0, "2년": 0.8, "3년": 0.7}
+    hz = HZ_MULT.get(horizon, 1.0)
+
+    if mode == "간단 모드" and simple_df is not None:
+        scale = float(np.clip((100 - conf_pct) / max(conf_pct, 1) * hz, 0.02, 12.0))
+        for _, r in simple_df.iterrows():
+            a = str(r.get("티커") or "").strip()
+            v = str(r.get("전망") or "중립")
+            k = BL_SIMPLE.get(v, 0.0) * float(strength)
+            if a not in use_tk or abs(k) < 1e-9:
+                continue
+            i = use_tk.index(a)
+            row = np.zeros(len(use_tk)); row[i] = 1.0
+            # 균형 수익률 대비 ±(변동성 × k) 만큼 초과/미달을 기대
+            base_pi = float(implied_returns(delta, cov, w_mkt)[i])
+            q = base_pi + k * float(sig[i])
+            P.append(row); Q.append(q); conf.append(scale)
+            vdesc.append(f"**{a}** {v} — 균형 {base_pi*100:.2f}% 대비 "
+                         f"{k*sig[i]*100:+.2f}%p (확신도 {conf_pct}%)")
+        vv = pd.DataFrame()
+    else:
+        vv = ved.copy()
+
     for _, r in vv.iterrows():
         a = str(r.get("자산 A") or "").strip()
         val = pd.to_numeric(r.get("연 수익률(%)"), errors="coerce")
@@ -2365,7 +3095,7 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
             row[use_tk.index(a)] = 1.0
             vdesc.append(f"{a} 연 수익률 {val:.2f}% (확신 {r.get('확신도')})")
         P.append(row); Q.append(float(val) / 100.0)
-        conf.append(BL_CONF.get(str(r.get("확신도")), 1.0))
+        conf.append(BL_CONF.get(str(r.get("확신도")), 1.0) * hz)
 
     pi, post = black_litterman(cov, w_mkt, delta, tau,
                                P if P else None, Q if Q else None,
@@ -2373,6 +3103,7 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
     w_bl = bl_weights(post, cov, delta, 0.0, wmax_bl / 100.0, allow_short)
 
     st.success(f"✅ 계산 완료 · 자산 {len(use_tk)}개 · 뷰 **{len(P)}개** · "
+               f"전망 기간 **{horizon}** · "
                f"위험회피계수 δ = **{delta:.2f}**{' (자동 추정)' if auto_delta else ''} · "
                f"공분산 {lookback} ({R.index[0].date()} ~ {R.index[-1].date()}, {len(R):,}일)")
     if vdesc:
@@ -2391,12 +3122,12 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
         "균형 기대수익률(%)": pi * 100,
         "사후 기대수익률(%)": post * 100,
         "변화(%p)": (post - pi) * 100,
-        "연 변동성(%)": np.sqrt(np.diag(cov)) * 100,
+        "변동성(연,%)": np.sqrt(np.diag(cov)) * 100,
     })
     st.dataframe(edf.style.format({"균형 기대수익률(%)": "{:.2f}",
                                    "사후 기대수익률(%)": "{:.2f}",
                                    "변화(%p)": "{:+.2f}",
-                                   "연 변동성(%)": "{:.2f}"}),
+                                   "변동성(연,%)": "{:.2f}"}),
                  width="stretch", hide_index=True)
 
     # ---------------- 배분 ----------------
@@ -2428,8 +3159,72 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
                                    "변화(%p)": "{:+.2f}"}),
                  width="stretch", hide_index=True)
 
+    # ---------------- 결과 해석 ----------------
+    st.subheader("6️⃣ 이렇게 바뀐 이유 (What Changed and Why)")
+    if not P:
+        st.info("전망을 넣지 않아 시장 비중이 그대로 유지됐습니다.")
+    else:
+        chg = pd.Series(w_bl - w_mkt, index=use_tk) * 100
+        viewed = set()
+        for row in P:
+            for i, x in enumerate(row):
+                if abs(x) > 1e-9:
+                    viewed.add(use_tk[i])
+
+        lines = []
+        lines.append(f"전망 **{len(P)}개**를 반영한 결과, 배분이 다음과 같이 바뀌었습니다.")
+        up = chg[chg > 0.05].sort_values(ascending=False)
+        dn = chg[chg < -0.05].sort_values()
+        if len(up):
+            lines.append("**늘어난 자산** · " + " · ".join(
+                f"{k} {w_mkt[use_tk.index(k)]*100:.1f}% → "
+                f"{w_bl[use_tk.index(k)]*100:.1f}% ({v:+.1f}%p)"
+                for k, v in up.head(4).items()))
+        if len(dn):
+            lines.append("**줄어든 자산** · " + " · ".join(
+                f"{k} {w_mkt[use_tk.index(k)]*100:.1f}% → "
+                f"{w_bl[use_tk.index(k)]*100:.1f}% ({v:+.1f}%p)"
+                for k, v in dn.head(4).items()))
+
+        spill = [k for k, v in chg.items() if abs(v) > 0.5 and k not in viewed]
+        if spill:
+            lines.append(f"전망을 직접 주지 않은 **{', '.join(spill[:4])}** 도 함께 "
+                         f"움직였습니다. 전망을 준 자산과 상관관계로 연결돼 있기 때문입니다.")
+
+        r_m, v_m, s_m = port_perf(w_mkt, post, cov, rf_rate)
+        r_b, v_b, s_b = port_perf(w_bl, post, cov, rf_rate)
+        lines.append(f"그 결과 기대수익률은 {r_m*100:.2f}% → **{r_b*100:.2f}%**, "
+                     f"예상 변동성은 {v_m*100:.2f}% → **{v_b*100:.2f}%**, "
+                     f"예상 샤프는 {s_m:.2f} → **{s_b:.2f}** 가 됐습니다.")
+        st.markdown("\n\n".join(lines))
+
+        top_chg = chg.abs().max()
+        if top_chg > 25:
+            st.warning(f"비중 변화가 최대 **{top_chg:.1f}%p** 로 큽니다. "
+                       f"전망이 빗나가면 손실도 그만큼 커집니다. "
+                       f"확신도를 낮추거나 자산별 최대 비중을 조이면 변화폭이 줄어듭니다.")
+
+        with st.expander("전망별 영향 자세히 보기", expanded=False):
+            st.caption("각 전망을 **하나만** 반영했을 때의 비중 변화입니다. "
+                       "여러 전망이 서로 상쇄되거나 증폭될 수 있어, 합이 전체 결과와 "
+                       "정확히 일치하지는 않습니다.")
+            rows_v = []
+            for i in range(len(P)):
+                _, po_i = black_litterman(cov, w_mkt, delta, tau,
+                                          [P[i]], [Q[i]], [conf[i]])
+                w_i = bl_weights(po_i, cov, delta, 0.0, wmax_bl / 100.0, allow_short)
+                d_i = (w_i - w_mkt) * 100
+                j = int(np.argmax(np.abs(d_i)))
+                rows_v.append({"전망": re.sub(r"\*\*", "", vdesc[i]),
+                               "가장 크게 바뀐 자산": use_tk[j],
+                               "변화(%p)": float(d_i[j]),
+                               "총 변화량(%p)": float(np.abs(d_i).sum() / 2)})
+            st.dataframe(pd.DataFrame(rows_v).style.format(
+                {"변화(%p)": "{:+.2f}", "총 변화량(%p)": "{:.2f}"}),
+                width="stretch", hide_index=True)
+
     # ---------------- 기대 성과 ----------------
-    st.subheader("6️⃣ 기대 성과 비교 (Expected Performance)")
+    st.subheader("7️⃣ 기대 성과 비교 (Expected Performance)")
     st.caption("사후 기대수익률과 공분산으로 계산한 **예상치**입니다. "
                "과거 실현 성과가 아니라 모형이 내다본 값입니다.")
     rows = []
@@ -2471,6 +3266,19 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
         except Exception as ex:
             st.caption(f"과거 성과를 계산하지 못했습니다: {ex}")
 
+    # ---------------- 다음 단계 ----------------
+    st.divider()
+    st.subheader("➡️ 다음 단계")
+    if st.button("📊 제안 배분으로 상세 분석하기", width="stretch",
+                 help="제안 배분을 포트폴리오 분석 화면으로 넘겨 과거 성과를 자세히 봅니다."):
+        rows_s = [{"티커": t, "비중(%)": round(float(x) * 100, 2), "종목명": ""}
+                  for t, x in zip(use_tk, np.clip(w_bl, 0, None)) if x > 1e-6]
+        if rows_s:
+            send_to("📊 포트폴리오 분석",
+                    df_0=pd.DataFrame(rows_s)[COLS],
+                    gen_0=st.session_state.get("gen_0", 0) + 1,
+                    name_0="뷰 기반 배분", _has_run=False)
+
     # ---------------- 내보내기 ----------------
     st.divider()
     try:
@@ -2485,7 +3293,7 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
                 xw, sheet_name="5_공분산")
             pd.DataFrame(list({
                 "위험회피계수 δ": f"{delta:.3f}" + (" (자동)" if auto_delta else ""),
-                "τ": f"{tau:.3f}", "공분산 추정 기간": lookback,
+                "τ": f"{tau:.3f}", "전망 기간": horizon, "공분산 추정 기간": lookback,
                 "표본": f"{len(R):,}일", "자산별 최대 비중": f"{wmax_bl}%",
                 "공매도": "허용" if allow_short else "금지",
                 "기준 통화": base_ccy, "무위험 수익률": f"{rf_rate*100:.2f}%",
@@ -2658,8 +3466,8 @@ def render_regimes(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, 
         st.rerun()
 
     tickers = [t for t in rf_["티커"] if t]
-    if bad:
-        st.error(f"확인되지 않는 티커: {', '.join(bad)}")
+    ok_in, msgs = validate_setup(tickers, bad, min_n=1)
+    show_msgs(msgs)
 
     # ---------------- 국면 기준 ----------------
     st.subheader("2️⃣ 국면 구분 기준 (Regime Rules)")
@@ -2754,23 +3562,24 @@ def render_regimes(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, 
             eqc = (1 + rr).cumprod()
             prow.append({"국면": reg, "티커": t,
                          "누적 수익률(%)": (float(eqc.iloc[-1]) - 1) * 100,
-                         "연율 수익률(%)": ((float(eqc.iloc[-1]) ** (TRADING_DAYS / len(rr))) - 1) * 100,
-                         "변동성(%)": float(rr.std() * np.sqrt(TRADING_DAYS)) * 100,
+                         "수익률(연,%)": ((float(eqc.iloc[-1]) ** (TRADING_DAYS / len(rr))) - 1) * 100,
+                         "변동성(연,%)": float(rr.std() * np.sqrt(TRADING_DAYS)) * 100,
                          "최대낙폭(%)": float((eqc / eqc.cummax() - 1).min()) * 100,
                          "거래일": int(len(rr))})
     pdf = pd.DataFrame(prow)
     if not pdf.empty:
-        piv = pdf.pivot(index="티커", columns="국면", values="연율 수익률(%)")
+        piv = pdf.pivot(index="티커", columns="국면", values="수익률(연,%)")
         piv = piv[[c for c in ["강세", "횡보", "약세"] if c in piv.columns]]
-        st.markdown("**국면별 연율 수익률 (%)**")
+        st.markdown("**국면별 수익률 (연율, %)**")
         st.dataframe(piv.style.format("{:.2f}", na_rep="-").map(_heat_color),
                      width="stretch")
         with st.expander("상세 지표 보기", expanded=False):
             st.dataframe(pdf.style.format({"누적 수익률(%)": "{:.2f}",
-                                           "연율 수익률(%)": "{:.2f}",
-                                           "변동성(%)": "{:.2f}",
+                                           "수익률(연,%)": "{:.2f}",
+                                           "변동성(연,%)": "{:.2f}",
                                            "최대낙폭(%)": "{:.2f}"}),
                          width="stretch", hide_index=True)
+            st.caption("최대낙폭은 음수이며, 0에 가까울수록 하락이 얕았다는 뜻입니다.")
         if "약세" in piv.columns:
             best = piv["약세"].idxmax()
             st.info(f"약세장에서 가장 잘 버틴 자산은 **{best}** "
@@ -2889,6 +3698,51 @@ CAND_MAX_ADD = 3
 CAND_TOPN = 10
 
 
+ADD_WEIGHTS = [1.0, 3.0, 5.0, 10.0]
+FUND_PROP = "비례 축소 (모든 기존 자산에서 조금씩)"
+
+
+def fund_weights(base: dict, cand: str, w_add: float, source: str):
+    """
+    후보를 w_add(0~1) 만큼 편입할 때 재원을 어디서 가져올지에 따른 최종 비중.
+      · 비례 축소 — 기존 전부를 (1−w_add) 배로 줄인다
+      · 특정 자산 — 그 자산에서만 차감하고, 모자라면 나머지에서 비례로 충당한다
+    반환: (비중 dict, 경고문)
+    """
+    b = {k: float(v) for k, v in base.items() if float(v) > 0}
+    s = sum(b.values())
+    if s <= 0:
+        return None, "기존 비중이 없습니다."
+    b = {k: v / s for k, v in b.items()}
+    if not (0 < w_add < 1):
+        return None, "추가 비중은 0~100% 사이여야 합니다."
+
+    warn = ""
+    if source == FUND_PROP:
+        out = {k: v * (1 - w_add) for k, v in b.items()}
+    else:
+        if source not in b:
+            return None, f"{source} 가 기존 구성에 없습니다."
+        if b[source] < w_add - 1e-12:
+            short = w_add - b[source]
+            warn = (f"{source} 비중이 {b[source]*100:.2f}% 뿐이라 "
+                    f"{w_add*100:.2f}% 를 모두 뺄 수 없습니다. "
+                    f"부족분 {short*100:.2f}%p 는 나머지 자산에서 비례로 충당했습니다.")
+            out = dict(b)
+            out[source] = 0.0
+            rest = {k: v for k, v in out.items() if k != source and v > 0}
+            rs = sum(rest.values())
+            if rs <= 0:
+                return None, "충당할 자산이 없습니다."
+            for k in rest:
+                out[k] -= short * (rest[k] / rs)
+        else:
+            out = dict(b)
+            out[source] -= w_add
+    out[cand] = out.get(cand, 0.0) + w_add
+    return out, warn
+
+
 def _cand_blank():
     return {"티커": "", "종목명": ""}
 
@@ -2920,9 +3774,267 @@ def solve_combo(R: pd.DataFrame, goal, risk_name, rf, wmin, wmax, min_ret, max_v
     return w
 
 
+def render_fixed_add(base_df, base_tk, cand_tk, base_ccy, start_date, end_date,
+                     use_div, rf_rate, fx_hedge, gap_fill, meta_bad=None):
+    """
+    고정 비중 편입 효과.
+    후보를 정해진 비중으로 넣었을 때 지표가 어떻게 달라지는지,
+    그리고 그 재원을 어디서 가져오느냐에 따라 결과가 어떻게 갈리는지 본다.
+    """
+    st.subheader("4️⃣ 편입 조건 (Settings)")
+    f1, f2, f3 = st.columns(3)
+    weights_sel = f1.multiselect("편입 비중 (%)", ADD_WEIGHTS, default=[3.0, 5.0],
+                                 key="_fx_w",
+                                 help="여러 개를 고르면 비중별로 비교합니다.")
+    fund_opts = [FUND_PROP] + list(base_tk)
+    fund_src = f2.selectbox("재원 (어디서 빼서 넣을까)", fund_opts, key="_fx_src",
+                            help="같은 비중을 넣어도 어느 자산에서 재원을 빼느냐에 따라 "
+                                 "결과가 크게 달라집니다.")
+    rebal_f = f3.selectbox("리밸런싱", REBAL_OPTIONS, index=2, key="_fx_rebal")
+
+    cmp_all = st.checkbox("재원별로 모두 비교", value=False, key="_fx_cmpall",
+                          help="비례 축소와 각 자산에서 뺐을 때를 한 번에 비교합니다. "
+                               "후보 1개 · 비중 1개일 때만 동작합니다.")
+
+    go_fx = st.button("📌 편입 효과 계산", type="primary", width="stretch",
+                      disabled=bool(meta_bad) or not cand_tk or not weights_sel
+                      or not base_tk)
+    if go_fx:
+        st.session_state["_fx_has_run"] = True
+    if not st.session_state.get("_fx_has_run"):
+        st.info("👆 편입 비중과 재원을 정한 뒤 **편입 효과 계산**을 눌러주세요.")
+        return
+
+    need = list(dict.fromkeys(list(base_tk) + list(cand_tk)))
+    try:
+        with st.spinner(f"{len(need)}개 종목 데이터 수집 중..."):
+            prices, meta, _fx = build_price_frame(need, start_date, end_date,
+                                                  base_ccy, use_div, fx_hedge, gap_fill)
+    except Exception as ex:
+        st.error(f"데이터를 가져오지 못했습니다: {ex}")
+        return
+    base_use = [t for t in base_tk if t in prices.columns]
+    cand_use = [t for t in cand_tk if t in prices.columns]
+    if not base_use or not cand_use:
+        st.error("기존 종목과 후보가 각각 1개 이상 필요합니다.")
+        return
+    if len(prices) < 60:
+        st.error("공통 거래일이 부족합니다.")
+        return
+
+    bw = pd.to_numeric(base_df.set_index("티커")["현재 비중(%)"],
+                       errors="coerce").reindex(base_use).fillna(0)
+    if bw.sum() <= 0:
+        bw = pd.Series(1.0, index=base_use)
+    W_base = {t: float(v) for t, v in bw.items()}
+
+    def run(W):
+        try:
+            r = portfolio_returns(prices, W, rebal_f)
+            tno = turnover_series(prices, W, rebal_f).reindex(r.index).fillna(0)
+            return apply_cost(r, tno, cost_bp)
+        except Exception:
+            return None
+
+    r0 = run(W_base)
+    if r0 is None:
+        st.error("기존 포트폴리오를 계산하지 못했습니다.")
+        return
+    m0 = perf_row(r0, rf_rate)
+    R = prices[base_use + cand_use].pct_change().dropna()
+    base_r = pd.Series(portfolio_returns(prices, W_base, REBAL_DAILY)).reindex(R.index)
+
+    st.success(f"✅ 계산 완료 · 기존 {len(base_use)}종목 · 후보 {len(cand_use)}개 · "
+               f"{prices.index[0].date()} ~ {prices.index[-1].date()}")
+
+    st.subheader("5️⃣ 편입 효과 (Impact of Adding)")
+    st.caption("**변화 열은 모두 '기존 대비'** 입니다. 최대낙폭은 값이 커질수록"
+               "(0에 가까울수록) 개선이므로 **개선(%p)** 으로 표기했습니다. "
+               "양수면 낙폭이 얕아졌다는 뜻입니다.")
+
+    rows, warns = [], set()
+    for c in cand_use:
+        for wa in sorted(weights_sel):
+            W, warn = fund_weights(W_base, c, wa / 100.0, fund_src)
+            if W is None:
+                continue
+            if warn:
+                warns.add(warn)
+            rr = run({k: v * 100 for k, v in W.items()})
+            if rr is None:
+                continue
+            mm = perf_row(rr, rf_rate)
+            corr_c = float(R[c].corr(base_r)) if c in R.columns else np.nan
+            rows.append({
+                "후보": c, "편입 비중(%)": wa,
+                "수익률 변화(%p)": mm["수익률(연,%)"] - m0["수익률(연,%)"],
+                "변동성 변화(%p)": mm["변동성(연,%)"] - m0["변동성(연,%)"],
+                "MDD 개선(%p)": mm["최대낙폭(%)"] - m0["최대낙폭(%)"],
+                "샤프 변화": mm["샤프지수"] - m0["샤프지수"],
+                "소르티노 변화": mm["소르티노"] - m0["소르티노"],
+                "기존과 상관": corr_c,
+            })
+    for w_ in warns:
+        st.warning(w_)
+    if not rows:
+        st.error("계산 가능한 조합이 없습니다.")
+        return
+
+    fdf = pd.DataFrame(rows)
+    st.markdown(f"**기존 포트폴리오** · 수익률 {m0['수익률(연,%)']:.2f}% · "
+                f"변동성 {m0['변동성(연,%)']:.2f}% · MDD {m0['최대낙폭(%)']:.2f}% · "
+                f"샤프 {m0['샤프지수']:.2f}")
+    st.dataframe(
+        fdf.style.format({"편입 비중(%)": "{:.0f}", "수익률 변화(%p)": "{:+.2f}",
+                          "변동성 변화(%p)": "{:+.2f}", "MDD 개선(%p)": "{:+.2f}",
+                          "샤프 변화": "{:+.3f}", "소르티노 변화": "{:+.3f}",
+                          "기존과 상관": "{:.2f}"}, na_rep="-")
+        .highlight_max(subset=["샤프 변화", "MDD 개선(%p)"], color="#dcfce7")
+        .highlight_min(subset=["기존과 상관"], color="#dcfce7"),
+        width="stretch", hide_index=True)
+    st.caption("초록색 = 가장 유리한 값. **기존과 상관**이 낮을수록 분산 효과가 큽니다.")
+
+    with st.expander("상세 지표 보기 (최악의 월·분기)", expanded=False):
+        st.caption("편입 전후로 **가장 나빴던 한 달·한 분기**가 어떻게 달라졌는지입니다. "
+                   "평균 지표에는 드러나지 않는 충격의 크기를 보여줍니다.")
+        m0_mon = float((1 + r0).resample("ME").prod().min() - 1) * 100
+        m0_qtr = float((1 + r0).resample("QE").prod().min() - 1) * 100
+        drows = []
+        for c in cand_use:
+            for wa in sorted(weights_sel):
+                W, _w = fund_weights(W_base, c, wa / 100.0, fund_src)
+                if W is None:
+                    continue
+                rr = run({k: v * 100 for k, v in W.items()})
+                if rr is None:
+                    continue
+                mo = float((1 + rr).resample("ME").prod().min() - 1) * 100
+                qt = float((1 + rr).resample("QE").prod().min() - 1) * 100
+                drows.append({"후보": c, "편입 비중(%)": wa,
+                              "최악의 월(%)": mo, "최악의 월 개선(%p)": mo - m0_mon,
+                              "최악의 분기(%)": qt, "최악의 분기 개선(%p)": qt - m0_qtr})
+        if drows:
+            st.markdown(f"**기존** · 최악의 월 {m0_mon:.2f}% · 최악의 분기 {m0_qtr:.2f}%")
+            st.dataframe(pd.DataFrame(drows).style.format(
+                {"편입 비중(%)": "{:.0f}", "최악의 월(%)": "{:.2f}",
+                 "최악의 월 개선(%p)": "{:+.2f}", "최악의 분기(%)": "{:.2f}",
+                 "최악의 분기 개선(%p)": "{:+.2f}"})
+                .highlight_max(subset=["최악의 월 개선(%p)", "최악의 분기 개선(%p)"],
+                               color="#dcfce7"),
+                width="stretch", hide_index=True)
+            st.caption("**개선(%p)** 이 양수이면 편입 후 최악의 구간이 덜 나빠졌다는 뜻입니다.")
+
+    if len(cand_use) > 1:
+        pick_w = sorted(weights_sel)[len(weights_sel) // 2]
+        sub = fdf[fdf["편입 비중(%)"] == pick_w].sort_values("샤프 변화",
+                                                          ascending=False)
+        if not sub.empty:
+            fb = go.Figure(go.Bar(
+                x=sub["샤프 변화"], y=sub["후보"], orientation="h",
+                marker_color=["#0d9488" if v > 0 else "#dc2626"
+                              for v in sub["샤프 변화"]],
+                text=[f"{v:+.3f}" for v in sub["샤프 변화"]],
+                textposition="outside"))
+            fb.update_layout(height=60 + 40 * len(sub),
+                             margin=dict(l=0, r=50, t=30, b=0),
+                             title=f"{pick_w:.0f}% 편입 시 샤프지수 변화",
+                             xaxis=dict(title=None),
+                             yaxis=dict(autorange="reversed"))
+            st.plotly_chart(fb, width="stretch")
+
+    # ---------------- 재원별 비교 ----------------
+    if cmp_all and len(cand_use) == 1 and len(weights_sel) == 1:
+        st.subheader("6️⃣ 재원별 비교 (Funding Source)")
+        st.caption("**같은 비중을 넣어도 어느 자산에서 재원을 빼느냐에 따라 결과가 "
+                   "완전히 달라집니다.** 이 표가 그 차이를 보여줍니다.")
+        c, wa = cand_use[0], sorted(weights_sel)[0]
+        srows = []
+        for src in [FUND_PROP] + list(base_use):
+            W, warn = fund_weights(W_base, c, wa / 100.0, src)
+            if W is None:
+                continue
+            rr = run({k: v * 100 for k, v in W.items()})
+            if rr is None:
+                continue
+            mm = perf_row(rr, rf_rate)
+            srows.append({
+                "재원": "비례 축소" if src == FUND_PROP else f"{src} 에서",
+                "수익률 변화(%p)": mm["수익률(연,%)"] - m0["수익률(연,%)"],
+                "변동성 변화(%p)": mm["변동성(연,%)"] - m0["변동성(연,%)"],
+                "MDD 개선(%p)": mm["최대낙폭(%)"] - m0["최대낙폭(%)"],
+                "샤프 변화": mm["샤프지수"] - m0["샤프지수"],
+                "비고": warn[:40] + "…" if warn else "",
+            })
+        if srows:
+            sdf = pd.DataFrame(srows)
+            st.dataframe(
+                sdf.style.format({"수익률 변화(%p)": "{:+.2f}",
+                                  "변동성 변화(%p)": "{:+.2f}",
+                                  "MDD 개선(%p)": "{:+.2f}", "샤프 변화": "{:+.3f}"})
+                .highlight_max(subset=["샤프 변화", "MDD 개선(%p)"], color="#dcfce7"),
+                width="stretch", hide_index=True)
+            best = sdf.loc[sdf["샤프 변화"].idxmax()]
+            worst = sdf.loc[sdf["샤프 변화"].idxmin()]
+            gap = float(best["샤프 변화"] - worst["샤프 변화"])
+            st.info(f"**{c}** 를 {wa:.0f}% 넣을 때, 재원을 **{best['재원']}** 가져오면 "
+                    f"샤프가 {best['샤프 변화']:+.3f} 변하고, "
+                    f"**{worst['재원']}** 가져오면 {worst['샤프 변화']:+.3f} 변합니다. "
+                    f"같은 편입인데 차이가 **{gap:.3f}** 입니다.")
+    elif cmp_all:
+        st.info("재원별 비교는 후보 1개 · 편입 비중 1개일 때만 동작합니다.")
+
+    # ---------------- 요약 ----------------
+    st.subheader("📝 요약 (Summary)")
+    best_row = fdf.loc[fdf["샤프 변화"].idxmax()]
+    worst_row = fdf.loc[fdf["샤프 변화"].idxmin()]
+    lines = []
+    src_lbl = "비례 축소" if fund_src == FUND_PROP else f"{fund_src} 에서 차감"
+    lines.append(f"재원을 **{src_lbl}** 방식으로 조달했을 때, "
+                 f"**{best_row['후보']}를 {best_row['편입 비중(%)']:.0f}% 편입**하는 것이 "
+                 f"가장 유리했습니다. 샤프 {best_row['샤프 변화']:+.3f}, "
+                 f"최대낙폭 {best_row['MDD 개선(%p)']:+.2f}%p, "
+                 f"변동성 {best_row['변동성 변화(%p)']:+.2f}%p 변화입니다.")
+    if float(best_row["샤프 변화"]) <= 0:
+        lines.append("다만 **모든 조합에서 샤프지수가 개선되지 않았습니다.** "
+                     "지금 구성에 굳이 추가할 필요가 없다는 뜻일 수 있습니다.")
+    if float(worst_row["샤프 변화"]) < 0:
+        lines.append(f"반대로 **{worst_row['후보']} {worst_row['편입 비중(%)']:.0f}%** 는 "
+                     f"샤프가 {worst_row['샤프 변화']:+.3f} 로 오히려 나빠졌습니다.")
+    low_corr = fdf.loc[fdf["기존과 상관"].idxmin()] if fdf["기존과 상관"].notna().any() else None
+    if low_corr is not None:
+        lines.append(f"기존 구성과 가장 덜 겹치는 후보는 **{low_corr['후보']}** "
+                     f"(상관 {low_corr['기존과 상관']:.2f})입니다. "
+                     f"분산 효과 관점에서는 이쪽이 유리합니다.")
+    st.markdown("\n\n".join(lines))
+
+    # ---------------- 다음 단계 ----------------
+    st.subheader("➡️ 다음 단계")
+    pick_c = st.selectbox("최적화로 넘길 후보", cand_use, key="_fx_send",
+                          help="기존 종목 + 선택한 후보를 최적화 화면으로 보냅니다. "
+                               "비중은 최적화가 다시 정합니다.")
+    if st.button("🎯 이 구성으로 최적화하기", width="stretch"):
+        rows_o = [{"티커": t, "종목명": "",
+                   "현재 비중(%)": round(float(W_base.get(t, 0)) /
+                                     max(sum(W_base.values()), 1e-9) * 100, 2),
+                   "최소(%)": 0.0, "최대(%)": 100.0} for t in base_use]
+        rows_o.append({"티커": pick_c, "종목명": "", "현재 비중(%)": 0.0,
+                       "최소(%)": 0.0, "최대(%)": 100.0})
+        send_to("🎯 포트폴리오 최적화",
+                _opt_df=pd.DataFrame(rows_o)[OPT_COLS],
+                _opt_gen=st.session_state.get("_opt_gen", 0) + 1,
+                _opt_has_run=False)
+
+    st.divider()
+    st.download_button("📄 편입 효과 CSV", fdf.to_csv(index=False).encode("utf-8-sig"),
+                       f"add_impact_{pd.Timestamp.now():%Y%m%d_%H%M}.csv",
+                       "text/csv", width="stretch")
+    st.caption("과거 데이터를 기준으로 계산한 결과이며, 미래에도 같은 효과가 나타난다는 "
+               "보장은 없습니다. 교육·참고용이며 투자 자문이 아닙니다.")
+
+
 def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
                             fx_hedge, gap_fill):
-    st.title("➕ 종목 추가 탐색")
+    st.title("➕ 자산 추가 효과")
     st.caption("기존 포트폴리오에 후보 종목 중 몇 개를 더했을 때 가장 좋아지는 조합을 찾습니다. "
                "선정은 **학습 구간** 데이터로만 하고, 결과는 **표본외 성과**와 함께 보여드립니다.")
 
@@ -3027,13 +4139,27 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
 
     cand_tk = [t for t in cf["티커"] if t and t not in base_tk]
     dup = [t for t in cf["티커"] if t and t in base_tk]
-    if bad:
-        st.error(f"확인되지 않는 티커: {', '.join(bad)}")
+    ok_in, msgs = validate_setup(cand_tk, bad, min_n=1, label="후보 종목")
+    show_msgs(msgs)
     if dup:
         st.info(f"기존 포트폴리오에 이미 있어 후보에서 제외했습니다: {', '.join(dup)}")
 
+    # ---------------- 모드 ----------------
+    st.subheader("3️⃣ 방식 선택 (Mode)")
+    cmode = st.radio(
+        "방식", ["📌 고정 비중 편입 효과", "🔎 최적 조합 탐색"], horizontal=True,
+        key="_cand_mode", label_visibility="collapsed",
+        help="고정 비중 — 정해진 비중(1·3·5·10%)으로 넣어보고 효과만 봅니다. "
+             "빠르고 해석이 쉽습니다.\n\n"
+             "최적 조합 — 어떤 조합이 가장 좋은지 최적화로 찾습니다.")
+
+    if cmode.startswith("📌"):
+        render_fixed_add(base_df, base_tk, cand_tk, base_ccy, start_date, end_date,
+                         use_div, rf_rate, fx_hedge, gap_fill, meta_bad=bad)
+        return
+
     # ---------------- 설정 ----------------
-    st.subheader("3️⃣ 탐색 설정 (Settings)")
+    st.subheader("4️⃣ 탐색 설정 (Settings)")
     a1, a2, a3 = st.columns(3)
     n_add = a1.number_input("추가할 종목 수", 1, CAND_MAX_ADD, 1, step=1, key="_cand_add")
     goal = a2.selectbox("목적", list(OPT_GOALS), key="_cand_goal")
@@ -3198,7 +4324,7 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
                f"검증 {opt_date.date()}~{last.date()}")
 
     # ---------------- 결과 ----------------
-    st.subheader("4️⃣ 상위 조합 (Top Combinations)")
+    st.subheader("5️⃣ 상위 조합 (Top Combinations)")
     st.warning("**순위는 학습 구간 기준입니다.** 표본외 성과로 순위를 매기면 검증의 의미가 "
                "사라지기 때문입니다. 오른쪽 표본외 지표를 보고 순위가 실제로 유지되는지 "
                "확인하세요. 1등과 5등의 차이가 미미하다면 그 순위는 큰 의미가 없습니다.")
@@ -3231,6 +4357,7 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
                                    "표본외 변동성(%)": "{:.2f}", "표본외 샤프": "{:.2f}",
                                    "표본외 MDD(%)": "{:.2f}"}, na_rep="-"),
                  width="stretch")
+    st.caption("**MDD는 음수**입니다. −20%보다 −15%가 낙폭이 얕아 더 좋습니다.")
 
     # 순위 유지 여부 진단
     valid = rdf.iloc[:len(ranked)]["표본외 샤프"].dropna()
@@ -3248,7 +4375,7 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
                        + f" 상위권 표본외 샤프 편차는 {spread:.2f} 입니다.")
 
     # ---------------- 채택 빈도 ----------------
-    st.subheader("5️⃣ 후보별 채택 빈도 (Selection Frequency)")
+    st.subheader("6️⃣ 후보별 채택 빈도 (Selection Frequency)")
     st.caption("상위 조합에 자주 등장하는 종목일수록, 특정 조합의 우연이 아니라 "
                "실제로 도움이 되는 후보일 가능성이 큽니다.")
     cnt = {}
@@ -3271,7 +4398,7 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
                      hide_index=True)
 
     # ---------------- 1위 조합 상세 ----------------
-    st.subheader("6️⃣ 1위 조합 비중 (Best Combination)")
+    st.subheader("7️⃣ 1위 조합 비중 (Best Combination)")
     best = ranked[0]
     bw2 = pd.DataFrame({
         "티커": best["tickers"],
@@ -3339,6 +4466,38 @@ def diversification_stats(corr: pd.DataFrame):
     # 평균 상관이 음수면 실효 종목 수가 실제 종목 수를 넘을 수 있다.
     # 서로 헤지되는 구성이라는 뜻이므로 상한을 두지 않는다.
     return rho, max(1.0, eff)
+
+
+def cluster_assets(corr: pd.DataFrame, rho_cut=0.6, method="average") -> pd.Series:
+    """
+    상관계수를 거리로 바꿔 계층 군집화한다.
+      거리 d = √((1−ρ)/2)  ·  ρ=1 → 0,  ρ=0 → 0.707,  ρ=−1 → 1
+    ρ_cut 이상으로 함께 움직이는 자산이 한 군집으로 묶인다.
+    """
+    n = len(corr)
+    if n < 2:
+        return pd.Series([1] * n, index=corr.index)
+    d = np.sqrt(np.clip((1 - corr.values) / 2, 0, 1))
+    np.fill_diagonal(d, 0.0)
+    try:
+        Z = linkage(squareform(d, checks=False), method=method)
+        thr = np.sqrt(max(0.0, (1 - rho_cut) / 2))
+        lab = fcluster(Z, t=thr, criterion="distance")
+    except Exception:
+        lab = np.arange(1, n + 1)
+    return pd.Series(lab, index=corr.index)
+
+
+def cluster_quality(corr: pd.DataFrame, lab: pd.Series):
+    """군집 내 평균 상관과 군집 간 평균 상관. 차이가 클수록 분리가 뚜렷하다."""
+    ks = list(corr.index)
+    within, between = [], []
+    for i in range(len(ks)):
+        for j in range(i + 1, len(ks)):
+            v = float(corr.iloc[i, j])
+            (within if lab[ks[i]] == lab[ks[j]] else between).append(v)
+    return (float(np.mean(within)) if within else np.nan,
+            float(np.mean(between)) if between else np.nan)
 
 
 def corr_pairs(corr: pd.DataFrame) -> pd.DataFrame:
@@ -3426,8 +4585,8 @@ def render_correlations(base_ccy, start_date, end_date, use_div, fx_hedge, gap_f
         st.rerun()
 
     tickers = [t for t in f["티커"] if t]
-    if bad:
-        st.error(f"확인되지 않는 티커: {', '.join(bad)}")
+    ok_in, msgs = validate_setup(tickers, bad, min_n=2)
+    show_msgs(msgs)
     if len(tickers) > CORR_MAX_HINT:
         st.info(f"종목이 {len(tickers)}개입니다. {CORR_MAX_HINT}개를 넘으면 행렬이 커져 "
                 f"화면에서 읽기 어려울 수 있습니다.")
@@ -3517,8 +4676,69 @@ def render_correlations(base_ccy, start_date, end_date, use_div, fx_hedge, gap_f
         st.dataframe(pairs.tail(5).iloc[::-1].style.format({"상관계수": "{:.2f}"}),
                      width="stretch", hide_index=True)
 
+    # ---------------- 군집 ----------------
+    st.subheader("5️⃣ 위험군 묶기 (Clusters)")
+    st.caption("비슷하게 움직이는 자산을 하나의 **위험군**으로 묶습니다. "
+               "종목 수가 많아도 같은 군집에 몰려 있다면 실제 분산은 그만큼 되지 않습니다.")
+    if len(tickers) < 3:
+        st.info("군집을 나누려면 3개 이상의 종목이 필요합니다.")
+        cl = None
+    else:
+        rho_cut = st.slider("묶는 기준 상관계수", 0.0, 0.95, 0.60, step=0.05,
+                            key="_corr_cut",
+                            help="이 값 이상으로 함께 움직이면 같은 위험군으로 봅니다. "
+                                 "높일수록 잘게, 낮출수록 크게 묶입니다.")
+        cl = cluster_assets(corr, rho_cut)
+        grp = {}
+        for tk_, g in cl.items():
+            grp.setdefault(int(g), []).append(tk_)
+        wi, be = cluster_quality(corr, cl)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("자산 수", f"{len(tickers)}개")
+        c2.metric("위험군 수", f"{len(grp)}개")
+        c3.metric("군집 내 / 군집 간 상관", f"{wi:.2f} / {be:.2f}"
+                  if not (pd.isna(wi) or pd.isna(be)) else "-",
+                  help="군집 내가 군집 간보다 훨씬 높아야 분리가 의미 있습니다.")
+
+        rows_g = []
+        for g, mem in sorted(grp.items()):
+            sub = corr.loc[mem, mem]
+            inner = (sub.values[~np.eye(len(mem), dtype=bool)].mean()
+                     if len(mem) > 1 else np.nan)
+            rows_g.append({"위험군": f"군집 {g}", "자산 수": len(mem),
+                           "구성": ", ".join(mem),
+                           "군집 내 평균 상관": inner})
+        st.dataframe(pd.DataFrame(rows_g).style.format(
+            {"군집 내 평균 상관": "{:.2f}"}, na_rep="-"),
+            width="stretch", hide_index=True)
+
+        big = max(grp.values(), key=len)
+        if len(grp) < len(tickers):
+            st.warning(f"자산은 **{len(tickers)}개**지만 상관관계 기준 실질 위험군은 "
+                       f"**{len(grp)}개**입니다. 가장 큰 군집에 "
+                       f"**{', '.join(big)}** ({len(big)}종목)이 함께 묶여 있어, "
+                       f"이들은 사실상 하나처럼 움직입니다.")
+        else:
+            st.success(f"{len(tickers)}개 자산이 모두 서로 다른 위험군으로 나뉩니다. "
+                       f"분산 구조가 잘 잡혀 있습니다.")
+
+        fcl = go.Figure(go.Bar(
+            x=[len(m) for _, m in sorted(grp.items())],
+            y=[f"군집 {g}" for g, _ in sorted(grp.items())],
+            orientation="h", marker_color="#4f46e5",
+            text=[", ".join(m) for _, m in sorted(grp.items())],
+            textposition="inside", insidetextanchor="start"))
+        fcl.update_layout(height=60 + 44 * len(grp),
+                          margin=dict(l=0, r=20, t=10, b=0),
+                          xaxis=dict(title="자산 수", dtick=1),
+                          yaxis=dict(autorange="reversed"))
+        st.plotly_chart(fcl, width="stretch")
+        st.caption("**실효 종목 수**가 분산의 '양'을 재는 숫자라면, 위험군은 그 '구조'를 "
+                   "보여줍니다. 두 값이 비슷하면 자산들이 고르게 퍼져 있다는 뜻입니다.")
+
     # ---------------- 기간별 ----------------
-    st.subheader("5️⃣ 기간별 상관관계 (By Period)")
+    st.subheader("6️⃣ 기간별 상관관계 (By Period)")
     st.caption("상관관계는 고정된 값이 아닙니다. 기간에 따라 크게 달라지며, "
                "특히 **위기 국면에서는 대부분의 자산이 함께 움직입니다.**")
     last = prices.index[-1]
@@ -3542,7 +4762,7 @@ def render_correlations(base_ccy, start_date, end_date, use_div, fx_hedge, gap_f
                                        "최고 쌍": "{:.2f}"}), width="stretch")
 
     # ---------------- 롤링 ----------------
-    st.subheader("6️⃣ 상관관계 추이 (Rolling Correlation)")
+    st.subheader("7️⃣ 상관관계 추이 (Rolling Correlation)")
     r1, r2, r3 = st.columns([2, 2, 1])
     pick_a = r1.selectbox("종목 A", tickers, index=0, key="_corr_a")
     others = [t for t in tickers if t != pick_a] or tickers
@@ -3573,6 +4793,16 @@ def render_correlations(base_ccy, start_date, end_date, use_div, fx_hedge, gap_f
     else:
         st.info("서로 다른 두 종목을 선택하거나 기간을 늘려주세요.")
 
+    # ---------------- 다음 단계 ----------------
+    st.divider()
+    st.subheader("➡️ 다음 단계")
+    st.caption("상관관계가 낮은 자산을 후보로 넘겨 편입 효과를 확인해보세요.")
+    if st.button("➕ 이 종목들을 자산 추가 효과로 보내기", width="stretch"):
+        send_to("➕ 자산 추가 효과",
+                _cand_df=pd.DataFrame([{"티커": t, "종목명": ""} for t in tickers])[CAND_COLS],
+                _cand_gen=st.session_state.get("_cand_gen", 0) + 1,
+                _cand_has_run=False, _fx_has_run=False)
+
     # ---------------- 내보내기 ----------------
     st.divider()
     try:
@@ -3582,10 +4812,17 @@ def render_correlations(base_ccy, start_date, end_date, use_div, fx_hedge, gap_f
             pairs.to_excel(xw, sheet_name="2_쌍별상관", index=False)
             if not pdf.empty:
                 pdf.to_excel(xw, sheet_name="3_기간별")
+            if cl is not None:
+                gg = {}
+                for tk_, g in cl.items():
+                    gg.setdefault(int(g), []).append(tk_)
+                pd.DataFrame([{"위험군": f"군집 {g}", "자산 수": len(m),
+                               "구성": ", ".join(m)} for g, m in sorted(gg.items())]
+                             ).to_excel(xw, sheet_name="4_위험군", index=False)
             info = pd.DataFrame([
                 {"티커": t, "종목명": meta.get(t, {}).get("name", t),
                  "통화": meta.get(t, {}).get("currency", "-")} for t in tickers])
-            info.to_excel(xw, sheet_name="4_종목정보", index=False)
+            info.to_excel(xw, sheet_name="5_종목정보", index=False)
             pd.DataFrame(list({
                 "계산 주기": freq, "기준 통화": base_ccy,
                 "기간": f"{prices.index[0].date()} ~ {prices.index[-1].date()}",
@@ -3595,7 +4832,7 @@ def render_correlations(base_ccy, start_date, end_date, use_div, fx_hedge, gap_f
                 "배당 처리": "재투자" if use_div else "주가만",
                 "환헤지": "적용" if fx_hedge else "미적용",
             }.items()), columns=["항목", "값"]).to_excel(
-                xw, sheet_name="5_설정", index=False)
+                xw, sheet_name="6_설정", index=False)
         st.download_button("📊 엑셀 파일 받기", buf.getvalue(),
                            f"correlations_{pd.Timestamp.now():%Y%m%d_%H%M}.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -3644,6 +4881,8 @@ def perf_row(r: pd.Series, rf: float) -> dict:
 def _cmp_table(rows: dict, rf: float) -> pd.DataFrame:
     """원본·최적화·벤치마크 성과표 + 변화율."""
     df = pd.DataFrame({k: perf_row(v, rf) for k, v in rows.items()}).T
+    # 최대낙폭은 음수이므로 '증가 = 개선'이다. 변화율만으로는 방향이 헷갈리므로
+    # 화면 안내문에서 별도로 설명한다.
     if "원본 포트폴리오" in df.index and "최적화 포트폴리오" in df.index:
         o, n = df.loc["원본 포트폴리오"], df.loc["최적화 포트폴리오"]
         chg = {}
@@ -3833,10 +5072,9 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
 
     live = f[f["티커"] != ""].copy()
     wsum = float(pd.to_numeric(live["현재 비중(%)"], errors="coerce").fillna(0).sum())
-    st.caption(f"현재 비중 합계 **{wsum:.2f}%**" +
-               ("" if abs(wsum - 100) < 0.01 else " · 100%가 아니면 자동 정규화됩니다"))
-    if bad:
-        st.error(f"확인되지 않는 티커: {', '.join(bad)}")
+    ok_in, msgs = validate_setup(list(live["티커"]), bad, live["현재 비중(%)"],
+                                 min_n=2, need_weight=True)
+    show_msgs(msgs)
 
     # ------------------------------------------------------------------
     st.subheader("2️⃣ 최적화 설정 (Settings)")
@@ -4115,6 +5353,8 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         oos_rows[f"벤치마크 ({bench_norm})"] = b_oos
     t_oos = _cmp_table(oos_rows, rf_rate)
     st.dataframe(t_oos.style.format("{:.2f}", na_rep="-"), width="stretch")
+    st.caption("**최대낙폭 읽는 법** — 값이 −20%에서 −15%로 바뀌면 낙폭이 얕아진 것이므로 "
+               "**개선**입니다. 변화율이 양수이면 개선, 음수이면 악화로 보시면 됩니다.")
 
     t_ins = pd.DataFrame()
     with st.expander("표본내 구간 (In-Sample) — 학습에 쓰인 데이터 · 참고용", expanded=False):
@@ -4127,6 +5367,35 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
             ins_rows[f"벤치마크 ({bench_norm})"] = b_ins
         t_ins = _cmp_table(ins_rows, rf_rate)
         st.dataframe(t_ins.style.format("{:.2f}", na_rep="-"), width="stretch")
+
+    # ---------------- 요약 ----------------
+    st.markdown("#### 📝 요약")
+    try:
+        _o = perf_row(oos_rows.get("원본 포트폴리오"), rf_rate)
+        _n = perf_row(oos_rows.get("최적화 포트폴리오"), rf_rate)
+        _lines = []
+        d_shp = _n["샤프지수"] - _o["샤프지수"]
+        d_mdd = _n["최대낙폭(%)"] - _o["최대낙폭(%)"]
+        verdict = ("개선됐습니다" if d_shp > 0.05 else
+                   "나빠졌습니다" if d_shp < -0.05 else "거의 차이가 없었습니다")
+        _lines.append(
+            f"검증 구간에서 최적화 포트폴리오의 샤프지수는 {_o['샤프지수']:.2f} → "
+            f"**{_n['샤프지수']:.2f}** ({d_shp:+.2f})로 {verdict}. "
+            f"최대낙폭은 {_o['최대낙폭(%)']:.2f}% → **{_n['최대낙폭(%)']:.2f}%** "
+            f"({d_mdd:+.2f}%p, {'개선' if d_mdd > 0 else '악화' if d_mdd < 0 else '동일'})입니다.")
+        _top = alloc.iloc[0]
+        _lines.append(f"비중은 **{_top['티커']}** 가 {_top['원본 비중(%)']:.1f}% → "
+                      f"{_top['최적 비중(%)']:.1f}% 로 가장 크게 배분됐습니다.")
+        if d_shp < 0:
+            _lines.append("**표본외에서 원본보다 못한 결과**입니다. 학습 구간에 과도하게 "
+                          "맞춰졌을 가능성이 있으니, 비중 안정성 점검과 함께 살펴보세요.")
+        if wf_r is not None:
+            _w = perf_row(wf_r, rf_rate)
+            _lines.append(f"주기적 재최적화({reopt})는 샤프 **{_w['샤프지수']:.2f}**, "
+                          f"최대낙폭 **{_w['최대낙폭(%)']:.2f}%** 였습니다.")
+        st.markdown("\n\n".join(_lines))
+    except Exception as _ex:
+        st.caption(f"요약을 만들지 못했습니다: {_ex}")
 
     # ---------------- 성과 차트 ----------------
     st.subheader("5️⃣ 포트폴리오 성과 (Growth of Investment)")
@@ -4348,10 +5617,17 @@ if "_pending_tool" in st.session_state:
     st.session_state["_tool"] = st.session_state.pop("_pending_tool")
 
 with st.sidebar:
-    tool = st.radio("도구", ["📊 포트폴리오 분석", "🎯 포트폴리오 최적화",
-                            "➕ 종목 추가 탐색", "🧭 뷰 기반 자산배분",
-                            "🔗 자산 상관관계", "📉 시장 국면 분석", "📖 도움말"],
-                    label_visibility="collapsed", key="_tool")
+    st.session_state.setdefault("_tool", TOOL_DEFAULT)
+    for grp, items in TOOL_GROUPS:
+        if grp:
+            st.caption(grp)
+        for it in items:
+            if st.button(it, key=f"nav_{it}", width="stretch",
+                         type=("primary" if st.session_state["_tool"] == it
+                               else "secondary")):
+                st.session_state["_tool"] = it
+                st.rerun()
+    tool = st.session_state["_tool"]
 
 # 도움말은 설정이 필요 없으므로 사이드바를 더 그리지 않고 바로 표시한다
 if tool.endswith("도움말"):
@@ -4403,14 +5679,19 @@ with st.sidebar:
                "일본 `7203.T`  홍콩 `0700.HK`")
 
 
+IS_STRESS = tool.endswith("스트레스 테스트")
 IS_BL = tool.endswith("자산배분")
+
+if IS_STRESS:
+    render_stress(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, rf_rate)
+    st.stop()
 IS_REG = tool.endswith("국면 분석")
 
 if IS_BL:
     render_black_litterman(base_ccy, start_date, end_date, use_div,
                            fx_hedge, gap_fill, rf_rate)
     st.stop()
-IS_CAND = tool.endswith("추가 탐색")
+IS_CAND = tool.endswith("추가 효과")
 
 if IS_REG:
     render_regimes(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, rf_rate)
@@ -4949,9 +6230,9 @@ for name, v in series.items():
     rows.append({
         "": ("📈 " if v["kind"] == "portfolio" else "📊 ") + name,
         "누적성장배수": equity_curve(r).iloc[-1],
-        "CAGR (%)": cagr(r) * 100,
-        "변동성 (%)": annual_vol(r) * 100,
-        "MDD (%)": max_drawdown(r) * 100,
+        "수익률(연,%)": cagr(r) * 100,
+        "변동성(연,%)": annual_vol(r) * 100,
+        "최대낙폭(%)": max_drawdown(r) * 100,
         "샤프지수": sharpe_ratio(r, rf_rate),
         "소르티노": sortino_ratio(r, rf_rate),
         "칼마": calmar_ratio(r),
@@ -4961,15 +6242,16 @@ for name, v in series.items():
                      and not pd.isna(v.get("turnover")) else np.nan),
     })
 comp = pd.DataFrame(rows).set_index("")
-_hi = [c for c in ["누적성장배수", "CAGR (%)", "MDD (%)", "샤프지수", "소르티노", "칼마"]
+_hi = [c for c in ["누적성장배수", "수익률(연,%)", "최대낙폭(%)", "샤프지수", "소르티노", "칼마"]
        if c in comp.columns]
-_lo = [c for c in ["변동성 (%)", "얼서지수", "연 회전율(%)"] if c in comp.columns]
+_lo = [c for c in ["변동성(연,%)", "얼서지수", "연 회전율(%)"] if c in comp.columns]
 st.dataframe(
     comp.style.format("{:.2f}", na_rep="-")
         .highlight_max(subset=_hi, color="#dcfce7")
         .highlight_min(subset=_lo, color="#dcfce7"),
     width="stretch")
-st.caption("초록색 = 각 지표에서 가장 좋은 값 (MDD는 0에 가까울수록 좋음). "
+st.caption("초록색 = 각 지표에서 가장 좋은 값. **MDD는 음수이므로 0에 가까울수록**, "
+           "즉 숫자가 클수록 좋습니다. "
            "📈 포트폴리오 · 📊 벤치마크 · **연 회전율**은 1년에 자산의 몇 %를 "
            "사고파는지를 뜻하며, 거래비용을 입력했다면 성과에 이미 반영돼 있습니다.")
 
