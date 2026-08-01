@@ -484,6 +484,202 @@ def render_etf_loader(target_key: str, gen_key: str, editor_key: str,
             st.rerun()
 
 
+# ======================================================================
+# 종목 입력 표 (모든 화면 공통)
+# ======================================================================
+CLIP_KEY = "_clipboard"          # 화면 사이 복사용 임시 보관함
+
+
+def clip_summary() -> str:
+    """보관함에 담긴 구성을 한 줄로 요약한다."""
+    c = st.session_state.get(CLIP_KEY)
+    if not c or not c.get("rows"):
+        return ""
+    rows = c["rows"]
+    head = " · ".join(
+        f"{r['티커']}" + (f" {r['비중']:.1f}%" if r.get("비중") is not None else "")
+        for r in rows[:3])
+    more = f" 외 {len(rows)-3}개" if len(rows) > 3 else ""
+    return f"{head}{more} ({len(rows)}종목)"
+
+
+def render_ticker_table(*, state_key, editor_key, gen_key, cols, weight_col=None,
+                        title="종목", min_rows=1, max_rows=30, default_rows=None,
+                        extra_config=None, extra_defaults=None,
+                        show_etf=True, show_equal=False, equal_key=None,
+                        count_label="종목 수", help_text=None):
+    """
+    티커 입력 표를 그린다. 모든 화면이 이 함수를 쓴다.
+
+    처리하는 것
+      · 종목 수 조절 (세대 번호로 위젯을 새로 만들어 값이 확실히 따라오게 함)
+      · 행 삭제 (체크 즉시)
+      · 티커 형식 변환 + 자동 확인 (005930 → 005930.KS)
+      · ETF 구성종목 불러오기
+      · 화면 사이 복사 / 붙여넣기
+      · 비중 균등 배분(선택)
+
+    반환: (정리된 DataFrame, 유효 티커 목록, 확인 실패 목록)
+    """
+    st.session_state.setdefault(gen_key, 0)
+
+    def _blank():
+        r = {c: ("" if c != weight_col else np.nan) for c in cols}
+        if extra_defaults:
+            r.update(extra_defaults)
+        return r
+
+    if state_key not in st.session_state:
+        rows = default_rows or [{"티커": ""}]
+        base = []
+        for r in rows:
+            d = _blank(); d.update(r); base.append(d)
+        st.session_state[state_key] = pd.DataFrame(base)[cols]
+
+    if help_text:
+        st.caption(help_text)
+
+    # ---------------- ETF 불러오기 ----------------
+    if show_etf:
+        render_etf_loader(target_key=state_key, gen_key=gen_key,
+                          editor_key=editor_key, cols=cols, weight_col=weight_col)
+
+    # ---------------- 상단 조작줄 ----------------
+    c1, c2, c3, c4 = st.columns([1.1, 1, 1, 3])
+    cur_n = len(st.session_state[state_key])
+    n = c1.number_input(count_label, min_rows, max_rows, cur_n, step=1,
+                        key=f"{gen_key}_n_{st.session_state[gen_key]}")
+    if int(n) != cur_n:
+        cur = st.session_state[state_key]
+        cur = (pd.concat([cur, pd.DataFrame([_blank()] * (int(n) - len(cur)))],
+                         ignore_index=True) if int(n) > len(cur)
+               else cur.iloc[:int(n)].reset_index(drop=True))
+        st.session_state[state_key] = cur[cols]
+        st.session_state[gen_key] += 1
+        st.session_state.pop(editor_key, None)
+        st.rerun()
+
+    c2.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+    if c2.button("📋 복사", key=f"{gen_key}_copy", width="stretch",
+                 help="이 표의 구성을 보관함에 담습니다. 다른 화면에서 붙여넣을 수 있습니다."):
+        cur = st.session_state[state_key]
+        rows = []
+        for _, r in cur.iterrows():
+            tk = str(r.get("티커") or "").strip()
+            if not tk:
+                continue
+            wv = None
+            if weight_col:
+                wv = pd.to_numeric(r.get(weight_col), errors="coerce")
+                wv = None if pd.isna(wv) else float(wv)
+            rows.append({"티커": tk, "비중": wv})
+        if rows:
+            st.session_state[CLIP_KEY] = {"rows": rows, "from": title}
+            st.rerun()
+
+    c3.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+    clip = st.session_state.get(CLIP_KEY)
+    if c3.button("📥 붙여넣기", key=f"{gen_key}_paste", width="stretch",
+                 disabled=not (clip and clip.get("rows")),
+                 help="보관함에 담긴 구성을 이 표에 채웁니다."):
+        rows = clip["rows"]
+        new = []
+        for r in rows:
+            d = _blank()
+            d["티커"] = r["티커"]
+            if weight_col and r.get("비중") is not None:
+                d[weight_col] = round(float(r["비중"]), 2)
+            new.append(d)
+        while len(new) < min_rows:
+            new.append(_blank())
+        st.session_state[state_key] = pd.DataFrame(new[:max_rows])[cols]
+        st.session_state[gen_key] += 1
+        st.session_state.pop(editor_key, None)
+        st.rerun()
+
+    equal_w = False
+    if show_equal and weight_col:
+        c4.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        equal_w = c4.checkbox("비중 균등", key=equal_key or f"{gen_key}_eq",
+                              help="입력된 종목에 100%를 균등 배분합니다.")
+    elif clip and clip.get("rows"):
+        c4.caption(f"📋 보관함 · {clip.get('from', '')} — {clip_summary()}")
+
+    # ---------------- 표 ----------------
+    conf = {
+        "티커": st.column_config.TextColumn(
+            "티커", width="small",
+            help="005930.KS · 005930 KS · 005930 · NVDA 모두 인식합니다."),
+        "종목명": st.column_config.TextColumn("종목명 (자동)", disabled=True,
+                                          width="large" if len(cols) <= 3 else "medium"),
+        "🗑": st.column_config.CheckboxColumn("삭제", width="small",
+                                            help="체크하면 해당 행이 삭제됩니다."),
+    }
+    if weight_col:
+        conf[weight_col] = st.column_config.NumberColumn(
+            weight_col, min_value=0.0, max_value=100.0, step=0.01,
+            format="%.2f", width="small", disabled=equal_w)
+    if extra_config:
+        conf.update(extra_config)
+
+    disp = st.session_state[state_key].copy()
+    disp["🗑"] = False
+    edited = st.data_editor(disp, num_rows="fixed", width="stretch",
+                            key=editor_key, column_order=cols + ["🗑"],
+                            hide_index=True, column_config=conf)
+
+    dele = edited["🗑"].fillna(False).astype(bool)
+    if dele.any():
+        kept = edited.loc[~dele, cols].reset_index(drop=True)
+        if kept.empty:
+            kept = pd.DataFrame([_blank()])[cols]
+        st.session_state[state_key] = kept
+        st.session_state[gen_key] += 1
+        st.session_state.pop(editor_key, None)
+        st.rerun()
+
+    # ---------------- 정규화 + 티커 확인 ----------------
+    f = edited[cols].copy()
+    f["티커"] = f["티커"].fillna("").astype(str).str.strip()
+    if weight_col:
+        f[weight_col] = pd.to_numeric(f[weight_col], errors="coerce").round(2)
+
+    bad = []
+    if any(t for t in f["티커"]):
+        with st.spinner("티커 확인 중..."):
+            res, labs = [], []
+            for t in f["티커"]:
+                if not t:
+                    res.append(""); labs.append(""); continue
+                r = probe_ticker(tuple(normalize_ticker(t)))
+                if r["ticker"] is None:
+                    res.append(t); labs.append("❌ 확인 불가"); bad.append(t)
+                else:
+                    res.append(r["ticker"])
+                    labs.append(f"✅ {r.get('name') or '(종목명 없음)'} · {r['currency']}")
+        f["티커"], f["종목명"] = res, labs
+    else:
+        f["종목명"] = ""
+
+    if equal_w and weight_col:
+        mask = f["티커"] != ""
+        k = int(mask.sum())
+        if k > 0:
+            base_w = round(100.0 / k, 2)
+            vals = [base_w] * k
+            vals[-1] = round(100.0 - base_w * (k - 1), 2)
+            f.loc[mask, weight_col] = vals
+        f.loc[~mask, weight_col] = np.nan
+
+    if not _frames_equal(f, st.session_state[state_key]):
+        st.session_state[state_key] = f
+        st.session_state.pop(editor_key, None)
+        st.rerun()
+
+    live = f[f["티커"] != ""].copy()
+    return live, list(live["티커"]), bad
+
+
 def validate_setup(tickers, bad=None, weights=None, min_n=1,
                    need_weight=False, label="종목"):
     """
@@ -513,17 +709,6 @@ def validate_setup(tickers, bad=None, weights=None, min_n=1,
 def show_msgs(msgs):
     for kind, m in msgs:
         getattr(st, kind)(m)
-
-
-def send_to(target_tool: str, **payload):
-    """
-    다른 화면으로 구성을 넘긴다. 위젯이 이미 그려진 뒤일 수 있으므로
-    다음 실행에서 반영되도록 예약만 걸고 재실행한다.
-    """
-    for k, v in payload.items():
-        st.session_state[k] = v
-    st.session_state["_pending_tool"] = target_tool
-    st.rerun()
 
 
 def _frames_equal(a: pd.DataFrame, b: pd.DataFrame) -> bool:
@@ -1979,16 +2164,19 @@ def render_help():
                 "없다는 점을 감안해서 보세요.")
 
         st.divider()
-        st.subheader("화면 사이 이동")
+        st.subheader("화면 사이 구성 옮기기")
         st.markdown(
-            "각 화면 아래쪽 **➡️ 다음 단계**에서 지금 구성을 다른 화면으로 넘길 수 있습니다. "
-            "종목을 다시 입력하지 않아도 됩니다.\n\n"
-            "```\n"
-            "🔗 자산 상관관계 ──▶ ➕ 자산 추가 효과 ──▶ 🎯 최적화 ──▶ 📊 분석\n"
-            "                                          🧭 뷰 기반 배분 ──▶ 📊 분석\n"
-            "```\n"
-            "상관관계로 후보를 걸러내고, 무엇을 얼마나 더할지 정하고, 비중을 최적화한 뒤, "
-            "최종 구성을 자세히 분석하는 흐름입니다.")
+            "모든 표 위에 **📋 복사** 와 **📥 붙여넣기** 버튼이 있습니다. "
+            "한 화면에서 복사한 뒤 다른 화면에서 붙여넣으면 종목을 다시 입력할 필요가 "
+            "없습니다.\n\n"
+            "- **📋 복사** — 그 표의 종목과 비중을 보관함에 담습니다\n"
+            "- **📥 붙여넣기** — 보관함 내용을 지금 표에 채웁니다. 비중 칸이 없는 "
+            "화면이면 종목만 들어갑니다\n\n"
+            "계산 결과도 옮길 수 있습니다. 최적화의 **최적 비중 복사**, 뷰 기반 배분의 "
+            "**제안 배분 복사** 를 누르면 그 결과가 보관함에 담깁니다.\n\n"
+            "**화면끼리 표를 공유하지는 않습니다.** 각 화면의 표는 독립적이므로, "
+            "한쪽을 고쳐도 다른 쪽은 그대로입니다. 옮기고 싶을 때만 복사·붙여넣기를 "
+            "쓰시면 됩니다.")
 
         st.divider()
         st.subheader("저장 · 내보내기")
@@ -2401,81 +2589,13 @@ def render_stress(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, r
     st.caption("과거 위기 국면만 잘라내어, 그 시기에 포트폴리오가 어떻게 버텼는지 봅니다. "
                "평균적으로 좋아 보이는 구성도 위기에는 전혀 다르게 움직일 수 있습니다.")
 
-    key = "_stress_df"
-    if key not in st.session_state:
-        st.session_state[key] = pd.DataFrame([
-            {"티커": t, "종목명": "", "비중(%)": w}
-            for t, w in [("SPY", 60.0), ("AGG", 40.0)]])[STRESS_COLS]
-    st.session_state.setdefault("_stress_gen", 0)
+    live, tickers, bad = render_ticker_table(
+        state_key="_stress_df", editor_key="_stress_editor", gen_key="_stress_gen",
+        cols=STRESS_COLS, weight_col="비중(%)", title="스트레스 테스트",
+        min_rows=1, max_rows=30, show_equal=True, equal_key="_stress_eq",
+        default_rows=[{"티커": "SPY", "비중(%)": 60.0},
+                      {"티커": "AGG", "비중(%)": 40.0}])
 
-    # ---------------- 종목 ----------------
-    st.subheader("1️⃣ 포트폴리오 (Holdings)")
-    render_etf_loader(target_key=key, gen_key="_stress_gen",
-                      editor_key="_stress_editor", cols=STRESS_COLS,
-                      weight_col="비중(%)")
-    z1, z2 = st.columns([1, 5])
-    _sn = len(st.session_state[key])
-    sn = z1.number_input("종목 수", 1, 30, _sn, step=1,
-                         key=f"_stress_n_{st.session_state['_stress_gen']}")
-    if int(sn) != _sn:
-        cur = st.session_state[key]
-        cur = (pd.concat([cur, pd.DataFrame([_stress_blank()] * (int(sn) - len(cur)))],
-                         ignore_index=True) if int(sn) > len(cur)
-               else cur.iloc[:int(sn)].reset_index(drop=True))
-        st.session_state[key] = cur[STRESS_COLS]
-        st.session_state["_stress_gen"] += 1
-        st.session_state.pop("_stress_editor", None)
-        st.rerun()
-
-    _sd = st.session_state[key].copy()
-    _sd["🗑"] = False
-    sed = st.data_editor(
-        _sd, num_rows="fixed", width="stretch", key="_stress_editor",
-        column_order=STRESS_COLS + ["🗑"], hide_index=True,
-        column_config={
-            "티커": st.column_config.TextColumn("티커", width="small"),
-            "종목명": st.column_config.TextColumn("종목명 (자동)", disabled=True,
-                                              width="medium"),
-            "비중(%)": st.column_config.NumberColumn(
-                "비중(%)", min_value=0.0, max_value=100.0, step=0.01,
-                format="%.2f", width="small"),
-            "🗑": st.column_config.CheckboxColumn("삭제", width="small"),
-        })
-    _sdel = sed["🗑"].fillna(False).astype(bool)
-    if _sdel.any():
-        kept = sed.loc[~_sdel, STRESS_COLS].reset_index(drop=True)
-        if kept.empty:
-            kept = pd.DataFrame([_stress_blank()])[STRESS_COLS]
-        st.session_state[key] = kept
-        st.session_state["_stress_gen"] += 1
-        st.session_state.pop("_stress_editor", None)
-        st.rerun()
-
-    sf = sed[STRESS_COLS].copy()
-    sf["티커"] = sf["티커"].fillna("").astype(str).str.strip()
-    sf["비중(%)"] = pd.to_numeric(sf["비중(%)"], errors="coerce")
-    labs, bad = [], []
-    if any(t for t in sf["티커"]):
-        with st.spinner("티커 확인 중..."):
-            res = []
-            for t in sf["티커"]:
-                if not t:
-                    res.append(""); labs.append(""); continue
-                rr_ = probe_ticker(tuple(normalize_ticker(t)))
-                if rr_["ticker"] is None:
-                    res.append(t); labs.append("❌ 확인 불가"); bad.append(t)
-                else:
-                    res.append(rr_["ticker"])
-                    labs.append(f"✅ {rr_.get('name') or '(종목명 없음)'} · {rr_['currency']}")
-        sf["티커"] = res
-    sf["종목명"] = labs if labs else ""
-    if not _frames_equal(sf, st.session_state[key]):
-        st.session_state[key] = sf
-        st.session_state.pop("_stress_editor", None)
-        st.rerun()
-
-    live = sf[sf["티커"] != ""].copy()
-    tickers = list(live["티커"])
     ok_in, msgs = validate_setup(tickers, bad, live["비중(%)"], min_n=1,
                                  need_weight=True)
     show_msgs(msgs)
@@ -2824,89 +2944,23 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
     st.caption("시장 균형에서 출발해, 내가 가진 전망(뷰)을 **확신도만큼만** 반영해 "
                "자산배분을 산출합니다. 뷰를 넣지 않으면 시장 비중이 그대로 나옵니다.")
 
-    akey, vkey = "_bl_df", "_bl_views"
-    if akey not in st.session_state:
-        st.session_state[akey] = pd.DataFrame([
-            {"티커": t, "종목명": "", "시장 비중(%)": w}
-            for t, w in [("SPY", 45.0), ("EFA", 25.0), ("EEM", 12.0),
-                         ("AGG", 13.0), ("GLD", 5.0)]])[BL_COLS]
+    vkey = "_bl_views"
     if vkey not in st.session_state:
         st.session_state[vkey] = pd.DataFrame([_bl_view_blank()])[BL_VIEW_COLS]
-    st.session_state.setdefault("_bl_gen", 0)
 
-    # ---------------- 자산 ----------------
     st.subheader("1️⃣ 자산과 시장 비중 (Market Portfolio)")
-    st.caption("**시장 비중**은 출발점이 되는 기준 배분입니다. 시가총액 비중이 이상적이지만, "
-               "실무에서는 벤치마크 비중이나 현재 전략적 배분을 넣어도 됩니다. "
-               "뷰가 없으면 이 비중이 그대로 결과가 됩니다.")
-    render_etf_loader(target_key=akey, gen_key="_bl_gen", editor_key="_bl_editor",
-                      cols=BL_COLS, weight_col="시장 비중(%)")
+    live, tickers, bad = render_ticker_table(
+        state_key="_bl_df", editor_key="_bl_editor", gen_key="_bl_gen",
+        cols=BL_COLS, weight_col="시장 비중(%)", title="뷰 기반 자산배분",
+        min_rows=2, max_rows=20, count_label="자산 수",
+        help_text="**시장 비중**은 출발점이 되는 기준 배분입니다. 시가총액 비중이 "
+                  "이상적이지만, 실무에서는 벤치마크 비중이나 현재 전략적 배분을 넣어도 "
+                  "됩니다. 뷰가 없으면 이 비중이 그대로 결과가 됩니다.",
+        default_rows=[{"티커": t_, "시장 비중(%)": w_} for t_, w_ in
+                      [("SPY", 45.0), ("EFA", 25.0), ("EEM", 12.0),
+                       ("AGG", 13.0), ("GLD", 5.0)]])
+    wsum = float(pd.to_numeric(live["시장 비중(%)"], errors="coerce").fillna(0).sum())
 
-    z1, z2 = st.columns([1, 5])
-    _bn = len(st.session_state[akey])
-    bn = z1.number_input("자산 수", 2, 20, _bn, step=1,
-                         key=f"_bl_n_{st.session_state['_bl_gen']}")
-    if int(bn) != _bn:
-        cur = st.session_state[akey]
-        cur = (pd.concat([cur, pd.DataFrame([_bl_blank()] * (int(bn) - len(cur)))],
-                         ignore_index=True) if int(bn) > len(cur)
-               else cur.iloc[:int(bn)].reset_index(drop=True))
-        st.session_state[akey] = cur[BL_COLS]
-        st.session_state["_bl_gen"] += 1
-        st.session_state.pop("_bl_editor", None)
-        st.rerun()
-
-    _bd = st.session_state[akey].copy()
-    _bd["🗑"] = False
-    bed = st.data_editor(
-        _bd, num_rows="fixed", width="stretch", key="_bl_editor",
-        column_order=BL_COLS + ["🗑"], hide_index=True,
-        column_config={
-            "티커": st.column_config.TextColumn("티커", width="small"),
-            "종목명": st.column_config.TextColumn("종목명 (자동)", disabled=True,
-                                              width="medium"),
-            "시장 비중(%)": st.column_config.NumberColumn(
-                "시장 비중(%)", min_value=0.0, max_value=100.0, step=0.1,
-                format="%.2f", width="small"),
-            "🗑": st.column_config.CheckboxColumn("삭제", width="small"),
-        })
-    _bdel = bed["🗑"].fillna(False).astype(bool)
-    if _bdel.any():
-        kept = bed.loc[~_bdel, BL_COLS].reset_index(drop=True)
-        if kept.empty:
-            kept = pd.DataFrame([_bl_blank()])[BL_COLS]
-        st.session_state[akey] = kept
-        st.session_state["_bl_gen"] += 1
-        st.session_state.pop("_bl_editor", None)
-        st.rerun()
-
-    bf = bed[BL_COLS].copy()
-    bf["티커"] = bf["티커"].fillna("").astype(str).str.strip()
-    bf["시장 비중(%)"] = pd.to_numeric(bf["시장 비중(%)"], errors="coerce")
-    labs, bad = [], []
-    if any(t for t in bf["티커"]):
-        with st.spinner("티커 확인 중..."):
-            res = []
-            for t in bf["티커"]:
-                if not t:
-                    res.append(""); labs.append(""); continue
-                r = probe_ticker(tuple(normalize_ticker(t)))
-                if r["ticker"] is None:
-                    res.append(t); labs.append("❌ 확인 불가"); bad.append(t)
-                else:
-                    res.append(r["ticker"])
-                    labs.append(f"✅ {r.get('name') or '(종목명 없음)'} · {r['currency']}")
-        bf["티커"] = res
-    bf["종목명"] = labs if labs else ""
-    if not _frames_equal(bf, st.session_state[akey]):
-        st.session_state[akey] = bf
-        st.session_state.pop("_bl_editor", None)
-        st.rerun()
-
-    live = bf[bf["티커"] != ""].copy()
-    tickers = list(live["티커"])
-    wsum = float(live["시장 비중(%)"].fillna(0).sum())
-    st.caption(f"자산 {len(tickers)}개")
     ok_in, msgs = validate_setup(tickers, bad, live["시장 비중(%)"], min_n=2,
                                  need_weight=True, label="자산")
     show_msgs(msgs)
@@ -3269,15 +3323,14 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
     # ---------------- 다음 단계 ----------------
     st.divider()
     st.subheader("➡️ 다음 단계")
-    if st.button("📊 제안 배분으로 상세 분석하기", width="stretch",
-                 help="제안 배분을 포트폴리오 분석 화면으로 넘겨 과거 성과를 자세히 봅니다."):
-        rows_s = [{"티커": t, "비중(%)": round(float(x) * 100, 2), "종목명": ""}
+    st.caption("이 배분을 다른 화면에서 쓰려면 보관함에 담고, 그 화면의 표에서 "
+               "**📥 붙여넣기** 하세요.")
+    if st.button("📋 제안 배분 복사", width="stretch"):
+        rows_s = [{"티커": t, "비중": round(float(x) * 100, 2)}
                   for t, x in zip(use_tk, np.clip(w_bl, 0, None)) if x > 1e-6]
         if rows_s:
-            send_to("📊 포트폴리오 분석",
-                    df_0=pd.DataFrame(rows_s)[COLS],
-                    gen_0=st.session_state.get("gen_0", 0) + 1,
-                    name_0="뷰 기반 배분", _has_run=False)
+            st.session_state[CLIP_KEY] = {"rows": rows_s, "from": "뷰 기반 배분"}
+            st.success(f"보관함에 담았습니다 · {clip_summary()}")
 
     # ---------------- 내보내기 ----------------
     st.divider()
@@ -3399,73 +3452,11 @@ def render_regimes(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, 
     st.caption("시장을 강세·약세·횡보로 나누고, 국면마다 자산들이 어떻게 움직였는지 봅니다. "
                "**상관관계가 국면에 따라 어떻게 달라지는지**가 핵심입니다.")
 
-    key = "_reg_df"
-    if key not in st.session_state:
-        st.session_state[key] = pd.DataFrame(
-            [{"티커": t, "종목명": ""} for t in ("SPY", "AGG", "GLD", "005930.KS")])[REG_COLS]
-    st.session_state.setdefault("_reg_gen", 0)
+    live, tickers, bad = render_ticker_table(
+        state_key="_reg_df", editor_key="_reg_editor", gen_key="_reg_gen",
+        cols=REG_COLS, title="시장 국면 분석", min_rows=1, max_rows=20,
+        default_rows=[{"티커": x} for x in ("SPY", "AGG", "GLD", "005930.KS")])
 
-    # ---------------- 종목 ----------------
-    st.subheader("1️⃣ 분석할 종목 (Assets)")
-    render_etf_loader(target_key=key, gen_key="_reg_gen", editor_key="_reg_editor",
-                      cols=REG_COLS, weight_col=None)
-    g1, g2 = st.columns([1, 5])
-    _rn = len(st.session_state[key])
-    rn = g1.number_input("종목 수", 1, 20, _rn, step=1,
-                         key=f"_reg_n_{st.session_state['_reg_gen']}")
-    if int(rn) != _rn:
-        cur = st.session_state[key]
-        cur = (pd.concat([cur, pd.DataFrame([_reg_blank()] * (int(rn) - len(cur)))],
-                         ignore_index=True) if int(rn) > len(cur)
-               else cur.iloc[:int(rn)].reset_index(drop=True))
-        st.session_state[key] = cur[REG_COLS]
-        st.session_state["_reg_gen"] += 1
-        st.session_state.pop("_reg_editor", None)
-        st.rerun()
-
-    _rd = st.session_state[key].copy()
-    _rd["🗑"] = False
-    red = st.data_editor(
-        _rd, num_rows="fixed", width="stretch", key="_reg_editor",
-        column_order=REG_COLS + ["🗑"], hide_index=True,
-        column_config={
-            "티커": st.column_config.TextColumn("티커", width="small"),
-            "종목명": st.column_config.TextColumn("종목명 (자동)", disabled=True, width="large"),
-            "🗑": st.column_config.CheckboxColumn("삭제", width="small"),
-        })
-    _rdel = red["🗑"].fillna(False).astype(bool)
-    if _rdel.any():
-        kept = red.loc[~_rdel, REG_COLS].reset_index(drop=True)
-        if kept.empty:
-            kept = pd.DataFrame([_reg_blank()])[REG_COLS]
-        st.session_state[key] = kept
-        st.session_state["_reg_gen"] += 1
-        st.session_state.pop("_reg_editor", None)
-        st.rerun()
-
-    rf_ = red[REG_COLS].copy()
-    rf_["티커"] = rf_["티커"].fillna("").astype(str).str.strip()
-    labs, bad = [], []
-    if any(t for t in rf_["티커"]):
-        with st.spinner("티커 확인 중..."):
-            res = []
-            for t in rf_["티커"]:
-                if not t:
-                    res.append(""); labs.append(""); continue
-                r = probe_ticker(tuple(normalize_ticker(t)))
-                if r["ticker"] is None:
-                    res.append(t); labs.append("❌ 확인 불가"); bad.append(t)
-                else:
-                    res.append(r["ticker"])
-                    labs.append(f"✅ {r.get('name') or '(종목명 없음)'} · {r['currency']}")
-        rf_["티커"] = res
-    rf_["종목명"] = labs if labs else ""
-    if not _frames_equal(rf_, st.session_state[key]):
-        st.session_state[key] = rf_
-        st.session_state.pop("_reg_editor", None)
-        st.rerun()
-
-    tickers = [t for t in rf_["티커"] if t]
     ok_in, msgs = validate_setup(tickers, bad, min_n=1)
     show_msgs(msgs)
 
@@ -4009,20 +4000,16 @@ def render_fixed_add(base_df, base_tk, cand_tk, base_ccy, start_date, end_date,
 
     # ---------------- 다음 단계 ----------------
     st.subheader("➡️ 다음 단계")
-    pick_c = st.selectbox("최적화로 넘길 후보", cand_use, key="_fx_send",
-                          help="기존 종목 + 선택한 후보를 최적화 화면으로 보냅니다. "
-                               "비중은 최적화가 다시 정합니다.")
-    if st.button("🎯 이 구성으로 최적화하기", width="stretch"):
-        rows_o = [{"티커": t, "종목명": "",
-                   "현재 비중(%)": round(float(W_base.get(t, 0)) /
-                                     max(sum(W_base.values()), 1e-9) * 100, 2),
-                   "최소(%)": 0.0, "최대(%)": 100.0} for t in base_use]
-        rows_o.append({"티커": pick_c, "종목명": "", "현재 비중(%)": 0.0,
-                       "최소(%)": 0.0, "최대(%)": 100.0})
-        send_to("🎯 포트폴리오 최적화",
-                _opt_df=pd.DataFrame(rows_o)[OPT_COLS],
-                _opt_gen=st.session_state.get("_opt_gen", 0) + 1,
-                _opt_has_run=False)
+    st.caption("기존 구성에 후보를 더한 상태를 보관함에 담아, 다른 화면에서 "
+               "**📥 붙여넣기** 할 수 있습니다.")
+    pick_c = st.selectbox("함께 담을 후보", cand_use, key="_fx_send")
+    if st.button("📋 기존 + 선택 후보 복사", width="stretch"):
+        tot_b = max(sum(W_base.values()), 1e-9)
+        rows_o = [{"티커": t, "비중": round(float(W_base.get(t, 0)) / tot_b * 100, 2)}
+                  for t in base_use]
+        rows_o.append({"티커": pick_c, "비중": 0.0})
+        st.session_state[CLIP_KEY] = {"rows": rows_o, "from": "자산 추가 효과"}
+        st.success(f"보관함에 담았습니다 · {clip_summary()}")
 
     st.divider()
     st.download_button("📄 편입 효과 CSV", fdf.to_csv(index=False).encode("utf-8-sig"),
@@ -4038,107 +4025,45 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
     st.caption("기존 포트폴리오에 후보 종목 중 몇 개를 더했을 때 가장 좋아지는 조합을 찾습니다. "
                "선정은 **학습 구간** 데이터로만 하고, 결과는 **표본외 성과**와 함께 보여드립니다.")
 
-    bkey, ckey = "_opt_df", "_cand_df"
-    if bkey not in st.session_state:
-        st.session_state[bkey] = pd.DataFrame([
-            {"티커": t, "종목명": "", "현재 비중(%)": w, "최소(%)": 0.0, "최대(%)": 100.0}
-            for t, w in [("SPY", 60.0), ("AGG", 40.0)]])[OPT_COLS]
-    if ckey not in st.session_state:
-        st.session_state[ckey] = pd.DataFrame(
-            [{"티커": t, "종목명": ""} for t in ("QQQ", "GLD", "EFA", "VNQ")])[CAND_COLS]
-    st.session_state.setdefault("_cand_gen", 0)
-
-    # ---------------- 기존 포트폴리오 ----------------
+    # 기존 포트폴리오 표는 최적화 화면과 **분리**한다.
+    # 공유하면 한쪽을 고칠 때 다른 쪽이 말없이 바뀌어 혼란을 준다.
     st.subheader("1️⃣ 기존 포트폴리오 (Current Holdings)")
-    st.caption("포트폴리오 최적화 화면과 같은 표를 사용합니다. 한쪽에서 고치면 양쪽에 반영됩니다.")
-    bed = st.data_editor(
-        st.session_state[bkey], num_rows="dynamic", width="stretch",
-        key="_cand_base_editor", column_order=OPT_COLS, hide_index=True,
-        column_config={
-            "티커": st.column_config.TextColumn("티커", width="small"),
-            "종목명": st.column_config.TextColumn("종목명 (자동)", disabled=True, width="medium"),
-            "현재 비중(%)": st.column_config.NumberColumn(
-                "현재 비중(%)", min_value=0.0, max_value=100.0, step=0.01,
-                format="%.2f", width="small"),
-            "최소(%)": st.column_config.NumberColumn("최소(%)", min_value=0.0,
-                                                   max_value=100.0, step=1.0,
-                                                   format="%.0f", width="small"),
-            "최대(%)": st.column_config.NumberColumn("최대(%)", min_value=0.0,
-                                                   max_value=100.0, step=1.0,
-                                                   format="%.0f", width="small"),
-        })
-    base_df = bed.copy()
-    base_df["티커"] = base_df["티커"].fillna("").astype(str).str.strip()
-    base_df = base_df[base_df["티커"] != ""].reset_index(drop=True)
-    base_tk = list(base_df["티커"])
+    base_live, base_tk, base_bad = render_ticker_table(
+        state_key="_cand_base_df", editor_key="_cand_base_editor",
+        gen_key="_cand_base_gen", cols=OPT_COLS, weight_col="현재 비중(%)",
+        title="자산 추가 효과 · 기존", min_rows=1, max_rows=20,
+        show_equal=True, equal_key="_cand_base_eq",
+        extra_defaults={"최소(%)": 0.0, "최대(%)": 100.0},
+        extra_config={
+            "최소(%)": st.column_config.NumberColumn(
+                "최소(%)", min_value=0.0, max_value=100.0, step=1.0,
+                format="%.0f", width="small"),
+            "최대(%)": st.column_config.NumberColumn(
+                "최대(%)", min_value=0.0, max_value=100.0, step=1.0,
+                format="%.0f", width="small")},
+        help_text="지금 보유 중인 구성입니다. 다른 화면에서 만든 구성을 가져오려면 "
+                  "그 화면에서 **📋 복사** 후 여기서 **📥 붙여넣기** 하세요.",
+        default_rows=[{"티커": "SPY", "현재 비중(%)": 60.0,
+                       "최소(%)": 0.0, "최대(%)": 100.0},
+                      {"티커": "AGG", "현재 비중(%)": 40.0,
+                       "최소(%)": 0.0, "최대(%)": 100.0}])
+    base_df = base_live
     bw = pd.to_numeric(base_df["현재 비중(%)"], errors="coerce").fillna(0)
     st.caption(f"기존 {len(base_tk)}종목 · 비중 합계 **{bw.sum():.2f}%**")
 
     # ---------------- 후보 종목 ----------------
     st.subheader("2️⃣ 후보 종목 (Candidates)")
-    st.caption("추가를 고민 중인 종목을 넣으세요. **15~30개**가 적당합니다. "
-               "너무 많으면 계산이 길어지고, 1등이 우연일 가능성도 커집니다.")
-    render_etf_loader(target_key=ckey, gen_key="_cand_gen",
-                      editor_key="_cand_editor", cols=CAND_COLS, weight_col=None)
+    cand_live, cand_all, cand_bad = render_ticker_table(
+        state_key="_cand_df", editor_key="_cand_editor", gen_key="_cand_gen",
+        cols=CAND_COLS, title="자산 추가 효과 · 후보", min_rows=2, max_rows=50,
+        count_label="후보 수",
+        help_text="추가를 고민 중인 종목을 넣으세요. **15~30개**가 적당합니다. "
+                  "너무 많으면 계산이 길어지고, 1등이 우연일 가능성도 커집니다.",
+        default_rows=[{"티커": x} for x in ("QQQ", "GLD", "EFA", "VNQ")])
+    bad = list(base_bad) + list(cand_bad)
+    cand_tk = [t_ for t_ in cand_all if t_ not in base_tk]
+    dup = [t_ for t_ in cand_all if t_ in base_tk]
 
-    q1, q2 = st.columns([1, 5])
-    _qn = len(st.session_state[ckey])
-    cn = q1.number_input("후보 수", 2, 50, _qn, step=1,
-                         key=f"_cand_n_{st.session_state['_cand_gen']}")
-    if int(cn) != _qn:
-        cur = st.session_state[ckey]
-        cur = (pd.concat([cur, pd.DataFrame([_cand_blank()] * (int(cn) - len(cur)))],
-                         ignore_index=True) if int(cn) > len(cur)
-               else cur.iloc[:int(cn)].reset_index(drop=True))
-        st.session_state[ckey] = cur[CAND_COLS]
-        st.session_state["_cand_gen"] += 1
-        st.session_state.pop("_cand_editor", None)
-        st.rerun()
-
-    _cd = st.session_state[ckey].copy()
-    _cd["🗑"] = False
-    ced = st.data_editor(
-        _cd, num_rows="fixed", width="stretch", key="_cand_editor",
-        column_order=CAND_COLS + ["🗑"], hide_index=True,
-        column_config={
-            "티커": st.column_config.TextColumn("티커", width="small"),
-            "종목명": st.column_config.TextColumn("종목명 (자동)", disabled=True, width="large"),
-            "🗑": st.column_config.CheckboxColumn("삭제", width="small"),
-        })
-    _cdel = ced["🗑"].fillna(False).astype(bool)
-    if _cdel.any():
-        kept = ced.loc[~_cdel, CAND_COLS].reset_index(drop=True)
-        if kept.empty:
-            kept = pd.DataFrame([_cand_blank()])[CAND_COLS]
-        st.session_state[ckey] = kept
-        st.session_state["_cand_gen"] += 1
-        st.session_state.pop("_cand_editor", None)
-        st.rerun()
-
-    cf = ced[CAND_COLS].copy()
-    cf["티커"] = cf["티커"].fillna("").astype(str).str.strip()
-    labs, bad = [], []
-    if any(t for t in cf["티커"]):
-        with st.spinner("티커 확인 중..."):
-            res = []
-            for t in cf["티커"]:
-                if not t:
-                    res.append(""); labs.append(""); continue
-                r = probe_ticker(tuple(normalize_ticker(t)))
-                if r["ticker"] is None:
-                    res.append(t); labs.append("❌ 확인 불가"); bad.append(t)
-                else:
-                    res.append(r["ticker"])
-                    labs.append(f"✅ {r.get('name') or '(종목명 없음)'} · {r['currency']}")
-        cf["티커"] = res
-    cf["종목명"] = labs if labs else ""
-    if not _frames_equal(cf, st.session_state[ckey]):
-        st.session_state[ckey] = cf
-        st.session_state.pop("_cand_editor", None)
-        st.rerun()
-
-    cand_tk = [t for t in cf["티커"] if t and t not in base_tk]
-    dup = [t for t in cf["티커"] if t and t in base_tk]
     ok_in, msgs = validate_setup(cand_tk, bad, min_n=1, label="후보 종목")
     show_msgs(msgs)
     if dup:
@@ -4516,75 +4441,11 @@ def render_correlations(base_ccy, start_date, end_date, use_div, fx_hedge, gap_f
     st.caption("종목들이 서로 얼마나 함께 움직이는지 확인합니다. "
                "낮은 상관관계가 많을수록 분산 효과가 큽니다.")
 
-    key = "_corr_df"
-    if key not in st.session_state:
-        st.session_state[key] = pd.DataFrame(
-            [{"티커": t, "종목명": ""} for t in ("005930.KS", "SPY", "QQQ", "GLD")])[CORR_COLS]
-    st.session_state.setdefault("_corr_gen", 0)
+    live, tickers, bad = render_ticker_table(
+        state_key="_corr_df", editor_key="_corr_editor", gen_key="_corr_gen",
+        cols=CORR_COLS, title="자산 상관관계", min_rows=2, max_rows=30,
+        default_rows=[{"티커": x} for x in ("005930.KS", "SPY", "QQQ", "GLD")])
 
-    # ---------------- 종목 입력 ----------------
-    st.subheader("1️⃣ 종목 (Holdings)")
-    render_etf_loader(target_key=key, gen_key="_corr_gen", editor_key="_corr_editor",
-                      cols=CORR_COLS, weight_col=None)
-
-    cc1, cc2 = st.columns([1, 5])
-    _cnt = len(st.session_state[key])
-    n = cc1.number_input("종목 수", 2, 30, _cnt, step=1,
-                         key=f"_corr_n_{st.session_state['_corr_gen']}")
-    if int(n) != _cnt:
-        cur = st.session_state[key]
-        cur = (pd.concat([cur, pd.DataFrame([_corr_blank()] * (int(n) - len(cur)))],
-                         ignore_index=True) if int(n) > len(cur)
-               else cur.iloc[:int(n)].reset_index(drop=True))
-        st.session_state[key] = cur[CORR_COLS]
-        st.session_state["_corr_gen"] += 1
-        st.session_state.pop("_corr_editor", None)
-        st.rerun()
-
-    _cd = st.session_state[key].copy()
-    _cd["🗑"] = False
-    ced = st.data_editor(
-        _cd, num_rows="fixed", width="stretch", key="_corr_editor",
-        column_order=CORR_COLS + ["🗑"], hide_index=True,
-        column_config={
-            "티커": st.column_config.TextColumn("티커", width="small"),
-            "종목명": st.column_config.TextColumn("종목명 (자동)", disabled=True, width="large"),
-            "🗑": st.column_config.CheckboxColumn("삭제", width="small",
-                                                help="체크하면 해당 행이 삭제됩니다."),
-        })
-    _cdel = ced["🗑"].fillna(False).astype(bool)
-    if _cdel.any():
-        kept = ced.loc[~_cdel, CORR_COLS].reset_index(drop=True)
-        if kept.empty:
-            kept = pd.DataFrame([_corr_blank()])[CORR_COLS]
-        st.session_state[key] = kept
-        st.session_state["_corr_gen"] += 1
-        st.session_state.pop("_corr_editor", None)
-        st.rerun()
-
-    f = ced[CORR_COLS].copy()
-    f["티커"] = f["티커"].fillna("").astype(str).str.strip()
-    labels, bad = [], []
-    if any(t for t in f["티커"]):
-        with st.spinner("티커 확인 중..."):
-            res = []
-            for t in f["티커"]:
-                if not t:
-                    res.append(""); labels.append(""); continue
-                r = probe_ticker(tuple(normalize_ticker(t)))
-                if r["ticker"] is None:
-                    res.append(t); labels.append("❌ 확인 불가"); bad.append(t)
-                else:
-                    res.append(r["ticker"])
-                    labels.append(f"✅ {r.get('name') or '(종목명 없음)'} · {r['currency']}")
-        f["티커"] = res
-    f["종목명"] = labels if labels else ""
-    if not _frames_equal(f, st.session_state[key]):
-        st.session_state[key] = f
-        st.session_state.pop("_corr_editor", None)
-        st.rerun()
-
-    tickers = [t for t in f["티커"] if t]
     ok_in, msgs = validate_setup(tickers, bad, min_n=2)
     show_msgs(msgs)
     if len(tickers) > CORR_MAX_HINT:
@@ -4796,12 +4657,8 @@ def render_correlations(base_ccy, start_date, end_date, use_div, fx_hedge, gap_f
     # ---------------- 다음 단계 ----------------
     st.divider()
     st.subheader("➡️ 다음 단계")
-    st.caption("상관관계가 낮은 자산을 후보로 넘겨 편입 효과를 확인해보세요.")
-    if st.button("➕ 이 종목들을 자산 추가 효과로 보내기", width="stretch"):
-        send_to("➕ 자산 추가 효과",
-                _cand_df=pd.DataFrame([{"티커": t, "종목명": ""} for t in tickers])[CAND_COLS],
-                _cand_gen=st.session_state.get("_cand_gen", 0) + 1,
-                _cand_has_run=False, _fx_has_run=False)
+    st.caption("상관관계가 낮은 자산을 다른 화면에서 검토해보세요. "
+               "위 표의 **📋 복사** 를 누른 뒤, 그 화면에서 **📥 붙여넣기** 하면 됩니다.")
 
     # ---------------- 내보내기 ----------------
     st.divider()
@@ -4921,12 +4778,6 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                     st.session_state[sk] = cfg[ck]
             st.success(f"**{cfg.get('label', '')}** 설정을 불러왔습니다.")
 
-    if key not in st.session_state:
-        st.session_state[key] = pd.DataFrame([
-            {"티커": t, "종목명": "", "현재 비중(%)": w, "최소(%)": 0.0, "최대(%)": 100.0}
-            for t, w in [("AAPL", 25.0), ("NVDA", 25.0), ("SCHD", 25.0), ("SPMO", 25.0)]
-        ])[OPT_COLS]
-
     # ---------------- 저장 / 불러오기 ----------------
     saved_opt = load_opt_saved()
     with st.expander("💾 최적화 설정 저장 / 불러오기", expanded=False):
@@ -4971,107 +4822,28 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         st.caption("설정은 브라우저 세션에 보관됩니다. 오래 쓰실 구성은 "
                    "**📥 내보내기**로 파일을 받아두세요.")
 
-    # ------------------------------------------------------------------
     st.subheader("1️⃣ 현재 포트폴리오 (Current Holdings)")
-    st.caption("지금 보유 중인 종목과 비중을 넣으세요. 최적화 결과는 **이 구성과 비교**해서 보여드립니다. "
-               "특정 종목을 제한하려면 최소·최대 편입비중을 조정하세요.")
-
-    c1, c2, c3 = st.columns([1, 1.2, 4])
-    render_etf_loader(target_key=key, gen_key="_opt_gen", editor_key="_opt_editor",
-                      cols=OPT_COLS, weight_col="현재 비중(%)",
-                      extra_defaults={"최소(%)": 0.0, "최대(%)": 100.0})
-
-    st.session_state.setdefault("_opt_gen", 0)
-    _ocnt = len(st.session_state[key])
-    n = c1.number_input("종목 수", 2, 20, _ocnt, step=1,
-                        key=f"_opt_n_{st.session_state['_opt_gen']}")
-    if int(n) != _ocnt:
-        cur = st.session_state[key]
-        cur = (pd.concat([cur, pd.DataFrame([_opt_blank()] * (int(n) - len(cur)))],
-                         ignore_index=True) if int(n) > len(cur)
-               else cur.iloc[:int(n)].reset_index(drop=True))
-        st.session_state[key] = cur[OPT_COLS]
-        st.session_state["_opt_gen"] += 1
-        st.session_state.pop("_opt_editor", None)
-        st.rerun()
-    c2.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-    eq_now = c2.checkbox("비중 균등", key="_opt_eq")
-
-    _od = st.session_state[key].copy()
-    _od["🗑"] = False
-    ed = st.data_editor(
-        _od, num_rows="fixed", width="stretch",
-        key="_opt_editor", column_order=OPT_COLS + ["🗑"], hide_index=True,
-        column_config={
-            "티커": st.column_config.TextColumn("티커", width="small"),
-            "종목명": st.column_config.TextColumn("종목명 (자동)", disabled=True, width="medium"),
-            "현재 비중(%)": st.column_config.NumberColumn(
-                "현재 비중(%)", min_value=0.0, max_value=100.0, step=0.01,
-                format="%.2f", width="small", disabled=eq_now),
+    live, tickers, bad = render_ticker_table(
+        state_key=key, editor_key="_opt_editor", gen_key="_opt_gen",
+        cols=OPT_COLS, weight_col="현재 비중(%)", title="포트폴리오 최적화",
+        min_rows=2, max_rows=20, show_equal=True, equal_key="_opt_eq",
+        extra_defaults={"최소(%)": 0.0, "최대(%)": 100.0},
+        extra_config={
             "최소(%)": st.column_config.NumberColumn(
                 "최소(%)", min_value=0.0, max_value=100.0, step=1.0,
                 format="%.0f", width="small"),
             "최대(%)": st.column_config.NumberColumn(
                 "최대(%)", min_value=0.0, max_value=100.0, step=1.0,
-                format="%.0f", width="small"),
-            "🗑": st.column_config.CheckboxColumn(
-                "삭제", width="small", help="체크하면 해당 행이 삭제됩니다."),
-        })
-
-    _odel = ed["🗑"].fillna(False).astype(bool)
-    if _odel.any():
-        _okept = ed.loc[~_odel, OPT_COLS].reset_index(drop=True)
-        if _okept.empty:
-            _okept = pd.DataFrame([_opt_blank()])[OPT_COLS]
-        st.session_state[key] = _okept
-        st.session_state["_opt_gen"] = st.session_state.get("_opt_gen", 0) + 1
-        st.session_state.pop("_opt_editor", None)
-        st.rerun()
-    ed = ed[OPT_COLS]
-
-    f = ed.copy()
-    for c in OPT_COLS:
-        if c not in f.columns:
-            f[c] = np.nan
-    f = f[OPT_COLS]
-    f["티커"] = f["티커"].fillna("").astype(str).str.strip()
-    f["현재 비중(%)"] = pd.to_numeric(f["현재 비중(%)"], errors="coerce").round(2)
-    f["최소(%)"] = pd.to_numeric(f["최소(%)"], errors="coerce").fillna(0.0)
-    f["최대(%)"] = pd.to_numeric(f["최대(%)"], errors="coerce").fillna(100.0)
-
-    res_t, res_l, bad = [], [], []
-    if any(t for t in f["티커"]):
-        with st.spinner("티커 확인 중..."):
-            for t in f["티커"]:
-                if not t:
-                    res_t.append(""); res_l.append(""); continue
-                r = probe_ticker(tuple(normalize_ticker(t)))
-                if r["ticker"] is None:
-                    res_t.append(t); res_l.append("❌ 확인 불가"); bad.append(t)
-                else:
-                    res_t.append(r["ticker"])
-                    res_l.append(f"✅ {r.get('name') or '(종목명 없음)'} · {r['currency']}")
-    else:
-        res_t, res_l = list(f["티커"]), [""] * len(f)
-    f["티커"], f["종목명"] = res_t, res_l
-
-    if eq_now:
-        m = f["티커"] != ""
-        k = int(m.sum())
-        if k:
-            base = round(100.0 / k, 2)
-            vals = [base] * k
-            vals[-1] = round(100.0 - base * (k - 1), 2)
-            f.loc[m, "현재 비중(%)"] = vals
-        f.loc[~m, "현재 비중(%)"] = np.nan
-
-    if not _frames_equal(f, st.session_state[key]):
-        st.session_state[key] = f
-        st.session_state.pop("_opt_editor", None)
-        st.rerun()
-
-    live = f[f["티커"] != ""].copy()
+                format="%.0f", width="small")},
+        help_text="지금 보유 중인 종목과 비중을 넣으세요. 최적화 결과는 **이 구성과 비교**"
+                  "해서 보여드립니다. 특정 종목을 제한하려면 최소·최대 편입비중을 "
+                  "조정하세요.",
+        default_rows=[{"티커": x, "현재 비중(%)": w, "최소(%)": 0.0, "최대(%)": 100.0}
+                      for x, w in [("AAPL", 25.0), ("NVDA", 25.0),
+                                   ("SCHD", 25.0), ("SPMO", 25.0)]])
+    f = live
     wsum = float(pd.to_numeric(live["현재 비중(%)"], errors="coerce").fillna(0).sum())
+
     ok_in, msgs = validate_setup(list(live["티커"]), bad, live["현재 비중(%)"],
                                  min_n=2, need_weight=True)
     show_msgs(msgs)
@@ -5295,18 +5067,14 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         else:
             st.info("비교할 만큼의 데이터가 부족합니다.")
 
-    if st.button("↗️ 이 비중으로 상세 분석하기", width="stretch",
-                 help="최적 비중을 포트폴리오 분석 화면으로 넘겨 자세히 살펴봅니다."):
-        st.session_state["df_0"] = pd.DataFrame(
-            [{"티커": t, "비중(%)": round(float(x) * 100, 2), "종목명": ""}
-             for t, x in zip(tickers, w_opt)])[COLS]
-        st.session_state["nrow_0"] = len(tickers)
-        st.session_state["name_0"] = f"최적화 ({goal})"
-        st.session_state["rebal_0"] = rebal
-        # 라디오 위젯은 이미 그려진 뒤이므로 직접 바꿀 수 없다. 다음 실행에서 반영한다.
-        st.session_state["_pending_tool"] = "📊 포트폴리오 분석"
-        st.session_state["_has_run"] = False
-        st.rerun()
+    if st.button("📋 최적 비중 복사", width="stretch",
+                 help="최적 비중을 보관함에 담습니다. 다른 화면의 표에서 "
+                      "📥 붙여넣기 하면 그대로 채워집니다."):
+        st.session_state[CLIP_KEY] = {
+            "rows": [{"티커": t, "비중": round(float(x) * 100, 2)}
+                     for t, x in zip(tickers, w_opt) if x > 1e-6],
+            "from": f"최적화 ({goal})"}
+        st.success(f"보관함에 담았습니다 · {clip_summary()}")
 
     # ---------------- 성과 비교 ----------------
     def _bt(px, W):
@@ -5839,122 +5607,15 @@ for i, tab in enumerate(tabs):
         rebal = c2.selectbox("리밸런싱", REBAL_OPTIONS, index=2, key=f"rebal_{i}")
 
         dfkey = f"df_{i}"
-        if dfkey not in st.session_state:
-            st.session_state[dfkey] = default_holdings(i)
-
-        render_etf_loader(target_key=dfkey, gen_key=f"gen_{i}",
-                          editor_key=f"hold_{i}", cols=COLS, weight_col="비중(%)")
-
-        # 행 수가 프로그램에 의해 바뀔 때마다 세대 번호를 올려 위젯을 새로 만든다.
-        # (같은 행 수로 되돌아왔을 때 이전 입력값이 되살아나는 것을 막는다)
-        genkey = f"gen_{i}"
-        st.session_state.setdefault(genkey, 0)
-        _cnt = len(st.session_state[dfkey])
-        n_rows = c3.number_input("종목 수", MIN_ROWS, MAX_ROWS, _cnt, step=1,
-                                 key=f"nrow_{i}_{st.session_state[genkey]}")
-        if int(n_rows) != _cnt:
-            st.session_state[dfkey] = fit_rows(st.session_state[dfkey], int(n_rows))
-            st.session_state[genkey] += 1
-            st.session_state.pop(f"hold_{i}", None)
-            st.rerun()
-
-        c4.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        equal_w = c4.checkbox("균등 비중", key=f"eqw_{i}",
-                              help="체크하면 입력된 종목에 100%를 균등 배분합니다.")
-
-        _disp = st.session_state[dfkey].copy()
-        _disp["🗑"] = False
-        edited = st.data_editor(
-            _disp,
-            num_rows="fixed", width="stretch", key=f"hold_{i}",
-            column_order=COLS + ["🗑"], hide_index=True,
-            column_config={
-                "티커": st.column_config.TextColumn(
-                    "티커", width="small",
-                    help="005930.KS · 005930 KS · 005930 · NVDA 모두 가능"),
-                "비중(%)": st.column_config.NumberColumn(
-                    "비중(%)", min_value=0.0, max_value=100.0,
-                    step=0.01, format="%.2f", width="small", disabled=equal_w),
-                "종목명": st.column_config.TextColumn(
-                    "종목명 (자동)", disabled=True, width="large"),
-                "🗑": st.column_config.CheckboxColumn(
-                    "삭제", width="small", help="체크하면 해당 행이 삭제됩니다."),
-            },
-        )
-
-        # 체크된 행 즉시 삭제
-        _del = edited["🗑"].fillna(False).astype(bool)
-        if _del.any():
-            _kept = edited.loc[~_del, COLS].reset_index(drop=True)
-            if _kept.empty:
-                _kept = pd.DataFrame([blank_row()])[COLS]
-            st.session_state[dfkey] = _kept
-            st.session_state[genkey] += 1
-            st.session_state.pop(f"hold_{i}", None)
-            st.rerun()
-        edited = edited[COLS]
-
-        # ---- 정규화 ----
-        filled = edited.copy()
-        for c in COLS:
-            if c not in filled.columns:
-                filled[c] = np.nan
-        filled = filled[COLS]
-        filled["티커"] = filled["티커"].fillna("").astype(str).str.strip()
-        filled["비중(%)"] = pd.to_numeric(filled["비중(%)"], errors="coerce").round(2)
-
-        # ---- 1단계: 티커 형식 변환 + 빠른 검증 ----
-        resolved, labels, need_name, thin = [], [], [], []
-        raw_list = list(filled["티커"])
-        if any(t for t in raw_list):
-            with st.spinner("티커 확인 중..."):
-                for t in raw_list:
-                    if not t:
-                        resolved.append(""); labels.append(""); continue
-                    r = probe_ticker(tuple(normalize_ticker(t)))
-                    if r["ticker"] is None:
-                        resolved.append(t); labels.append("❌ 확인 불가")
-                    else:
-                        resolved.append(r["ticker"])
-                        nm = r.get("name") or ""
-                        if nm:
-                            labels.append(f"✅ {nm} · {r['currency']}")
-                        else:
-                            labels.append(f"✅ … · {r['currency']}")
-                            need_name.append((len(resolved) - 1, r["ticker"], r["currency"]))
-                        if r["rows"] < 200:
-                            thin.append((r["ticker"], r["rows"], r["first"]))
-        else:
-            resolved = list(raw_list); labels = [""] * len(raw_list)
-
-        filled["티커"] = resolved
-        filled["종목명"] = labels
-
-        # ---- 2단계: 종목명 채우기 ----
-        for idx, tk, ccy in need_name:
-            nm = get_name(tk)
-            filled.iat[idx, COLS.index("종목명")] = (
-                f"✅ {nm} · {ccy}" if nm else f"✅ (종목명 없음) · {ccy}")
-
-        # ---- 균등 비중 ----
-        if equal_w:
-            mask = filled["티커"] != ""
-            k = int(mask.sum())
-            if k > 0:
-                base = round(100.0 / k, 2)
-                vals = [base] * k
-                vals[-1] = round(100.0 - base * (k - 1), 2)
-                filled.loc[mask, "비중(%)"] = vals
-            filled.loc[~mask, "비중(%)"] = np.nan
-
-        if not _frames_equal(filled, st.session_state[dfkey]):
-            st.session_state[dfkey] = filled
-            st.session_state.pop(f"hold_{i}", None)
-            st.rerun()
-
-        v = filled[filled["티커"].astype(str).str.strip() != ""].copy()
-        tot = float(pd.to_numeric(v["비중(%)"], errors="coerce").fillna(0).sum()) if not v.empty else 0.0
-        bad = v[v["종목명"].astype(str).str.startswith("❌")]["티커"].tolist()
+        pre = PRESETS[i] if i < len(PRESETS) else []
+        v, tks, bad = render_ticker_table(
+            state_key=dfkey, editor_key=f"hold_{i}", gen_key=f"gen_{i}",
+            cols=COLS, weight_col="비중(%)", title=f"포트{i+1}",
+            min_rows=MIN_ROWS, max_rows=MAX_ROWS,
+            show_equal=True, equal_key=f"eqw_{i}",
+            default_rows=([{"티커": t_, "비중(%)": w_} for t_, w_ in pre]
+                          or [{"티커": ""}]))
+        tot = float(pd.to_numeric(v["비중(%)"], errors="coerce").fillna(0).sum())
 
         m1, m2 = st.columns([1, 1])
         m1.caption(f"비중 합계 **{tot:.2f}%**"
@@ -5964,24 +5625,17 @@ for i, tab in enumerate(tabs):
         elif not v.empty:
             m2.caption("모든 티커 정상 ✅")
 
-        if thin:
-            txt = " · ".join(f"**{tk}** 최근 1년 {n}일 (시작 {f})" for tk, n, f in thin)
-            st.warning(f"데이터 이력이 짧은 종목이 있습니다 — {txt}\n\n"
-                       f"신규 상장이면 정상이지만, 아니라면 티커가 잘못 잡혔을 수 있습니다. "
-                       f"이런 종목이 있으면 **전체 분석 기간이 그 종목에 맞춰 줄어듭니다.**")
-
         if bad:
             with st.expander("🩺 조회 실패 원인 보기", expanded=False):
                 st.caption("각 티커에 대해 시도한 방법과 실패 사유입니다.")
-                for t in bad:
-                    r = probe_ticker(tuple(normalize_ticker(t)))
-                    st.markdown(f"**{t}** → 시도한 후보: `{', '.join(normalize_ticker(t))}`")
-                    if r["log"]:
-                        st.code("\n".join(r["log"]), language="text")
-                    else:
-                        st.code("기록된 오류 없음", language="text")
+                for t_ in bad:
+                    r_ = probe_ticker(tuple(normalize_ticker(t_)))
+                    st.markdown(f"**{t_}** → 시도한 후보: "
+                                f"`{', '.join(normalize_ticker(t_))}`")
+                    st.code("\n".join(r_["log"]) or "기록된 오류 없음", language="text")
                 st.caption(f"yfinance {getattr(yf, '__version__', '버전 확인 불가')} · "
                            "대부분 `pip install -U yfinance` 로 해결됩니다.")
+
 
         port_specs.append({"name": name, "rebalance": rebal, "holdings": v})
 
