@@ -547,6 +547,20 @@ def render_ticker_table(*, state_key, editor_key, gen_key, cols, weight_col=None
     # ---------------- 상단 조작줄 ----------------
     c1, c2, c3, c4 = st.columns([1.1, 1, 1, 3])
     cur_n = len(st.session_state[state_key])
+    # 저장된 행 수가 허용 범위를 벗어나면 먼저 맞춘다.
+    # (min_rows 를 바꿨거나 다른 화면에서 붙여넣은 뒤 생길 수 있다)
+    if cur_n < min_rows or cur_n > max_rows:
+        fixed = st.session_state[state_key]
+        if cur_n < min_rows:
+            fixed = pd.concat([fixed, pd.DataFrame([_blank()] * (min_rows - cur_n))],
+                              ignore_index=True)
+        else:
+            fixed = fixed.iloc[:max_rows].reset_index(drop=True)
+        st.session_state[state_key] = fixed[cols]
+        st.session_state[gen_key] += 1
+        st.session_state.pop(editor_key, None)
+        st.rerun()
+
     n = c1.number_input(count_label, min_rows, max_rows, cur_n, step=1,
                         key=f"{gen_key}_n_{st.session_state[gen_key]}")
     if int(n) != cur_n:
@@ -2141,6 +2155,11 @@ def render_help():
             st.markdown(
                 "종목들이 얼마나 함께 움직이는지 봅니다. **실효 종목 수**가 핵심 지표인데, "
                 "10종목을 담아도 서로 비슷하면 실효는 2~3종목에 불과할 수 있습니다.\n\n"
+                "**위험군 묶기**는 비슷하게 움직이는 자산을 하나로 묶어 보여줍니다. "
+                "'자산은 7개지만 실질 위험군은 3개' 같은 진단이 나옵니다.\n\n"
+                "**국면별·위기별 상관관계**를 꼭 펼쳐보세요. 평상시 0.3이던 상관이 "
+                "약세장에 0.8로 오른다면, 기대했던 분산 효과가 정작 필요할 때 "
+                "사라진다는 뜻입니다.\n\n"
                 "**계산 주기 선택이 중요합니다.** 거래 시간대가 다른 국가를 섞으면 일별 "
                 "상관계수가 실제보다 낮게 나옵니다. 한국·미국·일본을 함께 볼 때는 "
                 "주별이나 월별을 쓰세요.")
@@ -2869,7 +2888,7 @@ def render_stress(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, r
         st.download_button("📊 엑셀 파일 받기", buf.getvalue(),
                            f"stress_test_{pd.Timestamp.now():%Y%m%d_%H%M}.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           width="stretch")
+                           key="dl_stress", width="stretch")
     except Exception as ex:
         st.error(f"엑셀 생성 실패: {ex}")
     st.caption("과거의 위기가 같은 형태로 반복된다는 보장은 없습니다. "
@@ -2957,8 +2976,9 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
                   "이상적이지만, 실무에서는 벤치마크 비중이나 현재 전략적 배분을 넣어도 "
                   "됩니다. 뷰가 없으면 이 비중이 그대로 결과가 됩니다.",
         default_rows=[{"티커": t_, "시장 비중(%)": w_} for t_, w_ in
-                      [("SPY", 45.0), ("EFA", 25.0), ("EEM", 12.0),
-                       ("AGG", 13.0), ("GLD", 5.0)]])
+                      [("SPY", 35.0), ("EFA", 18.0), ("EEM", 10.0),
+                       ("SHY", 12.0), ("IEF", 12.0), ("TLT", 8.0),
+                       ("GLD", 5.0)]])
     wsum = float(pd.to_numeric(live["시장 비중(%)"], errors="coerce").fillna(0).sum())
 
     ok_in, msgs = validate_setup(tickers, bad, live["시장 비중(%)"], min_n=2,
@@ -2981,6 +3001,19 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
         st.caption("각 자산의 전망만 고르세요. 수치는 **자산의 변동성에 맞춰 자동 환산**됩니다. "
                    "변동성이 큰 주식의 '긍정'과 변동성이 작은 채권의 '긍정'은 "
                    "다른 크기로 반영됩니다.")
+        with st.expander("💡 금리 전망은 어떻게 넣나요?", expanded=False):
+            st.markdown(
+                "금리 자체(`^TNX` 등)를 자산으로 넣으면 계산이 왜곡됩니다. 금리가 4%에서 "
+                "5%로 오르면 '25% 상승'으로 잡히지만, 채권 투자자에게는 오히려 손실이기 "
+                "때문입니다.\n\n"
+                "**대신 만기가 다른 채권 ETF의 전망으로 표현하세요.**\n\n"
+                "| 전망 | 단기 `SHY` | 중기 `IEF` | 장기 `TLT` |\n|---|---|---|---|\n"
+                "| 금리 인하 예상 | 중립 | 긍정 | **강한 긍정** |\n"
+                "| 금리 인상 예상 | 긍정 | 중립 | **강한 부정** |\n"
+                "| 장단기 역전 해소 | 부정 | 중립 | 긍정 |\n\n"
+                "만기가 길수록 금리 변화에 민감하므로(듀레이션), 같은 금리 전망이라도 "
+                "**장기채에 더 강한 전망**을 주는 것이 자연스럽습니다. "
+                "기본 구성에 `SHY`·`IEF`·`TLT` 를 넣어둔 이유입니다.")
         skey = "_bl_simple"
         if skey not in st.session_state or \
                 list(st.session_state[skey]["티커"]) != tickers:
@@ -3355,7 +3388,7 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
         st.download_button("📊 엑셀 파일 받기", buf.getvalue(),
                            f"black_litterman_{pd.Timestamp.now():%Y%m%d_%H%M}.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           width="stretch")
+                           key="dl_bl", width="stretch")
     except Exception as ex:
         st.error(f"엑셀 생성 실패: {ex}")
     st.caption("이 모형은 시장 비중이 합리적인 출발점이라는 가정에 기대며, 공분산은 과거에서 "
@@ -3675,7 +3708,7 @@ def render_regimes(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, 
         st.download_button("📊 엑셀 파일 받기", buf.getvalue(),
                            f"regimes_{pd.Timestamp.now():%Y%m%d_%H%M}.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           width="stretch")
+                           key="dl_reg", width="stretch")
     except Exception as ex:
         st.error(f"엑셀 생성 실패: {ex}")
     st.caption("국면 구분은 사후적으로 나눈 것이며, 실시간으로는 지금이 어느 국면인지 "
@@ -3784,8 +3817,11 @@ def render_fixed_add(base_df, base_tk, cand_tk, base_ccy, start_date, end_date,
     rebal_f = f3.selectbox("리밸런싱", REBAL_OPTIONS, index=2, key="_fx_rebal")
 
     cmp_all = st.checkbox("재원별로 모두 비교", value=False, key="_fx_cmpall",
-                          help="비례 축소와 각 자산에서 뺐을 때를 한 번에 비교합니다. "
-                               "후보 1개 · 비중 1개일 때만 동작합니다.")
+                          help="비례 축소와 각 자산에서 뺐을 때를 한 번에 비교합니다.")
+    if cmp_all and not (len(cand_tk) == 1 and len(weights_sel) == 1):
+        st.info("재원별 비교는 **후보 1개 · 편입 비중 1개**일 때만 표시됩니다. "
+                f"지금은 후보 {len(cand_tk)}개 · 비중 {len(weights_sel)}개입니다. "
+                "위 후보 표에서 종목 수를 1로 줄이고, 편입 비중도 하나만 선택하세요.")
 
     go_fx = st.button("📌 편입 효과 계산", type="primary", width="stretch",
                       disabled=bool(meta_bad) or not cand_tk or not weights_sel
@@ -3885,12 +3921,12 @@ def render_fixed_add(base_df, base_tk, cand_tk, base_ccy, start_date, end_date,
         width="stretch", hide_index=True)
     st.caption("초록색 = 가장 유리한 값. **기존과 상관**이 낮을수록 분산 효과가 큽니다.")
 
+    drows, srows = [], []
     with st.expander("상세 지표 보기 (최악의 월·분기)", expanded=False):
         st.caption("편입 전후로 **가장 나빴던 한 달·한 분기**가 어떻게 달라졌는지입니다. "
                    "평균 지표에는 드러나지 않는 충격의 크기를 보여줍니다.")
         m0_mon = float((1 + r0).resample("ME").prod().min() - 1) * 100
         m0_qtr = float((1 + r0).resample("QE").prod().min() - 1) * 100
-        drows = []
         for c in cand_use:
             for wa in sorted(weights_sel):
                 W, _w = fund_weights(W_base, c, wa / 100.0, fund_src)
@@ -3939,7 +3975,6 @@ def render_fixed_add(base_df, base_tk, cand_tk, base_ccy, start_date, end_date,
         st.caption("**같은 비중을 넣어도 어느 자산에서 재원을 빼느냐에 따라 결과가 "
                    "완전히 달라집니다.** 이 표가 그 차이를 보여줍니다.")
         c, wa = cand_use[0], sorted(weights_sel)[0]
-        srows = []
         for src in [FUND_PROP] + list(base_use):
             W, warn = fund_weights(W_base, c, wa / 100.0, src)
             if W is None:
@@ -4012,7 +4047,47 @@ def render_fixed_add(base_df, base_tk, cand_tk, base_ccy, start_date, end_date,
         st.success(f"보관함에 담았습니다 · {clip_summary()}")
 
     st.divider()
-    st.download_button("📄 편입 효과 CSV", fdf.to_csv(index=False).encode("utf-8-sig"),
+    st.subheader("📥 결과 내보내기")
+    fx_settings = {
+        "방식": "고정 비중 편입 효과",
+        "기존 구성": " · ".join(f"{k} {v:.2f}%" for k, v in W_base.items()),
+        "후보": ", ".join(cand_use),
+        "편입 비중": ", ".join(f"{w:.0f}%" for w in sorted(weights_sel)),
+        "재원": "비례 축소" if fund_src == FUND_PROP else f"{fund_src} 에서 차감",
+        "리밸런싱": rebal_f,
+        "기준 통화": base_ccy,
+        "거래비용": f"{cost_bp:.0f}bp (편도)",
+        "무위험 수익률": f"{rf_rate*100:.2f}%",
+        "기간": f"{prices.index[0].date()} ~ {prices.index[-1].date()}",
+        "배당 처리": "재투자 (총수익)" if use_div else "주가만 (배당 제외)",
+        "생성 시각": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    g1, g2 = st.columns(2)
+    try:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
+            pd.DataFrame([{"항목": "기존 포트폴리오", **{
+                "수익률(연,%)": m0["수익률(연,%)"], "변동성(연,%)": m0["변동성(연,%)"],
+                "최대낙폭(%)": m0["최대낙폭(%)"], "샤프지수": m0["샤프지수"],
+                "소르티노": m0["소르티노"]}}]).to_excel(
+                xw, sheet_name="1_기존구성", index=False)
+            fdf.to_excel(xw, sheet_name="2_편입효과", index=False)
+            if drows:
+                pd.DataFrame(drows).to_excel(xw, sheet_name="3_최악의월분기",
+                                             index=False)
+            if srows:
+                pd.DataFrame(srows).to_excel(xw, sheet_name="4_재원별비교",
+                                             index=False)
+            pd.DataFrame(list(fx_settings.items()),
+                         columns=["항목", "값"]).to_excel(
+                xw, sheet_name="5_설정", index=False)
+        g1.download_button("📊 엑셀 파일 받기", buf.getvalue(),
+                           f"add_impact_{pd.Timestamp.now():%Y%m%d_%H%M}.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           key="dl_fixed", width="stretch")
+    except Exception as ex:
+        g1.error(f"엑셀 생성 실패: {ex}")
+    g2.download_button("📄 편입 효과 CSV", fdf.to_csv(index=False).encode("utf-8-sig"),
                        f"add_impact_{pd.Timestamp.now():%Y%m%d_%H%M}.csv",
                        "text/csv", width="stretch")
     st.caption("과거 데이터를 기준으로 계산한 결과이며, 미래에도 같은 효과가 나타난다는 "
@@ -4055,7 +4130,7 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
     st.subheader("2️⃣ 후보 종목 (Candidates)")
     cand_live, cand_all, cand_bad = render_ticker_table(
         state_key="_cand_df", editor_key="_cand_editor", gen_key="_cand_gen",
-        cols=CAND_COLS, title="자산 추가 효과 · 후보", min_rows=2, max_rows=50,
+        cols=CAND_COLS, title="자산 추가 효과 · 후보", min_rows=1, max_rows=50,
         count_label="후보 수",
         help_text="추가를 고민 중인 종목을 넣으세요. **15~30개**가 적당합니다. "
                   "너무 많으면 계산이 길어지고, 1등이 우연일 가능성도 커집니다.",
@@ -4354,7 +4429,46 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
         st.caption("검증 구간(표본외) 성과입니다.")
 
     st.divider()
-    st.download_button("📄 결과 CSV", rdf.to_csv().encode("utf-8-sig"),
+    st.subheader("📥 결과 내보내기")
+    cs_settings = {
+        "방식": f"최적 조합 탐색 ({mode})",
+        "기존 구성": ", ".join(base_use),
+        "후보": ", ".join(cand_use),
+        "추가 종목 수": f"{int(n_add)}개",
+        "평가한 조합": f"{len(uniq):,}가지",
+        "목적": goal,
+        "위험 정의": risk_name,
+        "최적화 기준일": str(opt_date.date()),
+        "학습 기간": f"{train_label} ({train_px.index[0].date()} ~ {opt_date.date()})",
+        "검증 구간": f"{opt_date.date()} ~ {last.date()}",
+        "리밸런싱": rebal,
+        "종목별 최대 비중": f"{wmax_pct}%",
+        "벤치마크": bench_norm or "-",
+        "기준 통화": base_ccy,
+        "거래비용": f"{cost_bp:.0f}bp (편도)",
+        "생성 시각": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    h1, h2 = st.columns(2)
+    try:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
+            rdf.to_excel(xw, sheet_name="1_상위조합")
+            if not fdf.empty:
+                fdf.to_excel(xw, sheet_name="2_채택빈도", index=False)
+            bw2.to_excel(xw, sheet_name="3_1위조합비중", index=False)
+            if curves:
+                pd.DataFrame({k: equity_curve(v) for k, v in curves.items()}).to_excel(
+                    xw, sheet_name="4_성과추이")
+            pd.DataFrame(list(cs_settings.items()),
+                         columns=["항목", "값"]).to_excel(
+                xw, sheet_name="5_설정", index=False)
+        h1.download_button("📊 엑셀 파일 받기", buf.getvalue(),
+                           f"candidate_search_{pd.Timestamp.now():%Y%m%d_%H%M}.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           key="dl_cand", width="stretch")
+    except Exception as ex:
+        h1.error(f"엑셀 생성 실패: {ex}")
+    h2.download_button("📄 결과 CSV", rdf.to_csv().encode("utf-8-sig"),
                        f"candidate_search_{pd.Timestamp.now():%Y%m%d_%H%M}.csv",
                        "text/csv", width="stretch")
     st.caption("후보가 많을수록 상위권이 우연히 좋아 보일 가능성이 커집니다. "
@@ -4622,8 +4736,107 @@ def render_correlations(base_ccy, start_date, end_date, use_div, fx_hedge, gap_f
                                        "실효 종목 수": "{:.1f}", "최저 쌍": "{:.2f}",
                                        "최고 쌍": "{:.2f}"}), width="stretch")
 
+    # ---------------- 국면별 · 위기별 ----------------
+    st.subheader("7️⃣ 국면별·위기별 상관관계 (By Regime & Crisis)")
+    st.caption("**분산투자가 가장 시험받는 지점입니다.** 평상시 낮던 상관관계가 하락 "
+               "국면이나 위기에 함께 올라가면, 정작 방어가 필요한 순간에 분산 효과가 "
+               "줄어듭니다.")
+    if len(tickers) < 2:
+        st.info("2개 이상의 종목이 필요합니다.")
+    else:
+        with st.expander("펼쳐서 계산하기 (기준 지수를 추가로 조회합니다)",
+                         expanded=False):
+            rc1, rc2 = st.columns([2, 1])
+            ref_c = rc1.text_input("국면 판정 기준 지수", value="^GSPC",
+                                   key="_corr_ref",
+                                   help="이 지수를 기준으로 강세·약세·횡보를 나눕니다.")
+            bear_c = rc2.slider("약세장 기준 (%)", 5, 40, 20, step=1,
+                                key="_corr_bear") / 100
+            use_crisis = st.checkbox("과거 위기 구간도 함께 보기", value=True,
+                                     key="_corr_crisis",
+                                     help="닷컴 붕괴·금융위기·코로나·긴축 발작 등 "
+                                          "미리 정의된 구간을 사용합니다.")
+
+            if st.button("🔗 국면별 상관관계 계산", width="stretch", key="_corr_reg_go"):
+                st.session_state["_corr_reg_run"] = True
+
+            if st.session_state.get("_corr_reg_run"):
+                ref_n = normalize_ticker(ref_c)[0] if ref_c.strip() else "^GSPC"
+                lo_c = (min(pd.Timestamp(v[0]) for v in CRISIS_PRESETS.values())
+                        if use_crisis else pd.Timestamp(start_date))
+                fs = min(pd.Timestamp(start_date), lo_c - pd.DateOffset(months=6))
+                try:
+                    with st.spinner("기준 지수 조회 중..."):
+                        px2, _m2, _f2 = build_price_frame(
+                            tickers + [ref_n], fs, end_date, base_ccy,
+                            use_div, fx_hedge, gap_fill)
+                except Exception as ex:
+                    st.error(f"데이터를 가져오지 못했습니다: {ex}")
+                    px2 = None
+
+                if px2 is not None and ref_n in px2.columns:
+                    tk2 = [x for x in tickers if x in px2.columns]
+                    R2 = corr_returns(px2[tk2], freq)
+                    lab2 = classify_regime(px2[ref_n], bear=bear_c, bull=bear_c)
+                    lab2 = lab2.reindex(R2.index).ffill()
+
+                    rows_r, mats = {}, {}
+                    for reg in ["강세", "횡보", "약세"]:
+                        sel = lab2 == reg
+                        if sel.sum() < 20:
+                            continue
+                        cm = R2[sel].corr()
+                        mats[reg] = cm
+                        rho_r, eff_r = diversification_stats(cm)
+                        rows_r[reg] = {"표본": int(sel.sum()), "평균 상관계수": rho_r,
+                                       "실효 종목 수": eff_r}
+                    if use_crisis:
+                        cmask = pd.Series(False, index=R2.index)
+                        for _nm, (a_, b_) in CRISIS_PRESETS.items():
+                            cmask |= ((R2.index >= pd.Timestamp(a_)) &
+                                      (R2.index <= pd.Timestamp(b_)))
+                        if cmask.sum() >= 20:
+                            cm = R2[cmask].corr()
+                            mats["위기 구간"] = cm
+                            rho_r, eff_r = diversification_stats(cm)
+                            rows_r["위기 구간"] = {"표본": int(cmask.sum()),
+                                              "평균 상관계수": rho_r,
+                                              "실효 종목 수": eff_r}
+                    rho_a2, eff_a2 = diversification_stats(R2.corr())
+                    rows_r["전체"] = {"표본": len(R2), "평균 상관계수": rho_a2,
+                                    "실효 종목 수": eff_a2}
+
+                    st.session_state["_corr_reg_result"] = pd.DataFrame(rows_r).T
+                    st.dataframe(pd.DataFrame(rows_r).T.style.format(
+                        {"표본": "{:.0f}", "평균 상관계수": "{:.3f}",
+                         "실효 종목 수": "{:.2f}"}), width="stretch")
+
+                    if "강세" in rows_r and "약세" in rows_r:
+                        d_ = (rows_r["약세"]["평균 상관계수"] -
+                              rows_r["강세"]["평균 상관계수"])
+                        if d_ > 0.1:
+                            st.warning(
+                                f"약세장 평균 상관계수가 강세장보다 **{d_:+.2f}** 높습니다. "
+                                f"실효 종목 수도 {rows_r['강세']['실효 종목 수']:.1f}개 → "
+                                f"**{rows_r['약세']['실효 종목 수']:.1f}개** 로 줄어듭니다.")
+                        elif d_ < -0.05:
+                            st.success(f"약세장 평균 상관계수가 강세장보다 "
+                                       f"**{d_:+.2f}** 낮습니다. 하락 국면에서도 "
+                                       f"분산이 유지되는 구성입니다.")
+
+                    if mats:
+                        tabs_r = st.tabs([f"{k} 행렬" for k in mats])
+                        for tb, (rk, cm) in zip(tabs_r, mats.items()):
+                            with tb:
+                                st.dataframe(cm.round(2).style.format("{:.2f}")
+                                             .map(_corr_color), width="stretch")
+                    st.caption("국면 구간이 언제부터 언제까지였는지, 국면마다 각 자산이 "
+                               "어떤 성과를 냈는지는 **📉 시장 국면 분석** 화면에서 "
+                               "볼 수 있습니다. 위기 구간의 낙폭과 회복 기간은 "
+                               "**🌩 스트레스 테스트** 화면에 있습니다.")
+
     # ---------------- 롤링 ----------------
-    st.subheader("7️⃣ 상관관계 추이 (Rolling Correlation)")
+    st.subheader("8️⃣ 상관관계 추이 (Rolling Correlation)")
     r1, r2, r3 = st.columns([2, 2, 1])
     pick_a = r1.selectbox("종목 A", tickers, index=0, key="_corr_a")
     others = [t for t in tickers if t != pick_a] or tickers
@@ -4669,6 +4882,9 @@ def render_correlations(base_ccy, start_date, end_date, use_div, fx_hedge, gap_f
             pairs.to_excel(xw, sheet_name="2_쌍별상관", index=False)
             if not pdf.empty:
                 pdf.to_excel(xw, sheet_name="3_기간별")
+            regr = st.session_state.get("_corr_reg_result")
+            if regr is not None and not regr.empty:
+                regr.to_excel(xw, sheet_name="3_국면별상관")
             if cl is not None:
                 gg = {}
                 for tk_, g in cl.items():
@@ -4693,7 +4909,7 @@ def render_correlations(base_ccy, start_date, end_date, use_div, fx_hedge, gap_f
         st.download_button("📊 엑셀 파일 받기", buf.getvalue(),
                            f"correlations_{pd.Timestamp.now():%Y%m%d_%H%M}.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           width="stretch")
+                           key="dl_corr", width="stretch")
     except Exception as ex:
         st.error(f"엑셀 생성 실패: {ex}")
     st.caption("상관관계는 과거 데이터에서 계산된 값이며 앞으로도 유지된다는 보장이 없습니다. "
@@ -5362,7 +5578,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         x1.download_button("📊 엑셀 파일 받기 (차트 포함)", xb,
                            f"optimization_{pd.Timestamp.now():%Y%m%d_%H%M}.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           width="stretch")
+                           key="dl_opt", width="stretch")
     except Exception as ex:
         x1.error(f"엑셀 생성 실패: {ex}")
     x2.download_button("📄 최적 비중 CSV", alloc.to_csv(index=False).encode("utf-8-sig"),
@@ -6058,7 +6274,7 @@ try:
         "📊 엑셀 파일 받기 (차트 포함)", xlsx_bytes,
         f"portfolio_analysis_{pd.Timestamp.now():%Y%m%d_%H%M}.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        width="stretch")
+        key="dl_analysis", width="stretch")
 except Exception as e:
     e1.error(f"엑셀 생성 실패: {e}")
 
