@@ -1772,6 +1772,30 @@ def efficient_frontier(mu, cov, n_points=30, wmin=0.0, wmax=1.0):
 # 목표 제약이 있는 일반 최적화
 # ======================================================================
 # ---------------------- 벤치마크 대비 지표 ----------------------
+def rel_metrics(rp: pd.Series, rb: pd.Series) -> dict:
+    """
+    벤치마크 대비 상대성과.
+      · 초과수익률 — 연율 수익률의 차이
+      · 추적오차   — 액티브 수익(포트 − 벤치)의 연율 변동성
+      · 정보비율   — 초과수익률 / 추적오차. 위험 한 단위당 초과수익
+      · 승률       — 벤치마크를 이긴 날의 비율
+    """
+    df = pd.concat([rp, rb], axis=1).dropna()
+    if len(df) < 20:
+        return {k: np.nan for k in
+                ("초과수익률(%p)", "추적오차(%)", "정보비율", "승률(%)")}
+    a, b = df.iloc[:, 0], df.iloc[:, 1]
+    act = a - b
+    te = float(act.std() * np.sqrt(TRADING_DAYS))
+    ann_a = float((1 + a).prod() ** (TRADING_DAYS / len(a)) - 1)
+    ann_b = float((1 + b).prod() ** (TRADING_DAYS / len(b)) - 1)
+    excess = ann_a - ann_b
+    return {"초과수익률(%p)": excess * 100,
+            "추적오차(%)": te * 100,
+            "정보비율": (excess / te) if te > 1e-12 else np.nan,
+            "승률(%)": float((act > 0).mean() * 100)}
+
+
 def bench_metrics(rp: pd.Series, rb: pd.Series, rf=0.0) -> dict:
     """알파(연)·베타·R²·상승/하락장 포착률."""
     df = pd.concat([rp, rb], axis=1).dropna()
@@ -4347,6 +4371,11 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
         st.caption(f"후보 **{n_c}개** 중 **{n_add}개** 조합 → **{n_comb:,}가지** · 방식 **{mode}**"
                    + ("" if mode == "전수 탐색" else
                       f" (한도 {CAND_MAX_COMB:,}가지 초과. 1개씩 순차로 고릅니다)"))
+        if mode != "전수 탐색":
+            st.warning("⚠️ **단계적 선택은 계산량을 줄이기 위한 근사 방식이며, 전체 조합의 "
+                       "최적해를 보장하지 않습니다.** 한 종목씩 순차로 고르기 때문에 "
+                       "'A와 B가 함께 있을 때만 좋아지는 조합'은 놓칠 수 있습니다. "
+                       "후보 수나 추가 종목 수를 줄이면 전수 탐색으로 바뀝니다.")
 
     run = st.button("🔎 조합 탐색", type="primary", width="stretch",
                     disabled=bool(bad) or n_comb == 0 or len(base_tk) < 1)
@@ -4511,8 +4540,11 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
         oos = bt(oos_px, W)
         m = perf_row(oos, rf_rate) if oos is not None else {}
         added = " + ".join(r["combo"])
+        _wmap = {t_: float(x_) * 100 for t_, x_ in zip(r["tickers"], r["w"])}
+        _cw = " · ".join(f"{c_} {_wmap.get(c_, 0):.1f}%" for c_ in r["combo"])
         rows.append({
             "순위": rank, "추가 종목": added,
+            "후보 편입비중": _cw,
             "학습 점수": r["score"],
             "표본외 수익률(%)": m.get("수익률(연,%)", np.nan),
             "표본외 변동성(%)": m.get("변동성(연,%)", np.nan),
@@ -4523,17 +4555,19 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
 
     if base_oos is not None:
         bm = perf_row(base_oos, rf_rate)
-        rdf.loc["기존"] = ["(추가 없음)", np.nan, bm["수익률(연,%)"], bm["변동성(연,%)"],
-                          bm["샤프지수"], bm["최대낙폭(%)"]]
+        rdf.loc["기존"] = ["(추가 없음)", "-", np.nan, bm["수익률(연,%)"],
+                          bm["변동성(연,%)"], bm["샤프지수"], bm["최대낙폭(%)"]]
     if bench_oos is not None:
         cm = perf_row(bench_oos, rf_rate)
-        rdf.loc["벤치마크"] = [bench_norm, np.nan, cm["수익률(연,%)"], cm["변동성(연,%)"],
-                            cm["샤프지수"], cm["최대낙폭(%)"]]
+        rdf.loc["벤치마크"] = [bench_norm, "-", np.nan, cm["수익률(연,%)"],
+                            cm["변동성(연,%)"], cm["샤프지수"], cm["최대낙폭(%)"]]
     st.dataframe(rdf.style.format({"학습 점수": "{:.3f}", "표본외 수익률(%)": "{:.2f}",
                                    "표본외 변동성(%)": "{:.2f}", "표본외 샤프": "{:.2f}",
                                    "표본외 MDD(%)": "{:.2f}"}, na_rep="-"),
                  width="stretch")
-    st.caption("**MDD는 음수**입니다. −20%보다 −15%가 낙폭이 얕아 더 좋습니다.")
+    st.caption("**MDD는 음수**입니다. −20%보다 −15%가 낙폭이 얕아 더 좋습니다. "
+               "**후보 편입비중**은 최적화 결과 그 후보가 실제로 받은 비중입니다. "
+               "0%에 가깝다면 조합에 뽑혔어도 실질적으로는 담기지 않은 것입니다.")
 
     # 순위 유지 여부 진단
     valid = rdf.iloc[:len(ranked)]["표본외 샤프"].dropna()
@@ -5270,6 +5304,16 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         st.caption("두 값은 **이상 / 이하** 조건으로 적용됩니다. "
                    "동시에 만족할 수 없으면 달성 가능한 수치를 알려드립니다.")
 
+    st.markdown("**현재 비중 대비 변경 제한** — 한 번에 크게 바꾸지 않도록 묶습니다")
+    m1, m2 = st.columns([1, 3])
+    use_band = m1.checkbox("변경폭 제한", key="_opt_useband")
+    band_pp = (m2.slider("종목당 최대 변경 (%p)", 1, 50, 10, step=1,
+                         key="_opt_band",
+                         help="현재 비중에서 이 폭을 넘지 않게 제한합니다. "
+                              "예를 들어 10%p면 현재 30%인 종목은 20~40% 사이에서만 "
+                              "움직입니다. 회전율과 거래비용을 줄이는 실무적 제약입니다.")
+               if use_band else None)
+
     p1, p2, p3, p4 = st.columns(4)
     reopt = p4.selectbox("재최적화 주기", list(REOPT_FREQ), index=0, key="_opt_reopt",
                          help="'한 번만'은 기준일에 정한 비중을 끝까지 유지합니다. "
@@ -5372,6 +5416,22 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
     # 같은 한도가 적용되는 문제가 있었다)
     wmin, wmax = lo, hi
 
+    # 현재 비중 대비 변경폭 제한을 종목별 상하한에 합친다
+    if use_band and band_pp:
+        _cur = pd.to_numeric(live.set_index("티커")["현재 비중(%)"],
+                             errors="coerce").reindex(tickers).fillna(0).values
+        _cur = _cur / _cur.sum() if _cur.sum() > 0 else np.full(len(tickers),
+                                                               1 / len(tickers))
+        _bd = band_pp / 100.0
+        wmin = np.maximum(wmin, _cur - _bd)
+        wmax = np.minimum(wmax, _cur + _bd)
+        wmin = np.clip(wmin, 0.0, 1.0)
+        wmax = np.clip(wmax, 0.0, 1.0)
+        if wmin.sum() > 1.0 + 1e-9 or wmax.sum() < 1.0 - 1e-9:
+            st.error(f"변경폭 {band_pp}%p 로는 합계 100%를 맞출 수 없습니다. "
+                     f"폭을 넓히거나 종목별 최소·최대를 완화해주세요.")
+            return
+
     ok, msg, ret_max, vol_min = feasibility(mu, cov, wmin, wmax, min_ret, max_vol)
     if not ok:
         st.error("🚫 " + msg)
@@ -5403,6 +5463,8 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         _cons.append(f"수익률 ≥ {min_ret*100:.2f}%")
     if max_vol is not None:
         _cons.append(f"변동성 ≤ {max_vol*100:.2f}%")
+    if use_band and band_pp:
+        _cons.append(f"변경폭 ±{band_pp}%p")
     st.success(f"✅ 계산 완료 · 목적: **{goal}** · 위험 정의: **{_rn}**"
                + (f" · 제약: {' · '.join(_cons)}" if _cons else "")
                + f"\n\n학습 기간 {train_label} ({train_px.index[0].date()} ~ "
@@ -6358,7 +6420,49 @@ st.caption("초록색 = 각 지표에서 가장 좋은 값. **MDD는 음수이�
            "사고파는지를 뜻하며, 거래비용을 입력했다면 성과에 이미 반영돼 있습니다.")
 
 # ---------------- 포트폴리오별 상세 ----------------
-st.subheader("5️⃣ 연도별 성과 (Calendar Year Returns)")
+# ---------------- 상대성과 ----------------
+_ports = [n for n, v in series.items() if v["kind"] == "portfolio"]
+_benches = [n for n, v in series.items() if v["kind"] != "portfolio"]
+if _ports and _benches:
+    st.subheader("5️⃣ 벤치마크 대비 (Relative Performance)")
+    _bpick = st.selectbox("기준 벤치마크", _benches, key="_rel_bench")
+    _br = series[_bpick]["returns"]
+    st.caption("**초과수익률**은 연율 수익률의 차이, **추적오차**는 벤치마크와 얼마나 "
+               "다르게 움직였는지, **정보비율**은 추적오차 한 단위당 초과수익입니다. "
+               "**포착률**은 벤치마크가 오를 때/내릴 때 그중 몇 %를 따라갔는지로, "
+               "상승은 높고 하락은 낮을수록 유리합니다.")
+    _rrows = {}
+    for _n in _ports:
+        _m = rel_metrics(series[_n]["returns"], _br)
+        _m.update(bench_metrics(series[_n]["returns"], _br, rf_rate))
+        _rrows[_n] = _m
+    _rdf = pd.DataFrame(_rrows).T
+    st.dataframe(_rdf.style.format("{:.2f}", na_rep="-"), width="stretch")
+
+    if use_div:
+        st.warning("⚠️ 포트폴리오는 **배당 재투자(총수익)** 기준인데, 벤치마크가 "
+                   "`^KS11`·`^GSPC` 같은 **가격지수**라면 배당이 빠져 있어 "
+                   "포트폴리오가 유리하게 보입니다. 배당까지 포함한 비교를 원하시면 "
+                   "총수익 ETF(예: SPY·ACWI)를 벤치마크로 쓰세요.")
+
+    _fex = go.Figure()
+    for _n in _ports:
+        _act = (series[_n]["returns"] - _br).dropna()
+        if len(_act) < 2:
+            continue
+        _cum = ((1 + _act).cumprod() - 1) * 100
+        _fex.add_trace(go.Scatter(x=_cum.index, y=_cum.values, name=_n,
+                                  line=dict(color=color_of.get(_n), width=2)))
+    _fex.add_hline(y=0, line_dash="dot", line_color="#cbd5e1")
+    _fex.update_layout(height=320, hovermode="x unified",
+                       margin=dict(l=0, r=0, t=30, b=0),
+                       yaxis=dict(title=None, ticksuffix="%"),
+                       legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+    st.plotly_chart(_fex, width="stretch")
+    st.caption(f"**{_bpick}** 대비 누적 초과수익입니다. 우상향이면 벤치마크를 "
+               f"앞서고 있다는 뜻입니다.")
+
+st.subheader("6️⃣ 연도별 성과 (Calendar Year Returns)")
 st.caption("연도별로 잘라 보면 특정 해에만 좋았는지, 꾸준했는지가 드러납니다. "
            "약세장이 있던 해를 눈여겨보세요.")
 yr_rows = {}
@@ -6369,7 +6473,7 @@ ydf = pd.DataFrame(yr_rows)
 st.dataframe(ydf.style.format("{:.2f}", na_rep="-").map(_heat_color),
              width="stretch")
 
-st.subheader("6️⃣ 적립식 투자 (Dollar-Cost Averaging)")
+st.subheader("7️⃣ 적립식 투자 (Dollar-Cost Averaging)")
 st.caption("목돈을 한 번에 넣는 대신 매달 일정액을 넣었다면 어땠을지 계산합니다. "
            "나중에 넣은 돈일수록 투자 기간이 짧으므로, 단순 수익률보다 "
            "**내부수익률(IRR)** 이 올바른 비교 기준입니다.")
@@ -6411,7 +6515,7 @@ if mon_amt > 0 or init_amt > 0:
                                     "내부수익률 IRR(%)": "{:.2f}"}, na_rep="-"),
                      width="stretch")
 
-st.subheader("7️⃣ 포트폴리오별 상세 (Details)")
+st.subheader("8️⃣ 포트폴리오별 상세 (Details)")
 for name, v in series.items():
     if v["kind"] != "portfolio":
         continue
@@ -6459,10 +6563,33 @@ for name, v in series.items():
                            for t in contrib.index],
             })
             cdf["총성장 대비"] = cdf["기여도(%p)"] / total_g * 100 if total_g else np.nan
+
+            # 위험기여도 — 수익과 위험을 나란히 봐야 편중이 드러난다
+            try:
+                _tks = list(contrib.index)
+                _wv = np.array([v["weights"].get(t_, 0.0) for t_ in _tks], dtype=float)
+                _wv = _wv / _wv.sum() if _wv.sum() > 0 else _wv
+                _cov = (prices[_tks].pct_change().dropna().cov() * TRADING_DAYS).values
+                _rc = risk_contributions(_wv, _cov)
+                _tot_rc = float(_rc.sum())
+                cdf["위험기여도(%)"] = (_rc / _tot_rc * 100) if _tot_rc > 0 else np.nan
+            except Exception:
+                cdf["위험기여도(%)"] = np.nan
+
             st.dataframe(cdf.style.format({"기여도(%p)": "{:+.2f}", "비중(%)": "{:.2f}",
-                                           "총성장 대비": "{:.1f}%"}),
+                                           "총성장 대비": "{:.1f}%",
+                                           "위험기여도(%)": "{:.1f}"}, na_rep="-"),
                          width="stretch", hide_index=True)
-            st.caption(f"기여도 합계 **{total_g:+.2f}%** = 포트폴리오 총 성장률")
+            st.caption(f"기여도 합계 **{total_g:+.2f}%** = 포트폴리오 총 성장률 · "
+                       f"**위험기여도**는 전체 변동성에서 각 종목이 차지하는 몫입니다. "
+                       f"비중보다 위험기여도가 훨씬 크다면 그 종목에 위험이 쏠려 있다는 뜻입니다.")
+            try:
+                _mx = cdf.loc[cdf["위험기여도(%)"].idxmax()]
+                if float(_mx["위험기여도(%)"]) > float(_mx["비중(%)"]) * 1.5:
+                    st.info(f"**{_mx['종목']}** 은 비중 {_mx['비중(%)']:.1f}% 인데 "
+                            f"위험은 {_mx['위험기여도(%)']:.1f}% 를 차지합니다.")
+            except Exception:
+                pass
         except Exception as ex:
             st.warning(f"기여도를 계산하지 못했습니다: {ex}")
 
