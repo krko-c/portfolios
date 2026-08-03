@@ -280,6 +280,39 @@ def _fi_get(fi, *keys):
     return None
 
 
+def _is_symbol_list(name, ticker=None) -> bool:
+    """
+    야후가 종목명 대신 '유사 심볼 목록'을 돌려준 경우인지 판별한다.
+    예: "240810.KS,0P00017YB3,330566"  ← 원익IPS 인데 심볼 나열이 옴
+    회사명에도 콤마가 흔하므로("HANMI Semiconductor Co., Lt"),
+    조각이 전부 '숫자를 포함하거나 거래소 접미사가 붙은 심볼' 형태일 때만 걸러낸다.
+    """
+    if not name:
+        return False
+    s = str(name).strip()
+    if ticker and s.upper().startswith(str(ticker).upper() + ","):
+        return True
+    if re.search(r"0P[0-9A-Z]{8}", s):          # 모닝스타 펀드 코드
+        return True
+    parts = [x.strip() for x in s.split(",")]
+    if len(parts) < 2:
+        return False
+
+    def symbolish(x):
+        if not x or " " in x:
+            return False
+        if not re.fullmatch(r"[0-9A-Z.^-]{2,15}", x):
+            return False
+        return bool(re.search(r"\d", x)) or bool(re.search(r"\.[A-Z]{1,3}$", x))
+
+    return all(symbolish(x) for x in parts)
+
+
+def _clean_name(name, ticker=None) -> str:
+    """오염된 종목명은 버린다."""
+    return "" if _is_symbol_list(name, ticker) else (str(name).strip() if name else "")
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def probe_ticker(candidates: tuple):
     """
@@ -325,10 +358,20 @@ def probe_ticker(candidates: tuple):
             except Exception:
                 ccy = None
 
+        nm_ = _clean_name(hm.get("longName"), cand) or \
+            _clean_name(hm.get("shortName"), cand)
+        if not nm_:
+            # meta 가 오염됐거나 비어 있으면 info 로 한 번 더 시도한다
+            try:
+                _inf = tk.info or {}
+                nm_ = (_clean_name(_inf.get("longName"), cand) or
+                       _clean_name(_inf.get("shortName"), cand))
+            except Exception:
+                nm_ = ""
         info = {
             "ticker": cand,
             "currency": (ccy or _suffix_currency(cand)).upper(),
-            "name": hm.get("longName") or hm.get("shortName") or "",
+            "name": nm_,
             "rows": len(h),
             "first": pd.to_datetime(h.index[0]).date(),
             "last": pd.to_datetime(h.index[-1]).date(),
@@ -359,7 +402,8 @@ def get_name(ticker: str) -> str:
             info = getattr(yf.Ticker(ticker), fn)
             info = info() if callable(info) else info
             if info:
-                nm = info.get("shortName") or info.get("longName")
+                nm = (_clean_name(info.get("shortName"), ticker) or
+                      _clean_name(info.get("longName"), ticker))
                 if nm:
                     return nm
         except Exception:
@@ -392,9 +436,12 @@ def load_etf_holdings(ticker: str):
     w = pd.to_numeric(df[pct_col], errors="coerce")
     if w.max() is not None and w.max() <= 1.5:      # 0~1 소수로 오는 경우
         w = w * 100
+    _syms = [str(x).strip() for x in df.index]
+    _nms = ([_clean_name(v, s) for v, s in zip(df[name_col].astype(str).values, _syms)]
+            if name_col else [""] * len(_syms))
     out = pd.DataFrame({
-        "티커": [str(x).strip() for x in df.index],
-        "종목명": (df[name_col].astype(str).values if name_col else ""),
+        "티커": _syms,
+        "종목명": _nms,
         "비중(%)": w.round(2).values,
     })
     out = out[out["티커"].str.strip() != ""].reset_index(drop=True)
@@ -670,7 +717,8 @@ def render_ticker_table(*, state_key, editor_key, gen_key, cols, weight_col=None
                     res.append(t); labs.append("❌ 확인 불가"); bad.append(t)
                 else:
                     res.append(r["ticker"])
-                    labs.append(f"✅ {r.get('name') or '(종목명 없음)'} · {r['currency']}")
+                    _nm = r.get("name") or f"{r['ticker']} (종목명 미제공)"
+                    labs.append(f"✅ {_nm} · {r['currency']}")
         f["티커"], f["종목명"] = res, labs
     else:
         f["종목명"] = ""
@@ -5600,6 +5648,22 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
 if "_pending_tool" in st.session_state:
     st.session_state["_tool"] = st.session_state.pop("_pending_tool")
 
+# 화면 선택을 주소(URL)에 남긴다.
+# 세션이 끊겨 상태가 비워져도 주소가 남아 있으면 보던 화면으로 복원된다.
+_ALL_TOOLS = [x for _, items in TOOL_GROUPS for x in items]
+try:
+    _qp = st.query_params
+    if "_tool" not in st.session_state:
+        _from_url = _qp.get("tool")
+        if isinstance(_from_url, list):
+            _from_url = _from_url[0] if _from_url else None
+        for _t in _ALL_TOOLS:
+            if _from_url and _from_url == _t.split(" ", 1)[-1]:
+                st.session_state["_tool"] = _t
+                break
+except Exception:
+    _qp = None
+
 with st.sidebar:
     st.session_state.setdefault("_tool", TOOL_DEFAULT)
     for grp, items in TOOL_GROUPS:
@@ -5610,8 +5674,17 @@ with st.sidebar:
                          type=("primary" if st.session_state["_tool"] == it
                                else "secondary")):
                 st.session_state["_tool"] = it
+                try:
+                    st.query_params["tool"] = it.split(" ", 1)[-1]
+                except Exception:
+                    pass
                 st.rerun()
     tool = st.session_state["_tool"]
+    try:
+        if _qp is not None and _qp.get("tool") != tool.split(" ", 1)[-1]:
+            st.query_params["tool"] = tool.split(" ", 1)[-1]
+    except Exception:
+        pass
 
 # 도움말은 설정이 필요 없으므로 사이드바를 더 그리지 않고 바로 표시한다
 if tool.endswith("도움말"):
@@ -5657,6 +5730,17 @@ with st.sidebar:
                                    "기준 통화에 맞는 금리를 넣으세요.") / 100
 
     st.divider()
+    if st.button("🔄 종목 정보 새로 조회", width="stretch",
+                 help="종목명·통화 조회 결과를 지우고 다시 받아옵니다. "
+                      "종목명이 이상하게 표시될 때 눌러보세요."):
+        for _fn in (probe_ticker, get_name, load_etf_holdings):
+            try:
+                _fn.clear()
+            except Exception:
+                pass
+        st.success("조회 결과를 비웠습니다. 표의 종목명이 다시 채워집니다.")
+        st.rerun()
+
     st.caption("**티커 예시**\n\n"
                "한국 `005930.KS` `086520.KQ`\n\n"
                "미국 `NVDA` `SPY` `QQQ`\n\n"
