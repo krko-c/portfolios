@@ -794,6 +794,47 @@ def render_ticker_table(*, state_key, editor_key, gen_key, cols, weight_col=None
     return live, list(live["티커"]), bad
 
 
+def assumptions_panel(*, rebalance=None, cost=None, initial_cost=True,
+                      period=None, bench=None, extra=None, path_note=False):
+    """
+    화면 하단에 이 결과의 계산 가정을 모아 보여준다.
+    가정이 화면 곳곳에 흩어져 있으면 사용자가 결과를 오해하기 쉽다.
+    """
+    with st.expander("📋 이 결과의 가정", expanded=False):
+        rows = []
+        if period:
+            rows.append(("분석 기간", period))
+        if rebalance:
+            rows.append(("리밸런싱", rebalance))
+        if cost is not None:
+            rows.append(("거래비용", f"편도 {cost:.0f}bp"
+                         + (" · 반영 안 함" if not cost else "")))
+            rows.append(("최초 구축비용",
+                         "포함 (첫날 전량 매수 가정)" if initial_cost
+                         else "제외 (이전부터 보유 가정)"))
+            rows.append(("회전율 표기", "매도+매수를 합한 총 매매비중"))
+        rows.append(("기준 통화", base_ccy))
+        rows.append(("환율", "제외 (현지통화 기준)" if fx_hedge
+                     else "포함 (기준통화 환산)"))
+        rows.append(("배당", "재투자 (총수익)" if use_div else "주가만 (배당 제외)"))
+        rows.append(("휴장일", "직전 종가로 채움" if gap_fill else "공통 거래일만 사용"))
+        if bench:
+            rows.append(("벤치마크", bench))
+        rows.append(("무위험 수익률", f"{rf_rate*100:.2f}%"))
+        if extra:
+            rows.extend(list(extra))
+        st.dataframe(pd.DataFrame(rows, columns=["항목", "설정"]),
+                     width="stretch", hide_index=True)
+        notes = ["세금·호가스프레드·시장충격은 반영하지 않습니다.",
+                 "상장폐지된 종목은 데이터에 없어 과거 성과가 실제보다 좋아 보일 수 "
+                 "있습니다(생존편향)."]
+        if path_note:
+            notes.insert(0, "**경로의존 지표**(조건부 낙폭·얼서지수·오메가)는 "
+                            "계산 편의를 위해 **매일 고정비중**을 가정해 구합니다. "
+                            "위에 선택한 리밸런싱 주기와 다를 수 있습니다.")
+        st.caption("· " + "\n\n· ".join(notes))
+
+
 def validate_setup(tickers, bad=None, weights=None, min_n=1,
                    need_weight=False, label="종목"):
     """
@@ -2879,10 +2920,15 @@ def guess_asset_kind(ticker: str, name: str = "") -> tuple:
         return "원자재", None, None, False
     if any(x in nm for x in ("BOND", "채권", "FIXED INCOME")):
         return "기타·혼합", 5.0, 40, False
-    return "주식", None, None, False
+    # 확실하지 않으면 주식으로 단정하지 않는다. 이름을 못 받아온 채권 ETF가
+    # 주식으로 처리되면 금리 충격이 통째로 빠진다.
+    if re.fullmatch(r"[A-Z]{1,5}", key) or re.fullmatch(r"\d{6}\.(KS|KQ)", key):
+        return "주식", None, None, False
+    return "기타·혼합", None, None, False
 
 
-def shock_asset(kind, dur, conv, beta, eq_bp, dy_bp, cs_bp, gold_pct, cm_pct):
+def shock_asset(kind, dur, conv, beta, eq_bp, dy_bp, cs_bp, gold_pct, cm_pct,
+                spread_dur=None):
     """
     자산 유형별로 충격을 적용한다. 반환은 요인별 변화율(%) 딕셔너리.
     유형마다 적용 요인이 다르며, 겹쳐 더하지 않는다.
@@ -2902,7 +2948,7 @@ def shock_asset(kind, dur, conv, beta, eq_bp, dy_bp, cs_bp, gold_pct, cm_pct):
     elif kind in ("국채", "회사채", "하이일드", "기타·혼합"):
         if dur:
             out["금리"] = (-dur * dy + 0.5 * (conv or 0.0) * dy ** 2) * 100
-        sd = SPREAD_DUR.get(kind, 0.0)
+        sd = SPREAD_DUR.get(kind, 0.0) if spread_dur is None else float(spread_dur)
         if sd:
             out["신용"] = -sd * cs * 100
         # 기타·혼합은 주식 성격이 섞였을 수 있어 사용자가 준 베타를 그대로 쓴다
@@ -2928,12 +2974,18 @@ def combine_shock(factors: dict, fx_pct: float) -> float:
 
 
 def estimate_betas(R: pd.DataFrame, mkt: pd.Series) -> dict:
-    """각 자산의 시장 베타. 충격을 자산별로 전이하는 데 쓴다."""
+    """
+    각 자산의 시장 베타. 종목마다 겹치는 날짜만 써서 따로 계산한다.
+    한 종목의 데이터가 짧다고 다른 종목의 표본까지 줄어들면 안 된다.
+    """
     out = {}
-    var = float(mkt.var())
     for c in R.columns:
         df = pd.concat([R[c], mkt], axis=1).dropna()
-        out[c] = float(df.iloc[:, 0].cov(df.iloc[:, 1]) / var) if var > 1e-18 else 0.0
+        if len(df) < 10:
+            out[c] = 0.0
+            continue
+        v = float(df.iloc[:, 1].var())
+        out[c] = float(df.iloc[:, 0].cov(df.iloc[:, 1]) / v) if v > 1e-18 else 0.0
     return out
 
 
@@ -3239,6 +3291,9 @@ def render_compare(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, 
                            key="dl_compare", width="stretch")
     except Exception as ex:
         st.error(f"엑셀 생성 실패: {ex}")
+    assumptions_panel(rebalance=rebal_c, cost=cost_bp,
+                      period=f"{main_px.index[0].date()} ~ {main_px.index[-1].date()}",
+                      bench=bench_n or "-")
     st.caption("모든 안을 같은 조건(리밸런싱·거래비용·기간)으로 다시 계산한 결과입니다. "
                "각 안을 만들 때의 설정과 다를 수 있습니다. "
                "교육·참고용이며 투자 자문이 아닙니다.")
@@ -3342,8 +3397,10 @@ def render_hypo_stress(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fi
         return
 
     _p = px if beta_freq == "일별" else px.resample("W-FRI").last()
-    R = _p[use_tk].pct_change().dropna()
-    mkt = _p[bench_n].pct_change().reindex(R.index).fillna(0)
+    # 종목별로 결측을 떨어내야 한 종목의 데이터 부족이 나머지 표본을 깎지 않는다.
+    # 시장수익률을 fillna(0) 하면 휴장일을 '0% 수익'으로 보아 베타가 낮아진다.
+    R = _p[use_tk].pct_change()
+    mkt = _p[bench_n].pct_change()
     betas = estimate_betas(R, mkt)
     bq = beta_quality(R, mkt)
 
@@ -3364,9 +3421,19 @@ def render_hypo_stress(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fi
             "자동판정": "✅" if auto else "⚠️ 확인 필요",
         })
     gdf = pd.DataFrame(guess)
+    # 티커뿐 아니라 베타 추정 조건이 바뀌어도 다시 계산해야 한다.
+    # 그러지 않으면 화면에는 '5년·일별'인데 값은 이전 '3년·주별'이 남는다.
+    _attr_sig = (tuple(use_tk), int(beta_yrs), beta_freq, bench_n,
+                 str(end_date), bool(use_div))
     if (akey not in st.session_state or
-            list(st.session_state[akey]["티커"]) != list(gdf["티커"])):
+            st.session_state.get("_hypo_attr_sig") != _attr_sig):
         st.session_state[akey] = gdf
+        st.session_state["_hypo_attr_sig"] = _attr_sig
+    elif st.button("🔄 추정값 다시 적용", key="_hypo_reattr",
+                   help="자동 추정한 베타·듀레이션으로 되돌립니다. "
+                        "직접 고친 값은 사라집니다."):
+        st.session_state[akey] = gdf
+        st.rerun()
 
     attr = st.data_editor(
         st.session_state[akey], num_rows="fixed", width="stretch", key="_hypo_attr_ed",
@@ -3386,10 +3453,14 @@ def render_hypo_stress(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fi
             "통화": st.column_config.TextColumn("통화", disabled=True, width="small"),
             "R²": st.column_config.NumberColumn("R²", disabled=True, format="%.2f",
                                                 width="small"),
-            "자동판정": st.column_config.TextColumn("자동판정", disabled=True,
-                                                width="small"),
+            "자동판정": st.column_config.SelectboxColumn(
+                "확인 상태", options=["✅", "⚠️ 확인 필요", "👤 확인함"],
+                width="medium",
+                help="자동 판정이 맞으면 그대로, 직접 고쳤으면 '👤 확인함'으로 "
+                     "바꿔주세요."),
         })
     st.session_state[akey] = attr
+    A = attr.set_index("티커")
 
     _need_check = attr[attr["자동판정"].astype(str).str.contains("확인")]
     if len(_need_check):
@@ -3432,7 +3503,17 @@ def render_hypo_stress(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fi
                                float(pre.get("cm", 0.0)), step=1.0,
                                key=f"_hypo_cm_{preset}")
 
-    if not st.button("⚡ 충격 적용", type="primary", width="stretch", key="_hypo_go"):
+    # 충격 설정이 바뀌면 결과를 무효화하고, 그 외 재실행에서는 결과를 유지한다.
+    # (버튼은 누른 그 실행에서만 True 라, 아래 위젯을 건드리면 결과가 사라진다)
+    _sig = (preset, eq_shock, dy_shock, cs_shock, fx_shock, gold_shock, cm_shock,
+            tuple(use_tk), tuple(np.round(live["비중(%)"].fillna(0).values, 4)),
+            tuple(map(str, attr.values.ravel())))
+    if st.session_state.get("_hypo_sig") != _sig:
+        st.session_state["_hypo_run"] = False
+        st.session_state["_hypo_sig"] = _sig
+    if st.button("⚡ 충격 적용", type="primary", width="stretch", key="_hypo_go"):
+        st.session_state["_hypo_run"] = True
+    if not st.session_state.get("_hypo_run"):
         st.info("👆 충격을 정한 뒤 **충격 적용**을 눌러주세요.")
         return
 
@@ -3441,16 +3522,16 @@ def render_hypo_stress(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fi
     if w.sum() <= 0:
         w = pd.Series(1.0, index=use_tk)
     w = w / w.sum() * 100
-    A = attr.set_index("티커")
 
     def run_shock(eq_, dy_, cs_, fx_, gold_, cm_):
         rows, total = [], 0.0
         for t_ in use_tk:
             a = A.loc[t_]
             kind = str(a["유형"])
+            _sd = st.session_state.get("_hypo_sd", {}).get(t_)
             f = shock_asset(kind, float(a["듀레이션"]) or None,
                             float(a["볼록성"]) or None, float(a["주식 베타"]),
-                            eq_, dy_, cs_, gold_, cm_)
+                            eq_, dy_, cs_, gold_, cm_, spread_dur=_sd)
             ccy = str(a["통화"])
             fx_e = fx_ if (not fx_hedge and ccy != base_ccy) else 0.0
             tot_e = combine_shock(f, fx_e)
@@ -3502,21 +3583,61 @@ def render_hypo_stress(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fi
 
     _by = {k: float((idf[f"{k}효과(%)"] * idf["비중(%)"] / 100).sum())
            for k in ("주식", "금리", "신용", "원자재", "환율")}
+    # 환율은 곱셈으로 적용되므로 단순 가중합과 실제 합계가 어긋난다.
+    # 그 차이를 '상호작용'으로 명시해 합계가 정확히 맞도록 한다.
+    _by["상호작용"] = total - sum(_by.values())
     st.markdown(f"가정한 충격에서 포트폴리오는 **{total:+.2f}%** 움직일 것으로 "
                 f"추정됩니다.")
     st.dataframe(pd.DataFrame([_by]).T.rename(columns={0: "기여(%p)"})
                  .style.format("{:+.2f}"), width="stretch")
+    st.caption(f"합계 **{sum(_by.values()):+.2f}%p** = 예상 손익. "
+               f"**상호작용**은 환율이 곱셈으로 적용되면서 생기는 차이입니다 — "
+               f"자산이 크게 빠진 상태에서 환율이 움직이면 그 효과가 줄거나 커집니다.")
+
+    # 스프레드 듀레이션은 자산별로 다르다. 유형 기본값을 쓰되 직접 고칠 수 있게 한다.
+    with st.expander("신용 스프레드 민감도 조정", expanded=False):
+        st.caption("종합채권(AGG·BND)이나 MBS는 순수 회사채보다 신용 민감도가 낮습니다. "
+                   "유형별 기본값이 맞지 않으면 여기서 고치세요. "
+                   "단위는 **스프레드 듀레이션(연)** 입니다.")
+        _sd_key = "_hypo_sd"
+        _sd_rows = [{"티커": t_, "유형": str(A.loc[t_, "유형"]),
+                     "스프레드 듀레이션": float(
+                         st.session_state.get(_sd_key, {}).get(
+                             t_, SPREAD_DUR.get(str(A.loc[t_, "유형"]), 0.0)))}
+                    for t_ in use_tk]
+        _sd_df = st.data_editor(
+            pd.DataFrame(_sd_rows), num_rows="fixed", width="stretch",
+            key="_hypo_sd_ed", hide_index=True,
+            column_config={
+                "티커": st.column_config.TextColumn("티커", disabled=True),
+                "유형": st.column_config.TextColumn("유형", disabled=True),
+                "스프레드 듀레이션": st.column_config.NumberColumn(
+                    "스프레드 듀레이션", min_value=0.0, max_value=15.0, step=0.1,
+                    format="%.1f")})
+        st.session_state[_sd_key] = dict(zip(_sd_df["티커"],
+                                             _sd_df["스프레드 듀레이션"]))
     _big = sorted(_by.items(), key=lambda x: x[1])
     if _big and _big[0][1] < -0.01:
         st.caption(f"손실의 가장 큰 원인은 **{_big[0][0]}** 요인입니다 "
                    f"({_big[0][1]:+.2f}%p).")
 
     # ---------------- 커버리지 ----------------
-    _auto = int((attr["자동판정"].astype(str) == "✅").sum())
-    _man = len(attr) - _auto
-    c1, c2 = st.columns(2)
-    c1.metric("자동 판정된 자산", f"{_auto}/{len(attr)}개")
-    c2.metric("확인이 필요한 자산", f"{_man}개")
+    _wmap = {t_: float(w[t_]) for t_ in use_tk}
+    _auto_w = sum(_wmap.get(r["티커"], 0) for _, r in attr.iterrows()
+                  if str(r["자동판정"]) == "✅")
+    _chk_w = sum(_wmap.get(r["티커"], 0) for _, r in attr.iterrows()
+                 if str(r["자동판정"]).startswith("👤"))
+    _man_w = 100.0 - _auto_w - _chk_w
+    c1, c2, c3 = st.columns(3)
+    c1.metric("자동 판정", f"{_auto_w:.1f}%")
+    c2.metric("사용자 확인", f"{_chk_w:.1f}%")
+    c3.metric("미확인", f"{_man_w:.1f}%")
+    st.caption("**종목 수가 아니라 비중 기준**입니다. 미확인 자산이 5%인지 70%인지가 "
+               "결과 신뢰도를 좌우하기 때문입니다.")
+    if _man_w > 20:
+        st.warning(f"유형이 확인되지 않은 자산이 **{_man_w:.1f}%** 입니다. "
+                   f"위 속성표에서 유형·듀레이션을 확인해주세요. "
+                   f"확인 후 '자동판정' 열을 👤 로 바꾸면 이 경고가 사라집니다.")
 
     # ---------------- 민감도 ----------------
     st.subheader("6️⃣ 민감도 (Sensitivity)")
@@ -3902,6 +4023,9 @@ def _render_hist_stress(base_ccy, start_date, end_date, use_div,
                            key="dl_stress", width="stretch")
     except Exception as ex:
         st.error(f"엑셀 생성 실패: {ex}")
+    assumptions_panel(rebalance=rebal_s, cost=cost_bp, initial_cost=init_cost,
+                      period=f"{prices.index[0].date()} ~ {prices.index[-1].date()}",
+                      bench=bench_n or "-")
     st.caption("과거의 위기가 같은 형태로 반복된다는 보장은 없습니다. "
                "특히 자산 간 상관관계는 위기마다 다르게 나타납니다. "
                "교육·참고용이며 투자 자문이 아닙니다.")
@@ -4437,6 +4561,13 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
                            key="dl_bl", width="stretch")
     except Exception as ex:
         st.error(f"엑셀 생성 실패: {ex}")
+    assumptions_panel(period=f"{R.index[0].date()} ~ {R.index[-1].date()}",
+                      extra=[("위험회피계수 δ", f"{delta:.2f}"
+                              + (" (자동 추정)" if auto_delta else "")),
+                             ("τ", f"{tau:.3f} (고정)"),
+                             ("공분산 추정", lookback),
+                             ("전망 기간", horizon),
+                             ("과거 성과 리밸런싱", "분기별 고정")])
     st.caption("이 모형은 기준 비중이 합리적인 출발점이라는 가정에 기대며, 공분산은 과거에서 "
                "추정합니다. 전망이 빗나가면 결과도 빗나갑니다. "
                "교육·참고용이며 투자 자문이 아닙니다.")
@@ -4997,18 +5128,27 @@ def _render_price_regimes(base_ccy, start_date, end_date, use_div,
     st.caption("같은 자산도 국면에 따라 전혀 다르게 움직입니다. "
                "**약세장에서 무엇이 버텼는지**를 눈여겨보세요.")
     prow = []
+    # 같은 국면이라도 시점이 흩어져 있으므로, 조각을 이어붙인 '누적 수익률'과
+    # '최대낙폭'은 실제로 겪을 수 있는 값이 아니다. 에피소드 단위 통계로 대신한다.
+    _epi = (lab != lab.shift()).cumsum()
+    _epi_r = _epi.reindex(R.index).ffill()
     for reg in ["강세", "횡보", "약세"]:
         m = lab_r == reg
         if m.sum() < 10:
             continue
+        _grp = _epi_r[m]
+        _n_epi = int(_grp.nunique())
         for t in use_tk:
             rr = R.loc[m, t]
-            eqc = (1 + rr).cumprod()
-            # 최대낙폭은 넣지 않는다. 같은 국면이라도 시점이 흩어져 있어
-            # 이어붙인 경로의 낙폭은 실제로 겪을 수 있는 값이 아니다.
+            # 에피소드별 수익률 → 그 분포를 요약
+            _er = [float((1 + rr[_grp == g]).prod() - 1) * 100
+                   for g in _grp.unique() if (_grp == g).sum() >= 3]
             prow.append({"국면": reg, "티커": t,
-                         "누적 수익률(%)": (float(eqc.iloc[-1]) - 1) * 100,
-                         "수익률(연,%)": ((float(eqc.iloc[-1]) ** (TRADING_DAYS / len(rr))) - 1) * 100,
+                         "에피소드": _n_epi,
+                         "에피소드 중앙값(%)": float(np.median(_er)) if _er else np.nan,
+                         "에피소드 최악(%)": float(np.min(_er)) if _er else np.nan,
+                         "에피소드 최선(%)": float(np.max(_er)) if _er else np.nan,
+                         "수익률(연,%)": ((float((1 + rr).prod()) ** (TRADING_DAYS / len(rr))) - 1) * 100,
                          "변동성(연,%)": float(rr.std() * np.sqrt(TRADING_DAYS)) * 100,
                          "최악의 일간(%)": float(rr.min()) * 100,
                          "하락일 비율(%)": float((rr < 0).mean()) * 100,
@@ -5021,16 +5161,26 @@ def _render_price_regimes(base_ccy, start_date, end_date, use_div,
         st.dataframe(piv.style.format("{:.2f}", na_rep="-").map(_heat_color),
                      width="stretch")
         with st.expander("상세 지표 보기", expanded=False):
-            st.dataframe(pdf.style.format({"누적 수익률(%)": "{:.2f}",
+            st.dataframe(pdf.style.format({"에피소드": "{:.0f}",
+                                           "에피소드 중앙값(%)": "{:+.2f}",
+                                           "에피소드 최악(%)": "{:+.2f}",
+                                           "에피소드 최선(%)": "{:+.2f}",
                                            "수익률(연,%)": "{:.2f}",
                                            "변동성(연,%)": "{:.2f}",
                                            "최악의 일간(%)": "{:.2f}",
-                                           "하락일 비율(%)": "{:.1f}"}),
+                                           "하락일 비율(%)": "{:.1f}"}, na_rep="-"),
                          width="stretch", hide_index=True)
-            st.caption("**최대낙폭은 표시하지 않습니다.** 같은 국면이라도 시점이 흩어져 "
-                       "있어, 그 조각들을 이어붙인 낙폭은 실제로 겪을 수 있는 값이 "
-                       "아니기 때문입니다. 연속 구간의 낙폭은 **🌩 스트레스 테스트** "
-                       "화면에서 확인하세요.")
+            st.caption("**누적 수익률과 최대낙폭은 표시하지 않습니다.** 같은 국면이라도 "
+                       "시점이 흩어져 있어, 그 조각들을 이어붙인 값은 실제로 겪을 수 "
+                       "있는 경험이 아니기 때문입니다.\n\n"
+                       "대신 **에피소드별 통계**를 씁니다. 각 국면이 몇 번 있었고, "
+                       "그때마다 얼마씩 움직였는지의 중앙값·최악·최선입니다. "
+                       "**에피소드가 5회 미만이면 통계적 의미가 약합니다.** "
+                       "연속 구간의 낙폭은 **🌩 스트레스 테스트** 화면에서 보세요.")
+            _few = pdf[pdf["에피소드"] < 5]["국면"].unique()
+            if len(_few):
+                st.warning(f"에피소드가 5회 미만인 국면: {', '.join(_few)} — "
+                           f"표본이 적어 우연일 수 있습니다.")
         if "약세" in piv.columns:
             best = piv["약세"].idxmax()
             st.info(f"약세장에서 가장 잘 버틴 자산은 **{best}** "
@@ -5138,6 +5288,10 @@ def _render_price_regimes(base_ccy, start_date, end_date, use_div,
                            key="dl_reg", width="stretch")
     except Exception as ex:
         st.error(f"엑셀 생성 실패: {ex}")
+    assumptions_panel(period=f"{prices.index[0].date()} ~ {prices.index[-1].date()}",
+                      extra=[("기준 지수", ref),
+                             ("약세장 기준", f"고점 대비 −{bear_th*100:.0f}%"),
+                             ("최소 지속", f"{min_days}거래일")])
     st.caption("국면 구분은 사후적으로 나눈 것이며, 실시간으로는 지금이 어느 국면인지 "
                "확정할 수 없습니다. 과거 국면별 특성이 앞으로도 반복된다는 보장도 없습니다. "
                "교육·참고용이며 투자 자문이 아닙니다.")
@@ -5549,6 +5703,10 @@ def render_fixed_add(base_df, base_tk, cand_tk, base_ccy, start_date, end_date,
     g2.download_button("📄 편입 효과 CSV", fdf.to_csv(index=False).encode("utf-8-sig"),
                        f"add_impact_{pd.Timestamp.now():%Y%m%d_%H%M}.csv",
                        "text/csv", width="stretch")
+    assumptions_panel(rebalance=rebal_f, cost=cost_bp,
+                      period=f"{prices.index[0].date()} ~ {prices.index[-1].date()}",
+                      extra=[("재원 조달", "비례 축소" if fund_src == FUND_PROP
+                              else f"{fund_src} 에서 차감")])
     st.caption("과거 데이터를 기준으로 계산한 결과이며, 미래에도 같은 효과가 나타난다는 "
                "보장은 없습니다. 교육·참고용이며 투자 자문이 아닙니다.")
 
@@ -6483,6 +6641,9 @@ def render_correlations(base_ccy, start_date, end_date, use_div, fx_hedge, gap_f
                            key="dl_corr", width="stretch")
     except Exception as ex:
         st.error(f"엑셀 생성 실패: {ex}")
+    assumptions_panel(period=f"{prices.index[0].date()} ~ {prices.index[-1].date()}",
+                      extra=[("계산 주기", freq),
+                             ("표본 수", f"{len(R):,}개")])
     st.caption("상관관계는 과거 데이터에서 계산된 값이며 앞으로도 유지된다는 보장이 없습니다. "
                "특히 시장 급락 국면에서는 대부분의 자산이 함께 움직이는 경향이 있어, "
                "분산이 가장 필요한 순간에 효과가 줄어들 수 있습니다.")
@@ -7233,6 +7394,12 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
     st.caption("엑셀은 화면과 같은 순서(최적자산배분 → 표본외성과 → 표본내성과 → 성과추이 → "
                "벤치마크지표 → 위험기여도 → 비중추이 → 자산상관관계 → 설정)로 구성되며, "
                "성과추이와 비중추이에는 엑셀 네이티브 차트가 포함됩니다.")
+    assumptions_panel(rebalance=rebal, cost=cost_bp,
+                      period=f"{train_px.index[0].date()} ~ {last.date()}",
+                      bench=bench_norm or "-", path_note=True,
+                      extra=[("최적화 기준일", str(opt_date.date())),
+                             ("학습 기간", train_label),
+                             ("재최적화", reopt)])
     st.caption("최적화는 학습 구간의 평균·변동성·상관관계가 앞으로도 유지된다고 가정합니다. "
                "특히 기대수익률 추정은 오차가 커서, 표본외 성과가 원본보다 나쁜 경우도 흔합니다. "
                "교육·참고용이며 투자 자문이 아닙니다.")
