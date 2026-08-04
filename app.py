@@ -37,6 +37,7 @@ TOOL_GROUPS = [
     ("분석", ["📊 포트폴리오 분석", "📉 시장 추세 국면", "🔗 자산 상관관계",
               "🌩 스트레스 테스트"]),
     ("배분", ["🎯 포트폴리오 최적화", "🧭 뷰 기반 자산배분", "➕ 자산 추가 효과"]),
+    ("결정", ["⚖️ 최종 대안 비교"]),
     ("", ["📖 도움말"]),
 ]
 TOOL_DEFAULT = "📊 포트폴리오 분석"
@@ -535,6 +536,57 @@ def render_etf_loader(target_key: str, gen_key: str, editor_key: str,
 # 종목 입력 표 (모든 화면 공통)
 # ======================================================================
 CLIP_KEY = "_clipboard"          # 화면 사이 복사용 임시 보관함
+PLANS_KEY = "_plans"             # 최종 비교용 후보안 모음
+MAX_PLANS = 8
+
+
+def load_plans() -> dict:
+    """비교 화면에서 쓸 후보안 모음. {이름: {rows, from, rebalance, note}}"""
+    if PLANS_KEY not in st.session_state:
+        st.session_state[PLANS_KEY] = {}
+    return st.session_state[PLANS_KEY]
+
+
+def save_plan(name: str, rows: list, source: str, rebalance=None, note="") -> bool:
+    """
+    후보안을 담는다. rows 는 [{"티커":.., "비중":..}, ...] 형태.
+    같은 이름이면 덮어쓴다.
+    """
+    rows = [r for r in rows if str(r.get("티커") or "").strip()]
+    if not rows:
+        return False
+    tot = sum(float(r.get("비중") or 0) for r in rows)
+    if tot > 0:                       # 합계 100%로 정규화
+        rows = [{"티커": r["티커"], "비중": float(r.get("비중") or 0) / tot * 100}
+                for r in rows]
+    else:                             # 비중이 없으면 균등
+        rows = [{"티커": r["티커"], "비중": 100.0 / len(rows)} for r in rows]
+    plans = load_plans()
+    if name not in plans and len(plans) >= MAX_PLANS:
+        return False
+    plans[name] = {"rows": rows, "from": source,
+                   "rebalance": rebalance, "note": note,
+                   "saved_at": pd.Timestamp.now().strftime("%m-%d %H:%M")}
+    st.session_state[PLANS_KEY] = plans
+    return True
+
+
+def plan_button(label: str, rows: list, source: str, key: str,
+                default_name: str = "", rebalance=None, note=""):
+    """'비교 후보로 담기' 버튼. 이름을 받아 후보함에 넣는다."""
+    c1, c2 = st.columns([2, 1])
+    nm = c1.text_input("이 안의 이름", value=default_name, key=f"{key}_name",
+                       placeholder="예: 최적화안 · 금 5% 편입안")
+    c2.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+    if c2.button(label, key=f"{key}_btn", width="stretch",
+                 disabled=not nm.strip()):
+        if save_plan(nm.strip(), rows, source, rebalance, note):
+            st.success(f"**{nm.strip()}** 을 비교 후보에 담았습니다. "
+                       f"⚖️ 최종 비교 화면에서 확인하세요.")
+        else:
+            st.error(f"담지 못했습니다. 후보는 최대 {MAX_PLANS}개까지이며, "
+                     f"종목이 하나 이상 있어야 합니다.")
+
 
 
 def clip_summary() -> str:
@@ -2200,7 +2252,7 @@ def render_help():
             "| **➕ 자산 추가 효과** | 무엇을 얼마나 더하면 좋을까 |\n"
             "| **🧭 뷰 기반 자산배분** | 내 전망을 배분에 어떻게 반영하나 |\n"
             "| **🔗 자산 상관관계** | 이 종목들은 서로 얼마나 겹치나 |\n"
-            "| **📉 시장 국면 분석** | 강세장·약세장에서 각각 어땠나 |\n""| **🌩 스트레스 테스트** | 과거 위기에 얼마나 버텼나 |\n\n"
+            "| **📉 시장 국면** | 강세·약세 구분 + 경기·물가 거시 국면 |\n""| **🌩 스트레스 테스트** | 과거 위기에 얼마나 버텼나 |\n""| **⚖️ 최종 대안 비교** | 여러 안 중 무엇을 고를까 |\n\n"
             "**사이드바 설정(기준 통화·기간·배당·거래비용·환헤지 등)은 모든 화면에 "
             "공통으로 적용**됩니다. 종목 표와 티커 입력 방식도 화면마다 동일합니다.")
 
@@ -2273,7 +2325,10 @@ def render_help():
                 "조합이 1,000가지를 넘으면 전수 탐색 대신 단계적 선택으로 자동 전환됩니다. "
                 "순위는 학습 구간 기준이고 표본외 성과는 확인용으로 함께 표시됩니다.\n\n"
                 "**1등만 보지 마세요.** 상위 조합 전반과 **채택 빈도**를 함께 보는 것이 "
-                "중요합니다. 여러 조합에 반복해서 등장하는 종목이 실제로 유용한 후보입니다.")
+                "중요합니다. 여러 조합에 반복해서 등장하는 종목이 실제로 유용한 후보입니다.\n\n"
+                "**반복 검증 기준일 수**를 2 이상으로 두면 기준일을 6개월씩 뒤로 옮겨가며 "
+                "같은 탐색을 반복합니다. 여러 시점에서 거듭 뽑히는 후보라야 특정 시기의 "
+                "우연이 아니라고 볼 수 있습니다. 한 번만 등장한 후보는 신중하게 보세요.")
         with st.expander("🧭 뷰 기반 자산배분"):
             st.markdown(
                 "**기준 비중**을 출발점으로 넣고, 전망이 있으면 뷰로 추가합니다. "
@@ -2295,6 +2350,16 @@ def render_help():
                 "**계산 주기 선택이 중요합니다.** 거래 시간대가 다른 국가를 섞으면 일별 "
                 "상관계수가 실제보다 낮게 나옵니다. 한국·미국·일본을 함께 볼 때는 "
                 "주별이나 월별을 쓰세요.")
+        with st.expander("⚖️ 최종 대안 비교"):
+            st.markdown(
+                "여러 화면에서 만든 안을 **같은 조건으로 나란히** 비교합니다.\n\n"
+                "각 화면 아래의 **⚖️ 비교 후보로 담기** 에 이름을 붙여 담으면 여기 모입니다. "
+                "분석·최적화·자산 추가 효과·뷰 기반 배분 네 화면에서 담을 수 있고, "
+                "최대 8개까지 보관됩니다.\n\n"
+                "**리밸런싱·거래비용·기간을 통일해 다시 계산**하므로, 각 안을 만들 때의 "
+                "설정과 결과가 다를 수 있습니다. 그래야 공정한 비교가 됩니다.\n\n"
+                "수익·위험·낙폭·회전율에 더해 **위험 집중도**(한 종목이 전체 위험에서 "
+                "차지하는 최대 비율)와 **위기별 손실**까지 함께 봅니다.")
         with st.expander("🌩 스트레스 테스트"):
             st.markdown(
                 "닷컴 붕괴·금융위기·코로나·긴축 발작 같은 **과거 위기 구간만 잘라내어** "
@@ -2306,7 +2371,20 @@ def render_help():
                 "뜻입니다.\n\n"
                 "**위기 구간 상관관계**를 꼭 확인하세요. 평상시 낮던 상관이 위기에 함께 "
                 "올라간다면, 정작 방어가 필요한 순간에 분산 효과가 줄어든다는 신호입니다.")
-        with st.expander("📉 시장 국면 분석"):
+        with st.expander("🌡 거시 경기·물가 국면 (FRED)"):
+            st.markdown(
+                "**📉 시장 국면** 화면의 두 번째 탭입니다. 미국 거시지표"
+                "(산업생산·고용·물가)로 **경기 × 물가** 4분면을 판정합니다.\n\n"
+                "**발표 지연**을 반드시 감안하세요. 거시지표는 한두 달 뒤에 발표되고 "
+                "이후 수정되므로, 기본값 2개월만큼 지표를 뒤로 밀어 그 시점에 실제로 "
+                "알 수 있었던 값만 씁니다. 지연을 0으로 두면 지금 시점의 최신 수정치를 "
+                "쓰게 되어 과거를 실제보다 정확히 맞힌 것처럼 보입니다.\n\n"
+                "**시장 내재 신호**는 야후 가격으로 계산합니다. 거시지표는 실물이고 "
+                "시장은 선반영이라, **둘이 엇갈릴 때가 오히려 정보**입니다.\n\n"
+                "**과거 국면별 성과**는 접어두었습니다. 표본이 적고 사후 수정 문제가 "
+                "있어 통계적 근거가 약하기 때문입니다. 이 화면은 **현재 상황을 읽는 "
+                "참고 자료**이지 과거 백테스트 도구가 아닙니다.")
+        with st.expander("📉 시장 추세 국면 (가격 기반)"):
             st.markdown(
                 "기준 지수를 강세·약세·횡보로 나누고, 국면마다 자산들이 어땠는지 봅니다.\n\n"
                 "가장 중요한 부분은 **국면별 상관관계**입니다. 평상시 낮던 상관관계가 "
@@ -2696,6 +2774,288 @@ CRISIS_PRESETS = {
     "코로나 폭락 (2020)": ("2020-02-19", "2020-03-23"),
     "긴축 발작 (2022)": ("2022-01-03", "2022-10-12"),
 }
+
+
+# ======================================================================
+# 최종 대안 비교
+# ======================================================================
+def render_compare(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, rf_rate):
+    st.title("⚖️ 최종 대안 비교")
+    st.caption("여러 화면에서 만든 안을 **같은 조건으로 나란히** 비교합니다. "
+               "각 화면 아래의 **비교 후보로 담기**로 안을 모아두세요.")
+
+    plans = load_plans()
+    if not plans:
+        st.info("아직 담긴 안이 없습니다.\n\n"
+                "**📊 포트폴리오 분석** · **🎯 최적화** · **➕ 자산 추가 효과** · "
+                "**🧭 뷰 기반 자산배분** 화면에서 결과를 낸 뒤 "
+                "**⚖️ 비교 후보로 담기** 를 누르면 여기 모입니다.")
+        return
+
+    # ---------------- 담긴 안 ----------------
+    st.subheader("1️⃣ 담긴 안 (Candidates)")
+    prows = []
+    for nm, pl in plans.items():
+        prows.append({"이름": nm, "출처": pl.get("from", "-"),
+                      "종목 수": len(pl["rows"]),
+                      "구성": " · ".join(f"{r['티커']} {r['비중']:.1f}%"
+                                       for r in pl["rows"][:4])
+                              + (" …" if len(pl["rows"]) > 4 else ""),
+                      "담은 시각": pl.get("saved_at", "-")})
+    st.dataframe(pd.DataFrame(prows), width="stretch", hide_index=True)
+
+    d1, d2 = st.columns([2, 1])
+    drop = d1.multiselect("뺄 안 고르기", list(plans), key="_cmp_drop")
+    d2.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+    if d2.button("🗑 선택 안 빼기", width="stretch", disabled=not drop):
+        for k in drop:
+            plans.pop(k, None)
+        st.session_state[PLANS_KEY] = plans
+        st.rerun()
+
+    picked = st.multiselect("비교할 안", list(plans), default=list(plans),
+                            key="_cmp_pick")
+    if len(picked) < 1:
+        st.warning("최소 1개를 선택해주세요.")
+        return
+
+    # ---------------- 조건 ----------------
+    st.subheader("2️⃣ 비교 조건 (Settings)")
+    st.caption("모든 안에 **같은 조건**을 적용해야 공정한 비교가 됩니다. "
+               "각 안을 만들 때의 설정과 다를 수 있습니다.")
+    e1, e2, e3 = st.columns(3)
+    rebal_c = e1.selectbox("리밸런싱", REBAL_OPTIONS, index=2, key="_cmp_rebal")
+    bench_c = e2.text_input("벤치마크", value="^GSPC", key="_cmp_bench")
+    crisis_c = e3.multiselect("위기 구간", list(CRISIS_PRESETS),
+                              default=["글로벌 금융위기 (2007~09)", "코로나 폭락 (2020)",
+                                       "긴축 발작 (2022)"], key="_cmp_crisis")
+
+    run_c = st.button("⚖️ 비교 실행", type="primary", width="stretch")
+    if run_c:
+        st.session_state["_cmp_has_run"] = True
+    if not st.session_state.get("_cmp_has_run"):
+        st.info("👆 조건을 정한 뒤 **비교 실행**을 눌러주세요.")
+        return
+
+    # ---------------- 데이터 ----------------
+    tks = sorted({r["티커"] for k in picked for r in plans[k]["rows"]})
+    bench_n = normalize_ticker(bench_c)[0] if bench_c.strip() else None
+    need = tks + ([bench_n] if bench_n else [])
+    lo_c = (min(pd.Timestamp(CRISIS_PRESETS[k][0]) for k in crisis_c)
+            if crisis_c else pd.Timestamp(start_date))
+    fetch_start = min(pd.Timestamp(start_date), lo_c - pd.DateOffset(months=6))
+    try:
+        with st.spinner(f"{len(need)}개 종목 데이터 수집 중..."):
+            prices, meta, _fx = build_price_frame(need, fetch_start, end_date,
+                                                  base_ccy, use_div, fx_hedge, gap_fill)
+    except Exception as ex:
+        st.error(f"데이터를 가져오지 못했습니다: {ex}")
+        return
+    if prices.empty:
+        st.error("공통 거래일이 없습니다.")
+        return
+
+    main_px = prices.loc[pd.Timestamp(start_date):]
+    if len(main_px) < 60:
+        st.error("분석 기간이 너무 짧습니다.")
+        return
+
+    def _run(rows, px):
+        W = {r["티커"]: float(r["비중"]) for r in rows if r["티커"] in px.columns}
+        if not W or sum(W.values()) <= 0:
+            return None, np.nan
+        try:
+            rr = portfolio_returns(px, W, rebal_c)
+            tno = turnover_series(px, W, rebal_c).reindex(rr.index).fillna(0)
+            return apply_cost(rr, tno, cost_bp), annual_turnover(tno)
+        except Exception:
+            return None, np.nan
+
+    br = None
+    if bench_n and bench_n in main_px.columns:
+        try:
+            br = portfolio_returns(main_px, {bench_n: 100.0}, REBAL_NONE)
+        except Exception:
+            br = None
+
+    st.success(f"✅ 비교 완료 · {len(picked)}개 안 · "
+               f"{main_px.index[0].date()} ~ {main_px.index[-1].date()} · "
+               f"리밸런싱 {rebal_c} · 거래비용 {cost_bp:.0f}bp")
+
+    # ---------------- 종합 비교표 ----------------
+    st.subheader("3️⃣ 종합 비교 (Summary)")
+    rows_m, curves = [], {}
+    for nm in picked:
+        rr, tno = _run(plans[nm]["rows"], main_px)
+        if rr is None:
+            continue
+        curves[nm] = rr
+        m_ = perf_row(rr, rf_rate)
+        row = {"안": nm, **m_, "연 회전율(%)": tno * 100 if not pd.isna(tno) else np.nan}
+        # 위험 집중도
+        try:
+            _t = [r["티커"] for r in plans[nm]["rows"] if r["티커"] in main_px.columns]
+            _w = np.array([r["비중"] for r in plans[nm]["rows"]
+                           if r["티커"] in main_px.columns], dtype=float)
+            _w = _w / _w.sum()
+            _cov = (main_px[_t].pct_change().dropna().cov() * TRADING_DAYS).values
+            _rc = risk_contributions(_w, _cov)
+            row["위험 집중도(%)"] = float(_rc.max() / _rc.sum() * 100) if _rc.sum() > 0 else np.nan
+        except Exception:
+            row["위험 집중도(%)"] = np.nan
+        if br is not None:
+            row.update({k: v for k, v in rel_metrics(rr, br).items()
+                        if k in ("초과수익률(%p)", "추적오차(%)", "정보비율")})
+        rows_m.append(row)
+
+    if br is not None:
+        bm_ = perf_row(br, rf_rate)
+        rows_m.append({"안": f"벤치마크 ({bench_n})", **bm_,
+                       "연 회전율(%)": 0.0, "위험 집중도(%)": np.nan})
+        curves[f"벤치마크 ({bench_n})"] = br
+
+    if not rows_m:
+        st.error("계산 가능한 안이 없습니다.")
+        return
+    cmp_df = pd.DataFrame(rows_m).set_index("안")
+    _hi = [c for c in ["수익률(연,%)", "최대낙폭(%)", "샤프지수", "소르티노",
+                       "초과수익률(%p)", "정보비율"] if c in cmp_df.columns]
+    _lo = [c for c in ["변동성(연,%)", "연 회전율(%)", "위험 집중도(%)", "추적오차(%)"]
+           if c in cmp_df.columns]
+    st.dataframe(cmp_df.style.format("{:.2f}", na_rep="-")
+                 .highlight_max(subset=_hi, color="#dcfce7")
+                 .highlight_min(subset=_lo, color="#dcfce7"),
+                 width="stretch")
+    st.caption("초록색 = 각 지표에서 가장 좋은 값. **최대낙폭은 음수**이므로 0에 가까울수록, "
+               "**위험 집중도**는 한 종목이 전체 위험에서 차지하는 최대 비율이라 낮을수록 "
+               "좋습니다.")
+
+    # ---------------- 성과 곡선 ----------------
+    st.subheader("4️⃣ 성과 곡선 (Growth)")
+    fg = go.Figure()
+    for nm, rr in curves.items():
+        ec = equity_curve(rr)
+        fg.add_trace(go.Scatter(x=ec.index, y=ec.values, name=nm,
+                                line=dict(width=1.6 if nm.startswith("벤치마크") else 2.2,
+                                          dash="dash" if nm.startswith("벤치마크") else None)))
+    fg.update_layout(height=400, hovermode="x unified",
+                     margin=dict(l=0, r=0, t=30, b=0),
+                     legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+    st.plotly_chart(fg, width="stretch")
+
+    fd = go.Figure()
+    for nm, rr in curves.items():
+        dd = drawdown_series(rr) * 100
+        fd.add_trace(go.Scatter(x=dd.index, y=dd.values, name=nm,
+                                line=dict(width=1.6 if nm.startswith("벤치마크") else 2)))
+    fd.update_layout(height=300, hovermode="x unified", yaxis=dict(ticksuffix="%"),
+                     margin=dict(l=0, r=0, t=20, b=0),
+                     legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+    st.plotly_chart(fd, width="stretch")
+    st.caption("아래는 낙폭입니다. 위기 때 어느 안이 덜 빠졌는지 보세요.")
+
+    # ---------------- 위기 손실 ----------------
+    if crisis_c:
+        st.subheader("5️⃣ 위기 구간 손실 (Crisis Loss)")
+        st.caption("과거 위기마다 각 안이 얼마나 빠졌는지입니다. "
+                   "평균 성과가 비슷해도 위기 대응은 크게 다를 수 있습니다.")
+        crows = []
+        for nm in picked:
+            row = {"안": nm}
+            for ck in crisis_c:
+                a_, b_ = CRISIS_PRESETS[ck]
+                seg = prices.loc[pd.Timestamp(a_):pd.Timestamp(b_)]
+                rr, _ = _run(plans[nm]["rows"], seg)
+                if rr is None or len(rr) < 3:
+                    row[ck] = np.nan
+                    continue
+                eq = (1 + rr).cumprod()
+                row[ck] = (float(eq.min()) - 1) * 100
+            crows.append(row)
+        if br is not None:
+            row = {"안": f"벤치마크 ({bench_n})"}
+            for ck in crisis_c:
+                a_, b_ = CRISIS_PRESETS[ck]
+                seg = prices.loc[pd.Timestamp(a_):pd.Timestamp(b_)]
+                if bench_n in seg.columns and len(seg) > 3:
+                    rb_ = portfolio_returns(seg, {bench_n: 100.0}, REBAL_NONE)
+                    eq = (1 + rb_).cumprod()
+                    row[ck] = (float(eq.min()) - 1) * 100
+                else:
+                    row[ck] = np.nan
+            crows.append(row)
+        cr_df = pd.DataFrame(crows).set_index("안")
+        st.dataframe(cr_df.style.format("{:.2f}", na_rep="-").map(_heat_color),
+                     width="stretch")
+        st.caption("구간 시작일 대비 최저 시점의 수익률입니다. 0에 가까울수록 잘 버틴 것입니다.")
+
+    # ---------------- 비중 비교 ----------------
+    st.subheader("6️⃣ 비중 비교 (Allocation)")
+    wide = {}
+    for nm in picked:
+        wide[nm] = {r["티커"]: r["비중"] for r in plans[nm]["rows"]}
+    wdf = pd.DataFrame(wide).fillna(0.0)
+    wdf.index.name = "티커"
+    fw = go.Figure()
+    for nm in picked:
+        fw.add_trace(go.Bar(name=nm, x=wdf.index, y=wdf[nm]))
+    fw.update_layout(barmode="group", height=340,
+                     margin=dict(l=0, r=0, t=30, b=0),
+                     yaxis=dict(ticksuffix="%"),
+                     legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+    st.plotly_chart(fw, width="stretch")
+    st.dataframe(wdf.style.format("{:.2f}"), width="stretch")
+
+    # ---------------- 요약 ----------------
+    st.subheader("📝 요약 (Summary)")
+    only = cmp_df[~cmp_df.index.str.startswith("벤치마크")]
+    if len(only):
+        lines = []
+        b_shp = only["샤프지수"].idxmax()
+        b_mdd = only["최대낙폭(%)"].idxmax()
+        b_ret = only["수익률(연,%)"].idxmax()
+        lines.append(f"**샤프지수**가 가장 높은 안은 **{b_shp}** "
+                     f"({only.loc[b_shp, '샤프지수']:.2f})입니다.")
+        lines.append(f"**낙폭이 가장 얕은** 안은 **{b_mdd}** "
+                     f"({only.loc[b_mdd, '최대낙폭(%)']:.2f}%), "
+                     f"**수익률이 가장 높은** 안은 **{b_ret}** "
+                     f"({only.loc[b_ret, '수익률(연,%)']:.2f}%)입니다.")
+        if b_shp != b_ret:
+            lines.append("수익률 1위와 위험조정 1위가 다릅니다. "
+                         "감내할 수 있는 변동성 수준에 따라 선택이 갈립니다.")
+        if "연 회전율(%)" in only.columns and only["연 회전율(%)"].notna().any():
+            hi_t = only["연 회전율(%)"].idxmax()
+            lines.append(f"회전율이 가장 높은 안은 **{hi_t}** "
+                         f"({only.loc[hi_t, '연 회전율(%)']:.0f}%)로 거래비용 부담이 큽니다.")
+        st.markdown("\n\n".join(lines))
+
+    st.divider()
+    try:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
+            cmp_df.to_excel(xw, sheet_name="1_종합비교")
+            wdf.to_excel(xw, sheet_name="2_비중")
+            if crisis_c:
+                cr_df.to_excel(xw, sheet_name="3_위기손실")
+            pd.DataFrame({k: equity_curve(v) for k, v in curves.items()}).to_excel(
+                xw, sheet_name="4_성과추이")
+            pd.DataFrame(list({
+                "비교 기간": f"{main_px.index[0].date()} ~ {main_px.index[-1].date()}",
+                "리밸런싱": rebal_c, "기준 통화": base_ccy,
+                "거래비용": f"{cost_bp:.0f}bp", "벤치마크": bench_n or "-",
+                "배당 처리": "재투자" if use_div else "주가만",
+                "생성 시각": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+            }.items()), columns=["항목", "값"]).to_excel(xw, sheet_name="5_설정",
+                                                       index=False)
+        st.download_button("📊 엑셀 파일 받기", buf.getvalue(),
+                           f"compare_{pd.Timestamp.now():%Y%m%d_%H%M}.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           key="dl_compare", width="stretch")
+    except Exception as ex:
+        st.error(f"엑셀 생성 실패: {ex}")
+    st.caption("모든 안을 같은 조건(리밸런싱·거래비용·기간)으로 다시 계산한 결과입니다. "
+               "각 안을 만들 때의 설정과 다를 수 있습니다. "
+               "교육·참고용이며 투자 자문이 아닙니다.")
 
 
 def _stress_blank():
@@ -3515,12 +3875,16 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
     st.subheader("➡️ 다음 단계")
     st.caption("이 배분을 다른 화면에서 쓰려면 보관함에 담고, 그 화면의 표에서 "
                "**📥 붙여넣기** 하세요.")
+    _bl_rows = [{"티커": t, "비중": round(float(x) * 100, 2)}
+                for t, x in zip(use_tk, np.clip(w_bl, 0, None)) if x > 1e-6]
     if st.button("📋 제안 배분 복사", width="stretch"):
-        rows_s = [{"티커": t, "비중": round(float(x) * 100, 2)}
-                  for t, x in zip(use_tk, np.clip(w_bl, 0, None)) if x > 1e-6]
-        if rows_s:
-            st.session_state[CLIP_KEY] = {"rows": rows_s, "from": "뷰 기반 배분"}
+        if _bl_rows:
+            st.session_state[CLIP_KEY] = {"rows": _bl_rows, "from": "뷰 기반 배분"}
             st.success(f"보관함에 담았습니다 · {clip_summary()}")
+
+    st.markdown("**⚖️ 비교 후보로 담기**")
+    plan_button("⚖️ 담기", _bl_rows, "뷰 기반 배분", "_plan_bl",
+                default_name="뷰 반영안")
 
     # ---------------- 내보내기 ----------------
     st.divider()
@@ -3551,6 +3915,367 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
     st.caption("이 모형은 기준 비중이 합리적인 출발점이라는 가정에 기대며, 공분산은 과거에서 "
                "추정합니다. 전망이 빗나가면 결과도 빗나갑니다. "
                "교육·참고용이며 투자 자문이 아닙니다.")
+
+
+# ======================================================================
+# 거시 경기·물가 국면 (FRED)
+# ======================================================================
+FRED_SERIES = {"INDPRO": "산업생산", "PAYEMS": "비농업고용",
+               "CPIAUCSL": "소비자물가", "CPILFESL": "근원물가",
+               "RPI": "실질개인소득"}
+MACRO_QUAD = {
+    "경기상승·물가하락": {"유리": "주식 · 성장주 · 하이일드",
+                   "불리": "원자재 · 현금", "색": "#dcfce7"},
+    "경기상승·물가상승": {"유리": "원자재 · 가치주 · 부동산 · 물가연동채",
+                   "불리": "장기채 · 성장주", "색": "#fef9c3"},
+    "경기하락·물가상승": {"유리": "금 · 현금 · 단기채 · 에너지",
+                   "불리": "주식 · 장기채", "색": "#fee2e2"},
+    "경기하락·물가하락": {"유리": "장기채 · 국채 · 방어주",
+                   "불리": "주식 · 원자재", "색": "#dbeafe"},
+}
+# 시장이 반영하는 방향을 읽는 대용 지표 (야후 데이터)
+MARKET_SIGNALS = {
+    "경기": [("XLY", "XLP", "경기소비재 / 필수소비재")],
+    "물가": [("DBC", "TLT", "원자재 / 장기채")],
+    "위험선호": [("HYG", "LQD", "하이일드 / 우량회사채"),
+              ("SPY", "TLT", "주식 / 장기채")],
+}
+
+
+def rolling_z(s: pd.Series, win=60, minp=24) -> pd.Series:
+    m = s.rolling(win, min_periods=minp).mean()
+    sd = s.rolling(win, min_periods=minp).std(ddof=1)
+    return (s - m) / sd.replace(0, np.nan)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def load_fred(start="1990-01-01"):
+    """FRED 거시지표. 실패하면 (None, 오류문)을 돌려준다."""
+    try:
+        from pandas_datareader import data as pdr
+    except Exception:
+        return None, "pandas-datareader 가 설치되어 있지 않습니다."
+    try:
+        df = pdr.DataReader(list(FRED_SERIES), "fred", start,
+                            pd.Timestamp.today().strftime("%Y-%m-%d"))
+        try:
+            df = df.resample("ME").last()
+        except ValueError:
+            df = df.resample("M").last()
+        return df.ffill(), ""
+    except Exception as ex:
+        return None, f"{type(ex).__name__}: {str(ex)[:120]}"
+
+
+def build_macro_regime(data: pd.DataFrame, lag_months=2, win=60) -> pd.DataFrame:
+    """
+    경기 × 물가 4분면.
+      경기 = 산업생산·고용의 3개월 변화 z점수 평균
+      물가 = CPI 전년동월비의 3개월 변화 z점수
+    lag_months 만큼 지표를 뒤로 밀어, 그 시점에 알 수 있었던 값만 쓰게 한다.
+    """
+    d = data.copy()
+    if lag_months:
+        d = d.shift(int(lag_months))
+    g1 = rolling_z(np.log(d["INDPRO"]).diff(3), win)
+    g2 = rolling_z(np.log(d["PAYEMS"]).diff(3), win)
+    parts = [g1, g2]
+    if "RPI" in d.columns:
+        parts.append(rolling_z(np.log(d["RPI"]).diff(3), win))
+    growth = pd.concat(parts, axis=1).mean(axis=1)
+
+    cpi_yoy = d["CPIAUCSL"].pct_change(12) * 100
+    infl = rolling_z(cpi_yoy.diff(3), win)
+
+    out = pd.DataFrame({"경기점수": growth, "물가점수": infl, "CPI 상승률(%)": cpi_yoy})
+    gu, iu = out["경기점수"] >= 0, out["물가점수"] >= 0
+    out["국면"] = np.select(
+        [gu & ~iu, gu & iu, ~gu & iu, ~gu & ~iu],
+        ["경기상승·물가하락", "경기상승·물가상승",
+         "경기하락·물가상승", "경기하락·물가하락"], default="판정불가")
+    sg = pd.concat(parts, axis=1)
+    out["지표 일치도(%)"] = (sg.apply(np.sign).eq(sg.apply(np.sign).iloc[:, 0], axis=0)
+                        .mean(axis=1) * 100)
+    return out.dropna(subset=["경기점수", "물가점수"])
+
+
+def macro_segments(reg: pd.DataFrame) -> pd.DataFrame:
+    """국면이 이어진 구간을 묶는다."""
+    g = (reg["국면"] != reg["국면"].shift()).cumsum()
+    rows = []
+    for _, idx_ in reg.groupby(g).groups.items():
+        a, b = idx_[0], idx_[-1]
+        rows.append({"국면": reg.loc[a, "국면"], "시작": a.strftime("%Y-%m"),
+                     "종료": b.strftime("%Y-%m"), "개월": len(idx_)})
+    return pd.DataFrame(rows)
+
+
+def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
+    """FRED 거시지표로 경기·물가 국면을 판정하고 시장 신호와 대조한다."""
+    st.caption("미국 거시지표(산업생산·고용·물가)로 **경기 × 물가** 국면을 판정하고, "
+               "시장 가격이 같은 방향을 반영하는지 확인합니다.")
+
+    c1, c2, c3 = st.columns(3)
+    lag_m = c1.slider("발표 지연 반영 (개월)", 0, 3, 2, step=1, key="_mac_lag",
+                      help="거시지표는 한두 달 뒤에 발표되고 이후 수정됩니다. "
+                           "그 시점에 실제로 알 수 있었던 값만 쓰도록 뒤로 밉니다. "
+                           "0으로 두면 지금 시점에서 본 최신 수정치를 씁니다.")
+    z_win = c2.selectbox("z점수 기준 기간", [36, 60, 120], index=1, key="_mac_win",
+                         format_func=lambda x: f"{x}개월",
+                         help="점수를 매기는 비교 구간입니다. 길수록 안정적이지만 "
+                              "최근 변화를 늦게 반영합니다.")
+    edge_th = c3.slider("경계 인접 기준", 0.10, 0.50, 0.25, step=0.05, key="_mac_edge",
+                        help="점수가 0에서 이 값 안이면 '경계에 가깝다'고 봅니다.")
+
+    if st.button("🌡 거시 국면 판정", type="primary", width="stretch", key="_mac_go"):
+        st.session_state["_mac_run"] = True
+    if not st.session_state.get("_mac_run"):
+        st.info("👆 **거시 국면 판정** 을 누르면 FRED에서 지표를 받아 계산합니다.")
+        return
+
+    with st.spinner("FRED 거시지표 조회 중..."):
+        fred, err = load_fred()
+    if fred is None:
+        st.error(f"🚫 FRED 데이터를 가져오지 못했습니다.\n\n{err}")
+        st.caption("네트워크가 막혀 있거나 FRED 서비스가 일시적으로 응답하지 않을 수 "
+                   "있습니다. 아래 **시장 내재 신호**는 야후 데이터만 쓰므로 "
+                   "그대로 확인할 수 있습니다.")
+        reg = None
+    else:
+        try:
+            reg = build_macro_regime(fred, lag_m, z_win)
+        except Exception as ex:
+            st.error(f"국면을 계산하지 못했습니다: {ex}")
+            reg = None
+
+    # ---------------- 현재 국면 ----------------
+    if reg is not None and len(reg):
+        last = reg.iloc[-1]
+        quad = MACRO_QUAD.get(last["국면"], {})
+        st.subheader("1️⃣ 현재 거시 국면")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("국면", last["국면"])
+        k2.metric("경기점수", f"{last['경기점수']:+.2f}",
+                  delta=f"{last['경기점수'] - reg['경기점수'].iloc[-2]:+.2f}"
+                  if len(reg) > 1 else None)
+        k3.metric("물가점수", f"{last['물가점수']:+.2f}",
+                  delta=f"{last['물가점수'] - reg['물가점수'].iloc[-2]:+.2f}"
+                  if len(reg) > 1 else None)
+        k4.metric("CPI 상승률", f"{last['CPI 상승률(%)']:.2f}%")
+
+        edges = []
+        if abs(last["경기점수"]) < edge_th:
+            edges.append("경기")
+        if abs(last["물가점수"]) < edge_th:
+            edges.append("물가")
+        base_txt = (f"기준 시점 **{reg.index[-1].strftime('%Y년 %m월')}** · "
+                    f"발표 지연 {lag_m}개월 반영 · 지표 일치도 "
+                    f"**{last['지표 일치도(%)']:.0f}%**")
+        if edges:
+            st.warning(f"{base_txt}\n\n⚠️ **{'·'.join(edges)}점수가 경계선(0)에 "
+                       f"가깝습니다.** 작은 변화로도 국면이 바뀔 수 있어 판정을 "
+                       f"단정하기 어렵습니다.")
+        elif last["지표 일치도(%)"] < 70:
+            st.warning(f"{base_txt}\n\n⚠️ 경기 구성지표들이 서로 다른 방향을 "
+                       f"가리키고 있어 확신도가 낮습니다.")
+        else:
+            st.success(base_txt)
+
+        if quad:
+            st.markdown(f"**이 국면에서 통념상** · 유리 `{quad['유리']}` · "
+                        f"불리 `{quad['불리']}`")
+            st.caption("교과서적 통념이며 반례가 많습니다. 아래 과거 성과와 함께 "
+                       "참고 수준으로만 보세요.")
+
+        # 4분면 산점도
+        st.subheader("2️⃣ 4분면 위치 (최근 24개월)")
+        rec = reg.tail(24)
+        fq = go.Figure()
+        for nm, q in MACRO_QUAD.items():
+            xr = [0, 4] if "경기상승" in nm else [-4, 0]
+            yr = [0, 4] if "물가상승" in nm else [-4, 0]
+            fq.add_shape(type="rect", x0=xr[0], x1=xr[1], y0=yr[0], y1=yr[1],
+                         fillcolor=q["색"], opacity=0.45, line_width=0, layer="below")
+            fq.add_annotation(x=sum(xr) / 2, y=yr[1] - 0.35 if yr[1] > 0 else yr[0] + 0.35,
+                              text=nm, showarrow=False,
+                              font=dict(size=11, color="#64748b"))
+        fq.add_trace(go.Scatter(x=rec["경기점수"], y=rec["물가점수"],
+                                mode="lines+markers", name="최근 24개월",
+                                line=dict(color="#334155", width=1.5),
+                                marker=dict(size=6),
+                                text=[d.strftime("%y-%m") for d in rec.index],
+                                hovertemplate="%{text}<br>경기 %{x:.2f} · 물가 %{y:.2f}"))
+        fq.add_trace(go.Scatter(x=[last["경기점수"]], y=[last["물가점수"]],
+                                mode="markers+text", text=["현재"],
+                                textposition="top center", name="현재",
+                                marker=dict(size=16, color="#dc2626", symbol="star")))
+        fq.add_vline(x=0, line_dash="dash", line_color="#94a3b8")
+        fq.add_hline(y=0, line_dash="dash", line_color="#94a3b8")
+        fq.update_layout(height=520, showlegend=False,
+                         xaxis=dict(title="경기: 하락 ← 0 → 상승", range=[-3, 3]),
+                         yaxis=dict(title="물가: 하락 ← 0 → 상승", range=[-3, 3]),
+                         margin=dict(l=0, r=0, t=20, b=0))
+        st.plotly_chart(fq, width="stretch")
+        st.caption("선은 최근 24개월의 이동 경로입니다. 어느 방향으로 움직이는지가 "
+                   "현재 위치만큼 중요합니다.")
+
+        with st.expander("국면 구간 이력", expanded=False):
+            segs = macro_segments(reg)
+            st.dataframe(segs.tail(30), width="stretch", hide_index=True)
+            st.caption(f"전체 {len(reg)}개월 · 국면 전환 {len(segs)}회 · "
+                       f"평균 지속 {segs['개월'].mean():.1f}개월")
+
+    # ---------------- 시장 신호 ----------------
+    st.subheader("3️⃣ 시장 내재 신호 (Market-implied)")
+    st.caption("시장 가격이 어느 방향을 반영하는지 봅니다. **거시지표는 실물이고 "
+               "시장은 선반영**이라, 둘이 엇갈릴 때가 오히려 정보입니다.")
+    sig_tk = sorted({t for lst in MARKET_SIGNALS.values() for a, b, _ in lst
+                     for t in (a, b)})
+    try:
+        with st.spinner("시장 신호 조회 중..."):
+            spx, _sm, _sf = build_price_frame(
+                sig_tk, pd.Timestamp.today() - pd.DateOffset(years=3),
+                end_date, "USD", use_div, True, gap_fill)
+    except Exception as ex:
+        st.warning(f"시장 신호를 가져오지 못했습니다: {ex}")
+        spx = None
+
+    mkt_dir = {}
+    if spx is not None and len(spx) > 130:
+        srows = []
+        for axis, pairs in MARKET_SIGNALS.items():
+            vals = []
+            for a, b, lbl in pairs:
+                if a not in spx.columns or b not in spx.columns:
+                    continue
+                ratio = spx[a] / spx[b]
+                mom = float(ratio.iloc[-1] / ratio.iloc[-127] - 1) * 100
+                vals.append(mom)
+                srows.append({"축": axis, "지표": lbl,
+                              "6개월 변화(%)": mom,
+                              "방향": "상승" if mom > 0 else "하락"})
+            if vals:
+                mkt_dir[axis] = float(np.mean(vals))
+        if srows:
+            st.dataframe(pd.DataFrame(srows).style.format({"6개월 변화(%)": "{:+.2f}"}),
+                         width="stretch", hide_index=True)
+            m_quad = (("경기상승" if mkt_dir.get("경기", 0) > 0 else "경기하락") + "·" +
+                      ("물가상승" if mkt_dir.get("물가", 0) > 0 else "물가하락"))
+            risk_on = mkt_dir.get("위험선호", 0) > 0
+            c1_, c2_ = st.columns(2)
+            c1_.metric("시장이 반영하는 국면", m_quad)
+            c2_.metric("위험선호 상태", "위험선호" if risk_on else "위험회피")
+
+            if reg is not None and len(reg):
+                if m_quad == last["국면"]:
+                    st.success(f"**실물지표와 시장 신호가 같은 방향**입니다 "
+                               f"({m_quad}). 판단의 신뢰도가 높은 편입니다.")
+                else:
+                    st.warning(f"**엇갈립니다.** 거시지표는 `{last['국면']}` 인데 "
+                               f"시장은 `{m_quad}` 를 반영하고 있습니다.\n\n"
+                               f"시장이 앞으로의 변화를 먼저 반영하는 중일 수도, "
+                               f"일시적 과민 반응일 수도 있습니다. 어느 쪽인지는 "
+                               f"시간이 지나야 확인됩니다.")
+    else:
+        st.info("시장 신호를 계산하기에 데이터가 부족합니다.")
+
+    # ---------------- 포트폴리오 노출 ----------------
+    st.subheader("4️⃣ 내 포트폴리오 노출 점검")
+    st.caption("현재 국면에서 **통념상 유리한 자산과 불리한 자산에 얼마나 노출**돼 "
+               "있는지 봅니다. 미래를 예측하지 않고, 지금 구성만 진단합니다.")
+    clip = st.session_state.get(CLIP_KEY)
+    plans = load_plans()
+    src_opts = (["보관함 (📋 복사한 구성)"] if clip and clip.get("rows") else []) + \
+               [f"비교 후보 · {k}" for k in plans]
+    if not src_opts:
+        st.info("다른 화면에서 **📋 복사** 하거나 **⚖️ 비교 후보로 담기** 를 하면 "
+                "여기서 노출을 점검할 수 있습니다.")
+    else:
+        pick_src = st.selectbox("점검할 구성", src_opts, key="_mac_src")
+        rows_p = (clip["rows"] if pick_src.startswith("보관함")
+                  else plans[pick_src.replace("비교 후보 · ", "")]["rows"])
+        if reg is not None and len(reg):
+            fav = MACRO_QUAD[last["국면"]]["유리"]
+            unf = MACRO_QUAD[last["국면"]]["불리"]
+            st.markdown(f"현재 국면 **{last['국면']}** · 유리 `{fav}` · 불리 `{unf}`")
+        st.caption("각 종목이 어느 쪽인지는 직접 골라주세요. 자동 분류는 "
+                   "종목마다 성격이 달라 오히려 잘못된 진단을 줄 수 있습니다.")
+        cls_key = "_mac_cls"
+        cdf0 = pd.DataFrame([{"티커": r["티커"], "비중(%)": r["비중"], "성격": "중립"}
+                             for r in rows_p])
+        cls = st.data_editor(
+            cdf0, num_rows="fixed", width="stretch", key=cls_key, hide_index=True,
+            column_config={
+                "티커": st.column_config.TextColumn("티커", disabled=True),
+                "비중(%)": st.column_config.NumberColumn("비중(%)", disabled=True,
+                                                       format="%.2f"),
+                "성격": st.column_config.SelectboxColumn(
+                    "이 국면에서", options=["유리", "중립", "불리"], width="medium")})
+        agg = cls.groupby("성격")["비중(%)"].sum()
+        e1, e2, e3 = st.columns(3)
+        e1.metric("유리한 자산", f"{agg.get('유리', 0):.1f}%")
+        e2.metric("중립", f"{agg.get('중립', 0):.1f}%")
+        e3.metric("불리한 자산", f"{agg.get('불리', 0):.1f}%")
+        if agg.get("불리", 0) > 50:
+            st.warning(f"현재 국면에서 통념상 불리한 자산에 **{agg.get('불리', 0):.1f}%** "
+                       f"노출돼 있습니다. 국면 판정이 맞다면 조정을 검토할 만합니다.")
+        elif agg.get("유리", 0) > 50:
+            st.success(f"유리한 자산 비중이 **{agg.get('유리', 0):.1f}%** 입니다.")
+
+    # ---------------- 과거 국면별 성과 ----------------
+    if reg is not None and len(reg) > 24:
+        with st.expander("⚠️ 과거 동일 국면의 자산 성과 (참고용 · 먼저 읽어주세요)",
+                         expanded=False):
+            st.error("**이 표는 통계적 근거가 약합니다.**\n\n"
+                     "· 국면당 표본이 적고, 연속되지 않은 시기를 묶은 값입니다\n"
+                     "· 거시지표는 사후 수정되므로 과거 국면 판정 자체가 정확하지 "
+                     "않을 수 있습니다\n"
+                     "· 에피소드 수가 5회 미만이면 우연일 가능성이 큽니다\n\n"
+                     "숫자를 근거로 삼지 마시고, 통념과 얼마나 부합하는지 보는 "
+                     "용도로만 쓰세요.")
+            mtk = st.text_input("확인할 자산 (콤마 구분)", value="SPY, TLT, GLD, DBC",
+                                key="_mac_hist_tk")
+            if st.button("과거 성과 계산", key="_mac_hist_go"):
+                tks_h = [normalize_ticker(x)[0] for x in mtk.split(",") if x.strip()]
+                try:
+                    hpx, _hm, _hf = build_price_frame(
+                        tks_h, reg.index[0], end_date, base_ccy, use_div,
+                        fx_hedge, gap_fill)
+                    mret = hpx.resample("ME").last().pct_change().dropna()
+                    lab = reg["국면"].reindex(mret.index, method="ffill")
+                    hrows = []
+                    segs_h = macro_segments(reg)
+                    for q in MACRO_QUAD:
+                        msk = lab == q
+                        if msk.sum() < 6:
+                            continue
+                        ep = int((segs_h["국면"] == q).sum())
+                        for t_ in mret.columns:
+                            rr = mret.loc[msk, t_]
+                            hrows.append({
+                                "국면": q, "티커": t_,
+                                "월평균(%)": float(rr.mean()) * 100,
+                                "연율(%)": (float((1 + rr).prod() ** (12 / len(rr))) - 1) * 100,
+                                "개월": int(msk.sum()), "에피소드": ep,
+                                "신뢰도": "낮음 ⚠️" if ep < 5 else "보통"})
+                    if hrows:
+                        hdf = pd.DataFrame(hrows)
+                        piv = hdf.pivot(index="티커", columns="국면", values="연율(%)")
+                        st.dataframe(piv.style.format("{:.2f}", na_rep="-")
+                                     .map(_heat_color), width="stretch")
+                        st.dataframe(hdf.style.format({"월평균(%)": "{:.2f}",
+                                                       "연율(%)": "{:.2f}"}),
+                                     width="stretch", hide_index=True)
+                        _lowep = hdf[hdf["에피소드"] < 5]["국면"].unique()
+                        if len(_lowep):
+                            st.error(f"에피소드가 5회 미만인 국면: {', '.join(_lowep)} "
+                                     f"— 이 숫자는 통계적 의미가 없습니다.")
+                except Exception as ex:
+                    st.error(f"계산하지 못했습니다: {ex}")
+
+    st.caption("거시 국면은 **현재 상황을 읽는 참고 자료**입니다. 발표 지연과 사후 수정 "
+               "때문에 과거를 정확히 재현하기 어려우므로, 이 화면의 판정을 과거 "
+               "백테스트에 쓰지 않습니다. 교육·참고용이며 투자 자문이 아닙니다.")
 
 
 REG_COLS = ["티커", "종목명"]
@@ -3638,7 +4363,17 @@ def regime_segments(px: pd.Series, lab: pd.Series) -> pd.DataFrame:
 
 
 def render_regimes(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, rf_rate):
-    st.title("📉 시장 추세 국면 (사후 분석)")
+    st.title("📉 시장 국면")
+    _t1, _t2 = st.tabs(["📈 시장 추세 국면 (가격 기반)", "🌡 거시 경기·물가 국면 (FRED)"])
+    with _t2:
+        render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill)
+    with _t1:
+        _render_price_regimes(base_ccy, start_date, end_date, use_div,
+                              fx_hedge, gap_fill, rf_rate)
+
+
+def _render_price_regimes(base_ccy, start_date, end_date, use_div,
+                          fx_hedge, gap_fill, rf_rate):
     st.caption("시장을 강세·약세·횡보로 나누고, 국면마다 자산들이 어떻게 움직였는지 봅니다. "
                "**상관관계가 국면에 따라 어떻게 달라지는지**가 핵심입니다.")
     st.info("⚠️ **사후 분석입니다.** 고점 대비 −20%가 확인된 뒤에야 그 고점부터 약세장으로 "
@@ -4232,13 +4967,18 @@ def render_fixed_add(base_df, base_tk, cand_tk, base_ccy, start_date, end_date,
     st.caption("기존 구성에 후보를 더한 상태를 보관함에 담아, 다른 화면에서 "
                "**📥 붙여넣기** 할 수 있습니다.")
     pick_c = st.selectbox("함께 담을 후보", cand_use, key="_fx_send")
-    if st.button("📋 기존 + 선택 후보 복사", width="stretch"):
-        tot_b = max(sum(W_base.values()), 1e-9)
-        rows_o = [{"티커": t, "비중": round(float(W_base.get(t, 0)) / tot_b * 100, 2)}
-                  for t in base_use]
-        rows_o.append({"티커": pick_c, "비중": 0.0})
-        st.session_state[CLIP_KEY] = {"rows": rows_o, "from": "자산 추가 효과"}
+    _add_w = st.select_slider("담을 편입 비중 (%)", options=sorted(weights_sel),
+                              value=sorted(weights_sel)[0], key="_fx_planw")
+    _fw, _warn2 = fund_weights(W_base, pick_c, _add_w / 100.0, fund_src)
+    _fx_rows = ([{"티커": k, "비중": round(v * 100, 2)} for k, v in _fw.items()]
+                if _fw else [])
+    if st.button("📋 이 구성 복사", width="stretch", disabled=not _fx_rows):
+        st.session_state[CLIP_KEY] = {"rows": _fx_rows, "from": "자산 추가 효과"}
         st.success(f"보관함에 담았습니다 · {clip_summary()}")
+
+    st.markdown("**⚖️ 비교 후보로 담기**")
+    plan_button("⚖️ 담기", _fx_rows, "자산 추가 효과", "_plan_fx",
+                default_name=f"{pick_c} {_add_w:.0f}% 편입", rebalance=rebal_f)
 
     st.divider()
     st.subheader("📥 결과 내보내기")
@@ -4378,6 +5118,10 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
                          help="0이면 후보가 조합에 뽑혀도 최적화 결과에서 0%를 받을 수 "
                               "있습니다. 값을 주면 실제로 그만큼은 담기게 됩니다.")
     bench_tk = d2.text_input("벤치마크", value="^GSPC", key="_cand_bench")
+    n_reps = d2.slider("반복 검증 기준일 수", 1, 5, 1, step=1, key="_cand_reps",
+                       help="기준일을 뒤로 옮겨가며 같은 탐색을 여러 번 합니다. "
+                            "여러 기준일에서 반복해 뽑히는 후보가 우연이 아닐 "
+                            "가능성이 큽니다. 횟수만큼 계산 시간이 늘어납니다.")
 
     n_c = len(cand_tk)
     from math import comb
@@ -4455,9 +5199,10 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
                 hi_.append(wmax)
         return np.array(lo_), np.array(hi_)
 
-    def evaluate(combo):
+    def evaluate(combo, tr_px=None):
         tks = base_use + list(combo)
-        Rtr = train_px[tks].pct_change().dropna()
+        _src = train_px if tr_px is None else tr_px
+        Rtr = _src[tks].pct_change().dropna()
         if len(Rtr) < MIN_TRAIN_DAYS:
             return None
         lo_, hi_ = _bounds_for(tks)
@@ -4602,8 +5347,71 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
                           "높지 않다는 신호입니다.")
                        + f" 상위권 표본외 샤프 편차는 {spread:.2f} 입니다.")
 
+    # ---------------- 반복 검증 ----------------
+    rep_df = None
+    if int(n_reps) > 1:
+        st.subheader("6️⃣ 반복 검증 (Multiple Cutoffs)")
+        st.caption("기준일을 뒤로 옮겨가며 같은 탐색을 반복합니다. "
+                   "**여러 기준일에서 거듭 뽑히는 후보**가 우연이 아닐 가능성이 큽니다. "
+                   "한 번만 1위였다면 그 시기의 우연일 수 있습니다.")
+        rbar = st.progress(0.0, text="반복 검증 중...")
+        rep_cnt, rep_detail = {}, []
+        _step = pd.DateOffset(months=6)
+        for k_ in range(int(n_reps)):
+            cut_k = opt_date - _step * k_
+            tr_s = prices.index[0] if tw is None else max(prices.index[0], cut_k - tw)
+            tr_k = prices.loc[tr_s:cut_k]
+            if len(tr_k) < MIN_TRAIN_DAYS:
+                continue
+            res_k = []
+            pool_k = (list(itertools.combinations(cand_use, int(n_add)))
+                      if mode == "전수 탐색" else
+                      [tuple(sorted(x["combo"])) for x in uniq.values()])
+            for cb in pool_k:
+                r_ = evaluate(cb, tr_px=tr_k)
+                if r_:
+                    res_k.append(r_)
+            if not res_k:
+                continue
+            top_k = sorted(res_k, key=lambda x: -x["score"])[:CAND_TOPN]
+            for rk, r_ in enumerate(top_k, start=1):
+                for c_ in r_["combo"]:
+                    rep_cnt[c_] = rep_cnt.get(c_, 0) + 1
+            rep_detail.append({"기준일": cut_k.date(),
+                               "학습 시작": tr_k.index[0].date(),
+                               "1위 조합": " + ".join(top_k[0]["combo"]),
+                               "학습 점수": top_k[0]["score"]})
+            rbar.progress((k_ + 1) / int(n_reps),
+                          text=f"반복 검증 중... {k_+1}/{int(n_reps)}")
+        rbar.empty()
+
+        if rep_detail:
+            st.dataframe(pd.DataFrame(rep_detail).style.format({"학습 점수": "{:.3f}"}),
+                         width="stretch", hide_index=True)
+            _runs = len(rep_detail)
+            rep_df = pd.DataFrame(
+                [{"티커": c_, "종목명": meta.get(c_, {}).get("name", c_),
+                  "상위권 등장": v_, "등장률(%)": v_ / (_runs * CAND_TOPN) * 100}
+                 for c_, v_ in sorted(rep_cnt.items(), key=lambda x: -x[1])])
+            st.markdown(f"**후보별 등장 횟수** — {_runs}개 기준일 × 상위 {CAND_TOPN}개 조합")
+            st.dataframe(rep_df.style.format({"등장률(%)": "{:.0f}"}),
+                         width="stretch", hide_index=True)
+            if len(rep_df):
+                _top = rep_df.iloc[0]
+                st.info(f"**{_top['티커']}** 가 가장 자주 등장했습니다 "
+                        f"({_top['상위권 등장']}회, {_top['등장률(%)']:.0f}%). "
+                        f"기준일을 바꿔도 반복해 뽑힌다면 특정 시기의 우연이 아닐 "
+                        f"가능성이 큽니다.")
+            _once = rep_df[rep_df["상위권 등장"] <= 1]["티커"].tolist()
+            if _once:
+                st.caption(f"한 번만 등장한 후보: {', '.join(_once)} — "
+                           f"우연일 수 있으니 신중하게 보세요.")
+        else:
+            st.warning("반복 검증에 필요한 데이터가 부족합니다. "
+                       "분석 시작일을 앞당기거나 기준일 수를 줄여주세요.")
+
     # ---------------- 채택 빈도 ----------------
-    st.subheader("6️⃣ 후보별 채택 빈도 (Selection Frequency)")
+    st.subheader("7️⃣ 후보별 채택 빈도 (Selection Frequency)")
     st.caption("상위 조합에 자주 등장하는 종목일수록, 특정 조합의 우연이 아니라 "
                "실제로 도움이 되는 후보일 가능성이 큽니다.")
     cnt = {}
@@ -4626,7 +5434,7 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
                      hide_index=True)
 
     # ---------------- 1위 조합 상세 ----------------
-    st.subheader("7️⃣ 1위 조합 비중 (Best Combination)")
+    st.subheader("8️⃣ 1위 조합 비중 (Best Combination)")
     best = ranked[0]
     bw2 = pd.DataFrame({
         "티커": best["tickers"],
@@ -4656,6 +5464,13 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
         st.plotly_chart(fg, width="stretch")
         st.caption("검증 구간(표본외) 성과입니다.")
 
+    st.subheader("⚖️ 비교 후보로 담기")
+    _best_rows = [{"티커": t_, "비중": round(float(x_) * 100, 2)}
+                  for t_, x_ in zip(best["tickers"], best["w"]) if x_ > 1e-6]
+    plan_button("⚖️ 1위 조합 담기", _best_rows, "자산 추가 효과 · 조합탐색",
+                "_plan_cand",
+                default_name=f"+{' + '.join(best['combo'])}", rebalance=rebal)
+
     st.divider()
     st.subheader("📥 결과 내보내기")
     cs_settings = {
@@ -4664,6 +5479,7 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
         "후보": ", ".join(cand_use),
         "추가 종목 수": f"{int(n_add)}개",
         "평가한 조합": f"{len(uniq):,}가지",
+        "반복 검증": f"{int(n_reps)}개 기준일" if int(n_reps) > 1 else "미사용",
         "목적": goal,
         "위험 정의": risk_name,
         "최적화 기준일": str(opt_date.date()),
@@ -4684,6 +5500,8 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
             if not fdf.empty:
                 fdf.to_excel(xw, sheet_name="2_채택빈도", index=False)
             bw2.to_excel(xw, sheet_name="3_1위조합비중", index=False)
+            if rep_df is not None and not rep_df.empty:
+                rep_df.to_excel(xw, sheet_name="6_반복검증", index=False)
             if curves:
                 pd.DataFrame({k: equity_curve(v) for k, v in curves.items()}).to_excel(
                     xw, sheet_name="4_성과추이")
@@ -5555,14 +6373,17 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         else:
             st.info("비교할 만큼의 데이터가 부족합니다.")
 
+    _opt_rows = [{"티커": t, "비중": round(float(x) * 100, 2)}
+                 for t, x in zip(tickers, w_opt) if x > 1e-6]
     if st.button("📋 최적 비중 복사", width="stretch",
                  help="최적 비중을 보관함에 담습니다. 다른 화면의 표에서 "
                       "📥 붙여넣기 하면 그대로 채워집니다."):
-        st.session_state[CLIP_KEY] = {
-            "rows": [{"티커": t, "비중": round(float(x) * 100, 2)}
-                     for t, x in zip(tickers, w_opt) if x > 1e-6],
-            "from": f"최적화 ({goal})"}
+        st.session_state[CLIP_KEY] = {"rows": _opt_rows, "from": f"최적화 ({goal})"}
         st.success(f"보관함에 담았습니다 · {clip_summary()}")
+
+    st.markdown("**⚖️ 비교 후보로 담기** — 여러 안을 모아 최종 비교 화면에서 견줍니다")
+    plan_button("⚖️ 담기", _opt_rows, f"최적화 ({goal})", "_plan_opt",
+                default_name=f"최적화 {goal.split(' ')[0]}", rebalance=rebal)
 
     # ---------------- 성과 비교 ----------------
     def _bt(px, W):
@@ -5976,7 +6797,12 @@ with st.sidebar:
                "일본 `7203.T`  홍콩 `0700.HK`")
 
 
+IS_CMP = tool.endswith("대안 비교")
 IS_STRESS = tool.endswith("스트레스 테스트")
+
+if IS_CMP:
+    render_compare(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, rf_rate)
+    st.stop()
 IS_BL = tool.endswith("자산배분")
 
 if IS_STRESS:
@@ -6630,6 +7456,18 @@ for name, v in series.items():
 
 # ---------------- 다운로드 ----------------
 st.divider()
+st.subheader("⚖️ 비교 후보로 담기")
+st.caption("지금 구성을 최종 비교 화면으로 보냅니다. 여러 안을 모아 나란히 견줄 수 있습니다.")
+_pnames = [n for n, v in series.items() if v["kind"] == "portfolio"]
+if _pnames:
+    _pk = st.selectbox("담을 포트폴리오", _pnames, key="_plan_an_pick")
+    _pw = series[_pk]["weights"]
+    _tot_w = sum(_pw.values())
+    _an_rows = [{"티커": k, "비중": round(v / _tot_w * 100, 2)}
+                for k, v in _pw.items() if v > 0]
+    plan_button("⚖️ 담기", _an_rows, "포트폴리오 분석", "_plan_an",
+                default_name=_pk, rebalance=series[_pk]["rebalance"])
+
 st.subheader("📥 결과 내보내기")
 
 settings_info = {
