@@ -1387,20 +1387,30 @@ def annual_vol(r):
     return r.std() * np.sqrt(TRADING_DAYS)
 
 
+# 변동성이 사실상 0일 때 비율 지표가 폭주하지 않도록 두는 임계값.
+# 부동소수점 오차 때문에 std()가 정확히 0이 아닌 10^-18 같은 값이 될 수 있다.
+_EPS_STD = 1e-12
+
+
 def sharpe_ratio(r, rf=0.0):
     e = r - rf / TRADING_DAYS
-    return np.nan if e.std() == 0 else e.mean() / e.std() * np.sqrt(TRADING_DAYS)
+    s = e.std()
+    if not np.isfinite(s) or s < _EPS_STD:
+        return np.nan
+    return e.mean() / s * np.sqrt(TRADING_DAYS)
 
 
 def sortino_ratio(r, rf=0.0):
     e = r - rf / TRADING_DAYS
     d = e[e < 0].std()
-    return np.nan if (d == 0 or np.isnan(d)) else e.mean() / d * np.sqrt(TRADING_DAYS)
+    if not np.isfinite(d) or d < _EPS_STD:
+        return np.nan
+    return e.mean() / d * np.sqrt(TRADING_DAYS)
 
 
 def calmar_ratio(r):
     m = abs(max_drawdown(r))
-    return np.nan if m == 0 else cagr(r) / m
+    return np.nan if (not np.isfinite(m) or m < _EPS_STD) else cagr(r) / m
 
 
 def ulcer_index(r):
@@ -1869,7 +1879,7 @@ REOPT_FREQ = {"한 번만": None, "분기마다": "QS", "매년": "YS"}
 
 def walk_forward(prices, tickers, start, freq_code, train_win, rebal,
                  goal, risk_name, rf, wmin, wmax, min_ret, max_vol,
-                 progress=None):
+                 progress=None, cost_bp=0.0):
     """
     각 재최적화 시점까지의 데이터로만 비중을 구해 다음 구간에 적용하고 이어붙인다.
     실제로 운용했다면 어땠을지를 재현한다.
@@ -1898,7 +1908,10 @@ def walk_forward(prices, tickers, start, freq_code, train_win, rebal,
             continue
         W = {t: float(x) for t, x in zip(tickers, w)}
         try:
-            segs.append(portfolio_returns(seg, W, rebal))
+            _sr = portfolio_returns(seg, W, rebal)
+            # 재최적화 시점의 비중 교체 비용까지 반영한다
+            _st = turnover_series(seg, W, rebal).reindex(_sr.index).fillna(0)
+            segs.append(apply_cost(_sr, _st, cost_bp))
         except Exception:
             continue
         hist.append((d, w))
@@ -3465,7 +3478,8 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
 
     with st.expander("과거 성과로 확인해보기 (참고용)", expanded=False):
         st.caption("두 배분을 **과거에 적용했다면** 어땠을지입니다. 지금의 전망을 과거에 "
-                   "적용한 것이므로 검증이 아니라 참고 자료로만 보세요.")
+                   "적용한 것이므로 검증이 아니라 참고 자료로만 보세요. "
+                   "리밸런싱은 **분기별**로 고정해 계산합니다.")
         try:
             W_m = {t: float(x) * 100 for t, x in zip(use_tk, w_mkt)}
             W_b = {t: float(x) * 100 for t, x in zip(use_tk, np.clip(w_bl, 0, None))}
@@ -3474,6 +3488,8 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
                 if sum(W.values()) <= 0:
                     continue
                 rr = portfolio_returns(px, W, REBAL_QUARTER)
+                _t2 = turnover_series(px, W, REBAL_QUARTER).reindex(rr.index).fillna(0)
+                rr = apply_cost(rr, _t2, cost_bp)
                 rows2[lbl] = perf_row(rr, rf_rate)
             if rows2:
                 st.dataframe(pd.DataFrame(rows2).T.style.format("{:.2f}", na_rep="-"),
@@ -3482,7 +3498,9 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
                 for lbl, W in [("기준 비중", W_m), ("제안 배분", W_b)]:
                     if sum(W.values()) <= 0:
                         continue
-                    ec = equity_curve(portfolio_returns(px, W, REBAL_QUARTER))
+                    _r3 = portfolio_returns(px, W, REBAL_QUARTER)
+                    _t3 = turnover_series(px, W, REBAL_QUARTER).reindex(_r3.index).fillna(0)
+                    ec = equity_curve(apply_cost(_r3, _t3, cost_bp))
                     fh.add_trace(go.Scatter(x=ec.index, y=ec.values, name=lbl,
                                             line=dict(width=2)))
                 fh.update_layout(height=340, hovermode="x unified",
@@ -5549,11 +5567,14 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
     # ---------------- 성과 비교 ----------------
     def _bt(px, W):
         try:
-            return portfolio_returns(px, W, rebal)
+            r = portfolio_returns(px, W, rebal)
+            tno = turnover_series(px, W, rebal).reindex(r.index).fillna(0)
+            return apply_cost(r, tno, cost_bp)
         except Exception:
             return None
 
     def _bench(px):
+        # 벤치마크는 매수 후 보유이므로 거래비용을 적용하지 않는다
         if not bench_norm or bench_norm not in px.columns:
             return None
         try:
@@ -5577,7 +5598,8 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                 prices, tickers, opt_date, REOPT_FREQ[reopt], tw, rebal,
                 goal, risk_name, rf_rate, wmin, wmax, min_ret, max_vol,
                 progress=lambda x: bar.progress(min(1.0, x),
-                                                text=f"주기적 재최적화 계산 중... {x*100:.0f}%"))
+                                                text=f"주기적 재최적화 계산 중... {x*100:.0f}%"),
+                cost_bp=cost_bp)
         except Exception as ex:
             st.warning(f"재최적화 계산 실패: {ex}")
         bar.empty()
