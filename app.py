@@ -16,6 +16,7 @@ streamlit run app.py
 
 import io
 import json
+import os
 import re
 from pathlib import Path
 
@@ -31,6 +32,10 @@ import streamlit as st
 
 TRADING_DAYS = 252
 MAX_PORTFOLIOS = 6
+# 공개 배포(예: Streamlit Cloud)는 접속자 전원이 프로세스 하나를 공유하므로,
+# 서버 파일에 저장하면 다른 세션의 구성이 섞여 보일 수 있다.
+# 본인 컴퓨터에서 혼자 실행할 때만 명시적으로 켜서 쓴다.
+ENABLE_LOCAL_PERSISTENCE = os.environ.get("ENABLE_LOCAL_PERSISTENCE", "").lower() == "true"
 
 # 사이드바 메뉴 — 성격별로 묶어 표시한다
 TOOL_GROUPS = [
@@ -899,7 +904,13 @@ STORE_KEY = "_saved_store"
 
 
 def _disk_read() -> dict:
-    """로컬 실행 시에만 쓰이는 파일 읽기. 클라우드에서는 보통 비어 있다."""
+    """
+    로컬 파일 읽기. ENABLE_LOCAL_PERSISTENCE=true 로 명시적으로 켠 경우에만
+    동작한다. 공개 배포 기본값은 세션 저장만 쓴다 (여러 사용자가 프로세스를
+    공유해 서버 파일이 섞일 수 있기 때문).
+    """
+    if not ENABLE_LOCAL_PERSISTENCE:
+        return {}
     try:
         if SAVE_PATH.exists():
             return json.loads(SAVE_PATH.read_text(encoding="utf-8"))
@@ -909,10 +920,9 @@ def _disk_read() -> dict:
 
 
 def _disk_write(data: dict) -> bool:
-    """
-    파일 저장 시도. Streamlit Cloud 는 쓰기가 되더라도 서버 재시작 시 사라지므로
-    실패해도 문제 삼지 않는다 (세션 보관 + 파일 내려받기로 보완).
-    """
+    """ENABLE_LOCAL_PERSISTENCE=true 인 로컬 실행에서만 파일로 저장한다."""
+    if not ENABLE_LOCAL_PERSISTENCE:
+        return False
     try:
         SAVE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                              encoding="utf-8")
@@ -932,6 +942,30 @@ def write_saved(data: dict) -> bool:
     st.session_state[STORE_KEY] = data
     _disk_write(data)          # 로컬이면 파일로도 남고, 클라우드면 조용히 무시
     return True
+
+
+MAX_IMPORT_BYTES = 2_000_000  # 저장 파일은 보통 수십~수백 KB 수준이면 충분하다
+
+
+def _safe_import_json(uploaded_file):
+    """
+    가져오기 파일을 검증한다 (크기 + 최소 형식).
+    반환: (data, None) 성공 / (None, 에러 메시지) 실패
+    """
+    size = getattr(uploaded_file, "size", None)
+    if size is not None and size > MAX_IMPORT_BYTES:
+        return None, (f"파일이 너무 큽니다 ({size / 1e6:.1f}MB). "
+                      f"{MAX_IMPORT_BYTES / 1e6:.0f}MB 이하만 허용합니다.")
+    try:
+        data = json.loads(uploaded_file.getvalue().decode("utf-8"))
+    except Exception as ex:
+        return None, f"JSON으로 읽지 못했습니다: {ex}"
+    if not isinstance(data, dict):
+        return None, "파일 형식이 올바르지 않습니다 (저장 이름 → 구성 객체 형태가 아닙니다)."
+    for k, v in data.items():
+        if not isinstance(v, dict):
+            return None, f"'{k}' 항목의 형식이 올바르지 않습니다."
+    return data, None
 
 
 def snapshot(port_specs, bench_list, base_ccy, use_div, rf_rate, label="") -> dict:
@@ -1183,17 +1217,21 @@ OPT_SAVE_PATH = Path(__file__).parent / "optimizations.json"
 
 def load_opt_saved() -> dict:
     if OPT_STORE_KEY not in st.session_state:
-        try:
-            st.session_state[OPT_STORE_KEY] = (
-                json.loads(OPT_SAVE_PATH.read_text(encoding="utf-8"))
-                if OPT_SAVE_PATH.exists() else {})
-        except Exception:
-            st.session_state[OPT_STORE_KEY] = {}
+        st.session_state[OPT_STORE_KEY] = {}
+        if ENABLE_LOCAL_PERSISTENCE:
+            try:
+                st.session_state[OPT_STORE_KEY] = (
+                    json.loads(OPT_SAVE_PATH.read_text(encoding="utf-8"))
+                    if OPT_SAVE_PATH.exists() else {})
+            except Exception:
+                st.session_state[OPT_STORE_KEY] = {}
     return st.session_state[OPT_STORE_KEY]
 
 
 def write_opt_saved(data: dict) -> bool:
     st.session_state[OPT_STORE_KEY] = data
+    if not ENABLE_LOCAL_PERSISTENCE:
+        return True
     try:
         OPT_SAVE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                                  encoding="utf-8")
@@ -7959,16 +7997,15 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         up_o = st.file_uploader("설정 파일 가져오기", type=["json"],
                                 key="_opt_up", label_visibility="collapsed")
         if up_o is not None and not st.session_state.get("_opt_imported"):
-            try:
-                inc = json.loads(up_o.getvalue().decode("utf-8"))
-                if isinstance(inc, dict):
-                    merged = dict(load_opt_saved()); merged.update(inc)
-                    write_opt_saved(merged)
-                    st.session_state["_opt_imported"] = True
-                    st.success(f"{len(inc)}개 설정을 불러왔습니다.")
-                    st.rerun()
-            except Exception as ex:
-                st.error(f"파일을 읽지 못했습니다: {ex}")
+            inc, err = _safe_import_json(up_o)
+            if err:
+                st.error(err)
+            else:
+                merged = dict(load_opt_saved()); merged.update(inc)
+                write_opt_saved(merged)
+                st.session_state["_opt_imported"] = True
+                st.success(f"{len(inc)}개 설정을 불러왔습니다.")
+                st.rerun()
         st.caption("설정은 브라우저 세션에 보관됩니다. 오래 쓰실 구성은 "
                    "**📥 내보내기**로 파일을 받아두세요.")
 
@@ -8798,16 +8835,15 @@ with st.expander("💾 구성 저장 / 불러오기", expanded=False):
                            label_visibility="collapsed",
                            help="내려받아 둔 portfolios.json 을 올리면 복원됩니다.")
     if up is not None and not st.session_state.get("_imported_once"):
-        try:
-            incoming = json.loads(up.getvalue().decode("utf-8"))
-            if isinstance(incoming, dict):
-                merged = dict(load_saved()); merged.update(incoming)
-                write_saved(merged)
-                st.session_state["_imported_once"] = True
-                st.success(f"{len(incoming)}개 구성을 불러왔습니다.")
-                st.rerun()
-        except Exception as ex:
-            st.error(f"파일을 읽지 못했습니다: {ex}")
+        incoming, err = _safe_import_json(up)
+        if err:
+            st.error(err)
+        else:
+            merged = dict(load_saved()); merged.update(incoming)
+            write_saved(merged)
+            st.session_state["_imported_once"] = True
+            st.success(f"{len(incoming)}개 구성을 불러왔습니다.")
+            st.rerun()
 
 
 st.subheader("벤치마크 (Benchmark)")
