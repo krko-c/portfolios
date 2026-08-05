@@ -4840,34 +4840,61 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
     with st.expander("📐 기간을 바꿔도 민감도가 유지되는가", expanded=False):
         st.caption("R²가 높아도 **개별 요인 계수는 표본에 따라 흔들릴 수 있습니다.** "
                    "추정 기간을 바꿔가며 부호가 유지되는지 확인합니다. "
-                   "부호가 뒤집히면 그 요인은 판정을 유보하는 게 안전합니다.")
+                   "부호가 뒤집히면 그 요인은 판정을 유보하는 게 안전합니다.\n\n"
+                   "자산 가격은 여기서 **최대 5년치를 따로 조회**해 1·3·5년 구간을 "
+                   "정확히 잘라 씁니다. 위 4️⃣ 표(추정 기간이 짧으면)와는 표본이 "
+                   "달라 값이 다를 수 있습니다.")
         if st.button("📐 안정성 확인", width="stretch", key="_mv_stab"):
-            srows = []
+            srows, r2rows = [], []
             with st.spinner("기간별로 다시 추정 중..."):
                 per = {}
-                for yrs in (1, 3, 5):
-                    s_ = pd.Timestamp(end_date) - pd.DateOffset(years=yrs)
-                    Fy, _bad = build_factors(s_, end_date, f_freq, tuple(picks))
-                    if Fy is None or Fy.empty:
-                        continue
-                    Ry = R.loc[Fy.index[0]:]
-                    per[yrs] = {t_: factor_betas(Ry[t_], Fy)[0] for t_ in use_tk
-                                if t_ in Ry.columns}
-                for t_ in use_tk:
-                    for fac in F.columns:
-                        vals = [per[y].get(t_, {}).get(fac) for y in per
-                                if t_ in per[y]]
-                        vals = [v for v in vals if v is not None and np.isfinite(v)]
-                        if len(vals) < 2:
+                _stab_start = pd.Timestamp(end_date) - pd.DateOffset(years=5)
+                try:
+                    stab_px, _sm, _sf = build_price_frame(
+                        use_tk, _stab_start, end_date, base_ccy, use_div,
+                        True, gap_fill)
+                except Exception as ex:
+                    st.error(f"안정성 검사용 자산 데이터를 가져오지 못했습니다: {ex}")
+                    stab_px = None
+                if stab_px is not None and not stab_px.empty:
+                    _stab_p = (stab_px if f_freq == "일별"
+                              else stab_px.resample("W-FRI").last())
+                    Rall = _stab_p.pct_change()
+                    for yrs in (1, 3, 5):
+                        s_ = pd.Timestamp(end_date) - pd.DateOffset(years=yrs)
+                        Fy, _bad = build_factors(s_, end_date, f_freq, tuple(picks))
+                        if Fy is None or Fy.empty:
                             continue
-                        signs = {np.sign(v) for v in vals if abs(v) > 1e-9}
-                        stable = len(signs) <= 1
-                        srows.append({
-                            "티커": t_, "요인": fac,
-                            **{f"{y}년": per[y].get(t_, {}).get(fac, np.nan)
-                               for y in sorted(per)},
-                            "부호 유지": "✅" if stable else "❌ 뒤집힘",
-                            "변동폭": float(max(vals) - min(vals))})
+                        Fyz, _ = standardize(Fy)
+                        Ry = Rall.loc[Fyz.index[0]:]
+                        per[yrs] = {t_: factor_betas(Ry[t_], Fyz) for t_ in use_tk
+                                    if t_ in Ry.columns}
+            for t_ in use_tk:
+                r2row = {"티커": t_}
+                for y in (1, 3, 5):
+                    rec = per.get(y, {}).get(t_)
+                    r2row[f"{y}년 R²"] = rec[1] if rec else np.nan
+                    r2row[f"{y}년 표본"] = rec[2] if rec else np.nan
+                r2rows.append(r2row)
+                for fac in F.columns:
+                    year_vals = {}
+                    for y in per:
+                        rec = per[y].get(t_)
+                        if rec is None:
+                            continue
+                        v = rec[0].get(fac)
+                        if v is not None and np.isfinite(v):
+                            year_vals[y] = v * 100
+                    if len(year_vals) < 2:
+                        continue
+                    vals = list(year_vals.values())
+                    signs = {np.sign(v) for v in vals if abs(v) > 1e-9}
+                    stable = len(signs) <= 1
+                    srows.append({
+                        "티커": t_, "요인": fac,
+                        **{f"{y}년": year_vals.get(y, np.nan) for y in (1, 3, 5)},
+                        "부호 유지": "✅" if stable else "❌ 뒤집힘",
+                        "변동폭": float(max(vals) - min(vals))})
             if srows:
                 sdf = pd.DataFrame(srows)
                 _flip = sdf[sdf["부호 유지"].astype(str).str.startswith("❌")]
@@ -4883,9 +4910,18 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
                     width="stretch", hide_index=True)
                 st.caption("**변동폭**이 클수록 기간에 따라 민감도가 크게 달라진다는 "
                            "뜻입니다. 부호가 유지되더라도 변동폭이 크면 크기를 "
-                           "그대로 믿기는 어렵습니다.")
+                           "그대로 믿기는 어렵습니다. 값은 각 기간의 요인을 그 "
+                           "기간 안에서 다시 표준화한 뒤 비교한 것입니다(1σ 기준 %).")
+                st.dataframe(pd.DataFrame(r2rows).style.format(
+                    {c: "{:.2f}" for c in pd.DataFrame(r2rows).columns
+                     if c.endswith("R²")}
+                    | {c: "{:.0f}" for c in pd.DataFrame(r2rows).columns
+                       if c.endswith("표본")}, na_rep="-"),
+                    width="stretch", hide_index=True)
+                st.caption("기간이 짧을수록 표본(주별 기준 1년≈52개)이 적어 R²가 "
+                           "불안정할 수 있습니다.")
             else:
-                st.warning("기간별 추정에 필요한 데이터가 부족합니다.")
+                st.warning("안정성 검사에 필요한 데이터가 부족합니다.")
 
     # ---------------- 자동 검증 ----------------
     with st.expander("🧪 민감도가 상식과 맞는지 확인", expanded=False):
