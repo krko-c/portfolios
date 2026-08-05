@@ -116,13 +116,15 @@ def _suffix_currency(ticker: str) -> str:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_ticker(ticker: str, start, end):
+def load_ticker(ticker: str, start, end, currency: str = None, name: str = None):
     """
-    종목 1개의 가격 + 통화를 가져온다.
+    종목 1개의 가격을 가져온다.
     반환: {"close": Series, "adjclose": Series, "currency": str, "name": str}
     - close    : 액면분할만 보정된 주가 (배당 제외)
     - adjclose : 액면분할 + 배당 재투자까지 보정
-    통화는 야후 메타데이터에서 직접 읽는다.
+
+    currency/name 을 인자로 주면(보통 probe_ticker 결과) 그대로 쓰고 야후에
+    다시 묻지 않는다 — 안 주면 여기서 새로 감지한다(단독 호출 대비).
     """
     tk = yf.Ticker(ticker)
     hist = tk.history(start=start, end=end, auto_adjust=False)
@@ -135,21 +137,21 @@ def load_ticker(ticker: str, start, end):
     close = hist["Close"].dropna()
     adj = hist["Adj Close"].dropna() if "Adj Close" in hist.columns else close.copy()
 
-    # --- 통화 자동 감지 ---
-    currency, name = None, ticker
-    try:
-        fi = tk.fast_info
-        currency = (fi.get("currency") if hasattr(fi, "get") else getattr(fi, "currency", None))
-    except Exception:
-        pass
     if not currency:
         try:
-            info = tk.info or {}
-            currency = info.get("currency")
-            name = info.get("shortName") or info.get("longName") or ticker
+            fi = tk.fast_info
+            currency = (fi.get("currency") if hasattr(fi, "get") else getattr(fi, "currency", None))
         except Exception:
             pass
+        if not currency:
+            try:
+                info = tk.info or {}
+                currency = info.get("currency")
+                name = name or info.get("shortName") or info.get("longName")
+            except Exception:
+                pass
     currency = (currency or _suffix_currency(ticker)).upper()
+    name = name or ticker
 
     return {"close": close, "adjclose": adj, "currency": currency, "name": name}
 
@@ -1347,16 +1349,20 @@ def build_price_frame(tickers, start, end, base_ccy: str, use_dividends: bool,
     series, meta, fx_cache = {}, {}, {}
 
     for t in tickers:
-        d = load_ticker(t, start, end)
-        px = d["adjclose"] if use_dividends else d["close"]
-        ccy = d["currency"]
-        # 자산 유형 판정에 쓸 상품 구분은 probe_ticker 결과에서 가져온다
-        _qt = ""
+        # 통화·종목명·상품구분은 probe_ticker 한 번으로 같이 얻는다.
+        # (예전에는 load_ticker 가 통화·이름을 따로 조회해 야후를 두 번 불렀고,
+        #  그마저도 fast_info 가 통화를 주면 이름 조회를 건너뛰어 이름이 티커
+        #  그대로 남는 경우가 많았다.)
         try:
             _pr = probe_ticker((t,))
-            _qt = str(_pr.get("quote_type") or "")
         except Exception:
-            _qt = ""
+            _pr = {"currency": None, "name": "", "quote_type": ""}
+        _qt = str(_pr.get("quote_type") or "")
+        _nm = _pr.get("name") or None
+        _ccy = _pr.get("currency") or None
+        d = load_ticker(t, start, end, currency=_ccy, name=_nm)
+        px = d["adjclose"] if use_dividends else d["close"]
+        ccy = d["currency"]
         meta[t] = {"currency": ccy, "name": d["name"], "rows": len(px),
                    "quote_type": _qt}
 
