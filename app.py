@@ -5068,15 +5068,23 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
         st.info(f"포트폴리오의 **{_hold:.1f}%** 는 지금 요인 세트로 설명되지 않아 "
                 f"판단을 유보했습니다. 이 부분은 다른 근거로 판단하셔야 합니다.")
 
-    _wavg = float((idf["조정점수"] * idf["비중(%)"] / 100).sum())
-    if _neg > 50:
+    # 가중 평균은 판정 가능한 자산만으로 계산한다 (판정 유보는 비중까지 왜곡시킴)
+    _ok_df = idf[_ok]
+    _ok_wsum = float(_ok_df["비중(%)"].sum())
+    _wavg = (float((_ok_df["조정점수"] * _ok_df["비중(%)"]).sum() / _ok_wsum)
+             if _ok_wsum > 1e-9 else np.nan)
+    _wavg_txt = (f"{_wavg:+.2f} (판정 가능한 자산 기준)" if np.isfinite(_wavg)
+                 else "계산 불가 (판정 가능한 자산 없음)")
+    if not np.isfinite(_wavg):
+        st.info("모든 자산이 판정 유보라 가중 평균 점수를 계산할 수 없습니다.")
+    elif _neg > 50:
         st.warning(f"입력한 전망이 맞다면 포트폴리오의 **{_neg:.1f}%** 가 불리한 "
-                   f"자산입니다. 가중 평균 점수는 **{_wavg:+.2f}** 입니다.")
+                   f"자산입니다. 가중 평균 점수는 **{_wavg_txt}** 입니다.")
     elif _pos > 50:
         st.success(f"전망에 유리한 자산이 **{_pos:.1f}%** 입니다. "
-                   f"가중 평균 점수 **{_wavg:+.2f}**.")
+                   f"가중 평균 점수 **{_wavg_txt}**.")
     else:
-        st.info(f"유불리가 뚜렷하지 않습니다. 가중 평균 점수 **{_wavg:+.2f}**.")
+        st.info(f"유불리가 뚜렷하지 않습니다. 가중 평균 점수 **{_wavg_txt}**.")
 
     fb = go.Figure(go.Bar(
         x=idf["조정점수"], y=idf["티커"], orientation="h",
