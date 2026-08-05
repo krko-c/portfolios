@@ -5383,11 +5383,23 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
     h1, h2 = st.columns([1, 3])
     horizon = h1.selectbox("전망 기간", ["6개월", "1년", "2년", "3년"], index=1,
                            key="_bl_horizon",
-                           help="이 전망이 어느 기간을 내다본 것인지입니다. "
-                                "기간이 짧을수록 같은 전망이라도 불확실성이 커집니다.")
-    h2.caption("전망 기간이 짧으면 **같은 확신도라도 반영 강도를 낮춥니다.** "
-               "6개월 앞을 3년 앞만큼 확신하기는 어렵기 때문입니다. "
-               "입력하신 수익률은 **연율 기준**으로 해석합니다.")
+                           help="이 전망이 어느 기간을 내다본 것인지입니다.")
+    use_bl_hz = h1.checkbox(
+        "⏱ 기간조정 사용", value=False, key="_bl_hz_on",
+        help="켜면 짧은 기간(6개월)의 전망은 확신도를 더 크게 낮추고, 긴 "
+             "기간(3년)은 덜 낮춥니다 (6개월 1.6배 ~ 3년 0.7배). 이 배수는 "
+             "이론적으로 정해진 값이 아니라 휴리스틱이라 **기본은 꺼져 "
+             "있습니다**. 꺼두면 전망 기간은 기록용으로만 쓰이고, 확신도는 "
+             "위에서 고른 값 그대로 반영됩니다.")
+    if use_bl_hz:
+        h2.caption("전망 기간이 짧으면 **같은 확신도라도 반영 강도를 낮춥니다** "
+                   "(6개월 1.6배 ~ 3년 0.7배, 휴리스틱). 6개월 앞을 3년 앞만큼 "
+                   "확신하기는 어렵다는 가정입니다. "
+                   "입력하신 수익률은 **연율 기준**으로 해석합니다.")
+    else:
+        h2.caption("**기간조정이 꺼져 있어** 전망 기간은 기록용으로만 쓰이고 "
+                   "확신도 반영 강도에는 영향을 주지 않습니다. "
+                   "입력하신 수익률은 **연율 기준**으로 해석합니다.")
 
     p1, p2, p3 = st.columns(3)
     auto_delta = p1.checkbox("위험회피계수 자동 추정", value=True, key="_bl_autod",
@@ -5463,9 +5475,9 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
     P, Q, conf, vdesc = [], [], [], []
     sig = np.sqrt(np.diag(cov))          # 자산별 연 변동성
 
-    # 전망 기간이 짧을수록 불확실성을 키운다 (1년 기준 1.0)
+    # 전망 기간이 짧을수록 불확실성을 키운다 (1년 기준 1.0) — 기간조정을 켰을 때만
     HZ_MULT = {"6개월": 1.6, "1년": 1.0, "2년": 0.8, "3년": 0.7}
-    hz = HZ_MULT.get(horizon, 1.0)
+    hz = HZ_MULT.get(horizon, 1.0) if use_bl_hz else 1.0
 
     if mode == "간단 모드" and simple_df is not None:
         scale = float(np.clip((100 - conf_pct) / max(conf_pct, 1) * hz, 0.02, 12.0))
@@ -5732,6 +5744,7 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
                 "표본": f"{len(R):,}일", "자산별 최대 비중": f"{wmax_bl}%",
                 "공매도": "허용" if allow_short else "금지",
                 "기준 통화": base_ccy, "무위험 수익률": f"{rf_rate*100:.2f}%",
+                "기간조정 사용": "예" if use_bl_hz else "아니오",
             }.items()), columns=["항목", "값"]).to_excel(xw, sheet_name="6_설정",
                                                        index=False)
         st.download_button("📊 엑셀 파일 받기", buf.getvalue(),
@@ -5745,7 +5758,9 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
                               + (" (자동 추정)" if auto_delta else "")),
                              ("τ", f"{tau:.3f} (고정)"),
                              ("공분산 추정", lookback),
-                             ("전망 기간", horizon),
+                             ("전망 기간", f"{horizon} · 가중치로 반영 (6개월 1.6~3년 0.7)"
+                              if use_bl_hz else
+                              f"{horizon} · 기록용만 — 기간조정 미사용, 확신도엔 반영 안 함"),
                              ("과거 성과 리밸런싱", "분기별 고정")])
     st.caption("이 모형은 기준 비중이 합리적인 출발점이라는 가정에 기대며, 공분산은 과거에서 "
                "추정합니다. 전망이 빗나가면 결과도 빗나갑니다. "
