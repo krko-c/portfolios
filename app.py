@@ -5065,7 +5065,11 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
     idf = pd.DataFrame(irows).sort_values("조정점수", ascending=False)
     # 자산군마다 민감도 크기가 달라(채권은 듀레이션 탓에 큼) 절대 기준으로는
     # 전부 '긍정'이 된다. 포트폴리오 안에서의 상대 크기로 등급을 매긴다.
-    _scale = float(idf["조정점수"].abs().max()) or 1.0
+    # 판정 유보(R²<0.10) 자산은 계수가 우연히 클 수 있어 기준에서 뺀다 —
+    # 안 빼면 판정 가능한 자산들의 등급 기준 자체가 왜곡된다.
+    _valid_r2 = idf["R²"].notna() & (idf["R²"] >= 0.10)
+    _scale = (float(idf.loc[_valid_r2, "조정점수"].abs().max())
+              if _valid_r2.any() else 1.0) or 1.0
     idf["종합 영향"] = [
         "판정 유보" if (not np.isfinite(r2_) or r2_ < 0.10)
         else impact_label(v, _scale)
