@@ -34,7 +34,7 @@ MAX_PORTFOLIOS = 6
 
 # 사이드바 메뉴 — 성격별로 묶어 표시한다
 TOOL_GROUPS = [
-    ("분석", ["📊 포트폴리오 분석", "📉 시장 추세 국면", "🔗 자산 상관관계",
+    ("분석", ["📊 포트폴리오 분석", "📉 시장·거시 국면", "🔗 자산 상관관계",
               "🌩 스트레스 테스트"]),
     ("배분", ["🎯 포트폴리오 최적화", "🧭 뷰 기반 자산배분", "➕ 자산 추가 효과"]),
     ("결정", ["⚖️ 최종 대안 비교"]),
@@ -369,9 +369,13 @@ def probe_ticker(candidates: tuple):
                        _clean_name(_inf.get("shortName"), cand))
             except Exception:
                 nm_ = ""
+        # 자산 유형 판정에 쓸 상품 구분. 추가 조회 없이 meta 에서 가져온다.
+        # EQUITY / ETF / MUTUALFUND / INDEX / CURRENCY / FUTURE 등
+        qtype = str(hm.get("instrumentType") or "").upper()
         info = {
             "ticker": cand,
             "currency": (ccy or _suffix_currency(cand)).upper(),
+            "quote_type": qtype,
             "name": nm_,
             "rows": len(h),
             "first": pd.to_datetime(h.index[0]).date(),
@@ -1296,7 +1300,15 @@ def build_price_frame(tickers, start, end, base_ccy: str, use_dividends: bool,
         d = load_ticker(t, start, end)
         px = d["adjclose"] if use_dividends else d["close"]
         ccy = d["currency"]
-        meta[t] = {"currency": ccy, "name": d["name"], "rows": len(px)}
+        # 자산 유형 판정에 쓸 상품 구분은 probe_ticker 결과에서 가져온다
+        _qt = ""
+        try:
+            _pr = probe_ticker((t,))
+            _qt = str(_pr.get("quote_type") or "")
+        except Exception:
+            _qt = ""
+        meta[t] = {"currency": ccy, "name": d["name"], "rows": len(px),
+                   "quote_type": _qt}
 
         if ccy != base_ccy and not fx_hedge:
             if ccy not in fx_cache:
@@ -2295,11 +2307,188 @@ METRIC_DOCS = {
 }
 
 
+# ======================================================================
+# 자체 점검 (계산 정합성)
+# ======================================================================
+def run_self_tests(prices: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    핵심 계산이 지켜야 할 성질을 실제로 확인한다.
+    실데이터를 주면 그것으로, 없으면 합성 데이터로 검사한다.
+    """
+    rows = []
+
+    def check(name, fn, note=""):
+        try:
+            ok, detail = fn()
+        except Exception as ex:
+            ok, detail = False, f"{type(ex).__name__}: {str(ex)[:60]}"
+        rows.append({"검사": name, "결과": "✅ 통과" if ok else "❌ 실패",
+                     "상세": detail, "확인하는 것": note})
+
+    if prices is None or prices.empty or prices.shape[1] < 2:
+        rng = np.random.default_rng(0)
+        n = 900
+        idx = pd.date_range("2021-01-01", periods=n, freq="B")
+        mk = rng.normal(.0004, .010, n)
+        prices = pd.DataFrame(
+            {t: 100 * np.exp(np.cumsum(a + b * mk + rng.normal(0, s, n)))
+             for t, a, b, s in [("A", .0005, 1.0, .004), ("B", .0001, -.2, .002),
+                                ("C", .0003, .1, .008)]}, index=idx)
+    tk = list(prices.columns)[:3]
+    px = prices[tk].dropna()
+    W = {t: 100.0 / len(tk) for t in tk}
+
+    # 1. 기여도 항등식
+    def t_contrib():
+        worst = 0.0
+        for mode in (REBAL_DAILY, REBAL_MONTH, REBAL_QUARTER, REBAL_YEAR, REBAL_NONE):
+            r = portfolio_returns(px, W, mode)
+            g = growth_contribution(px, W, mode, r)
+            worst = max(worst, abs(float(g.sum()) - float((1 + r).prod() - 1)))
+        return worst < 1e-9, f"최대 오차 {worst:.2e}"
+    check("성장 기여도 = 총수익", t_contrib,
+          "종목별 기여도를 더하면 포트폴리오 총수익과 같아야 합니다")
+
+    # 2. 비중 추이 합계
+    def t_weight():
+        worst = 0.0
+        for mode in (REBAL_QUARTER, REBAL_NONE):
+            s = weight_drift(px, W, mode).sum(axis=1)
+            worst = max(worst, float((s - 1).abs().max()))
+        return worst < 1e-9, f"최대 편차 {worst:.2e}"
+    check("보유 비중 합계 = 100%", t_weight,
+          "어느 시점에도 비중 합이 100%를 벗어나면 안 됩니다")
+
+    # 3. 자산곡선 시작값
+    def t_equity():
+        v = float(equity_curve(portfolio_returns(px, W, REBAL_QUARTER)).iloc[0])
+        return abs(v - 1.0) < 1e-12, f"첫 값 {v:.10f}"
+    check("자산곡선이 1.00에서 시작", t_equity,
+          "첫날 수익률이 곡선에 미리 반영되면 안 됩니다")
+
+    # 4. 회전율 경계
+    def t_turnover():
+        a = turnover_series(px, W, REBAL_NONE).iloc[1:].sum()
+        b = annual_turnover(turnover_series(px, W, REBAL_DAILY))
+        return (a < 1e-9 and b > 0.5), f"매수후보유 {a:.2e} · 매일 {b*100:.0f}%/년"
+    check("회전율 경계값", t_turnover,
+          "매수 후 보유는 거래가 0, 매일 리밸런싱은 회전율이 커야 합니다")
+
+    # 5. 거래비용 방향
+    def t_cost():
+        r = portfolio_returns(px, W, REBAL_QUARTER)
+        tno = turnover_series(px, W, REBAL_QUARTER).reindex(r.index).fillna(0)
+        g, nt = cagr(r), cagr(apply_cost(r, tno, 50))
+        return nt < g, f"비용 전 {g*100:.3f}% → 후 {nt*100:.3f}%"
+    check("거래비용이 성과를 낮춤", t_cost,
+          "비용을 넣으면 수익률이 반드시 줄어야 합니다")
+
+    # 6. 종목별 제약
+    def t_bounds():
+        mu, cov = ann_stats(px.pct_change().dropna())
+        lo = np.array([0.0, 0.0, 0.15][:len(tk)])
+        hi = np.array([0.40, 1.0, 1.0][:len(tk)])
+        w = opt_max_sharpe(mu, cov, 0.03, lo, hi)
+        ok = ((w >= lo - 1e-6).all() and (w <= hi + 1e-6).all()
+              and abs(w.sum() - 1) < 1e-6)
+        return ok, " ".join(f"{t}:{x*100:.1f}%" for t, x in zip(tk, w))
+    check("종목별 최소·최대 비중 준수", t_bounds,
+          "종목마다 다른 한도가 각각 적용되어야 합니다")
+
+    # 7. 잘못된 제약 검출
+    def t_badbounds():
+        try:
+            mu, cov = ann_stats(px.pct_change().dropna())
+            opt_min_vol(mu, cov, np.array([0.6] + [0.0] * (len(tk) - 1)),
+                        np.array([0.3] + [1.0] * (len(tk) - 1)))
+            return False, "예외가 발생하지 않음"
+        except ValueError:
+            return True, "ValueError 발생 (정상)"
+    check("모순된 제약을 걸러냄", t_badbounds,
+          "최소가 최대보다 크면 조용히 넘어가면 안 됩니다")
+
+    # 8. 0분모 방어
+    def t_zerodiv():
+        flat = pd.Series(0.0, index=px.index[:200])
+        vals = [sharpe_ratio(flat, 0.03), sortino_ratio(flat, 0.03), calmar_ratio(flat)]
+        return all(pd.isna(v) for v in vals), "샤프·소르티노·칼마 모두 NaN"
+    check("변동성 0일 때 비율 폭주 방지", t_zerodiv,
+          "가격이 안 움직이면 비율 지표는 값을 낼 수 없어야 합니다")
+
+    # 9. BL — 뷰가 없으면 기준 비중
+    def t_bl():
+        mu, cov = ann_stats(px.pct_change().dropna())
+        wm = np.array([0.5, 0.3, 0.2][:len(tk)])
+        wm = wm / wm.sum()
+        _, post = black_litterman(cov, wm, 2.5, 0.05, None, None, None)
+        w = bl_weights(post, cov, 2.5, -1.0, 1.0, allow_short=True)
+        d = float(np.abs(w - wm).max())
+        return d < 1e-6, f"최대 차이 {d:.2e}"
+    check("뷰가 없으면 기준 비중 그대로", t_bl,
+          "블랙-리터만의 핵심 성질입니다")
+
+    # 10. 상대 부 기준 초과수익
+    def t_excess():
+        rp = portfolio_returns(px, W, REBAL_QUARTER)
+        rb = px[tk[0]].pct_change().dropna()
+        a, b = rp.align(rb, join="inner")
+        pe, be = (1 + a).cumprod(), (1 + b).cumprod()
+        exact = float(pe.iloc[-1]) / float(be.iloc[-1]) - 1
+        shown = float((pe / be - 1).iloc[-1])
+        return abs(exact - shown) < 1e-12, f"오차 {abs(exact-shown):.2e}"
+    check("누적 초과수익 = 상대 부 변화", t_excess,
+          "일별 차이를 복리로 굴리면 실제와 벌어집니다")
+
+    # 11. 채권 충격 방향
+    def t_bond():
+        up = shock_asset("국채", 16.0, 250, 0, 0, 300, 0, 0, 0)["금리"]
+        dn = shock_asset("국채", 16.0, 250, 0, 0, -300, 0, 0, 0)["금리"]
+        hy = shock_asset("하이일드", 3.5, 25, 0, 0, 0, 300, 0, 0)["신용"]
+        ig = shock_asset("회사채", 8.4, 120, 0, 0, 0, 300, 0, 0)["신용"]
+        ok = (up < 0 < dn) and abs(dn) > abs(up) and hy < ig < 0
+        return ok, f"금리+300 {up:.1f}% · −300 {dn:+.1f}% · 신용 HY {hy:.1f}% IG {ig:.1f}%"
+    check("채권 충격 방향과 볼록성", t_bond,
+          "금리 상승은 손실, 하락 이익이 더 커야 하고, 하이일드가 신용에 더 민감해야 합니다")
+
+    # 12. 환율 곱셈 적용
+    def t_fx():
+        v = combine_shock({"주식": -35.0, "금리": 0, "신용": 0, "원자재": 0}, 12.0)
+        exact = ((1 - 0.35) * (1 + 0.12) - 1) * 100
+        return abs(v - exact) < 1e-9, f"{v:.2f}% (덧셈이면 {-35+12}%)"
+    check("환율을 곱셈으로 적용", t_fx,
+          "단순 덧셈은 충격이 클수록 실제와 벌어집니다")
+
+    return pd.DataFrame(rows)
+
+
 def render_help():
     st.title("📖 도움말")
     st.caption("이 도구를 쓰는 방법과, 화면에 나오는 숫자들이 무슨 뜻인지 정리했습니다.")
 
-    tab1, tab2, tab3 = st.tabs(["🚀 사용법", "📊 지표 사전", "🔬 방법론"])
+    tab1, tab2, tab3, tab4 = st.tabs(["🚀 사용법", "📊 지표 사전", "🔬 방법론",
+                                      "🧪 자체 점검"])
+
+    with tab4:
+        st.subheader("계산 정합성 자체 점검")
+        st.caption("이 도구의 핵심 계산이 지켜야 할 성질을 실제로 확인합니다. "
+                   "기여도 합계가 총수익과 맞는지, 비중 합이 100%인지, 제약이 "
+                   "지켜지는지 같은 것들입니다. **하나라도 실패하면 결과를 믿지 "
+                   "마시고 알려주세요.**")
+        if st.button("🧪 점검 실행", type="primary", width="stretch",
+                     key="_selftest_go"):
+            with st.spinner("계산 검증 중..."):
+                _res = run_self_tests()
+            _fail = int((_res["결과"].astype(str).str.contains("실패")).sum())
+            if _fail:
+                st.error(f"🚫 {_fail}개 항목이 실패했습니다. 아래 상세를 확인해주세요.")
+            else:
+                st.success(f"✅ {len(_res)}개 항목 모두 통과했습니다.")
+            st.dataframe(_res, width="stretch", hide_index=True)
+            st.caption("합성 데이터로 검사합니다. 실제 종목 데이터가 아니라 "
+                       "**계산 논리 자체**를 확인하는 것입니다.")
+        else:
+            st.info("👆 **점검 실행**을 누르면 12가지 항목을 확인합니다.")
+
 
     # ------------------------------------------------------------------
     with tab1:
@@ -2313,7 +2502,7 @@ def render_help():
             "| **➕ 자산 추가 효과** | 무엇을 얼마나 더하면 좋을까 |\n"
             "| **🧭 뷰 기반 자산배분** | 내 전망을 배분에 어떻게 반영하나 |\n"
             "| **🔗 자산 상관관계** | 이 종목들은 서로 얼마나 겹치나 |\n"
-            "| **📉 시장 국면** | 강세·약세 구분 + 경기·물가 거시 국면 |\n""| **🌩 스트레스 테스트** | 과거 위기 재현 + 가상 충격 |\n""| **⚖️ 최종 대안 비교** | 여러 안 중 무엇을 고를까 |\n\n"
+            "| **📉 시장·거시 국면** | 강세·약세 구분 + 경기·물가 거시 국면 |\n""| **🌩 스트레스 테스트** | 과거 위기 재현 + 가상 충격 |\n""| **⚖️ 최종 대안 비교** | 여러 안 중 무엇을 고를까 |\n\n"
             "**사이드바 설정(기준 통화·기간·배당·거래비용·환헤지 등)은 모든 화면에 "
             "공통으로 적용**됩니다. 종목 표와 티커 입력 방식도 화면마다 동일합니다.")
 
@@ -2438,6 +2627,10 @@ def render_help():
                 "ETF는 '확인 필요'로 표시되니 듀레이션을 넣어주세요.\n\n"
                 "**베타는 현지통화 기준**으로 추정합니다. 기준통화로 환산하면 환율이 "
                 "이미 섞여 들어가 환율 충격이 이중 반영되기 때문입니다.\n\n"
+                "**시장·통화가 여럿이면** 금리와 환율을 따로 줄 수 있습니다. "
+                "미국채와 한국채는 다르게 움직이니까요.\n\n"
+                "요인별 기여도에 **상호작용** 항목이 있는데, 환율이 곱셈으로 적용되며 "
+                "생기는 차이입니다. 이 항목까지 더해야 합계가 예상 손익과 맞습니다.\n\n"
                 "**선형 근사라는 점을 기억하세요.** 베타는 과거 평균이고, 실제 위기에는 "
                 "상관관계가 급등해 추정보다 더 빠지는 경우가 많습니다. 하한선이 아니라 "
                 "대략의 크기로 보시면 됩니다.")
@@ -2456,10 +2649,13 @@ def render_help():
             st.markdown(
                 "**📉 시장 국면** 화면의 두 번째 탭입니다. 미국 거시지표"
                 "(산업생산·고용·물가)로 **경기 × 물가** 4분면을 판정합니다.\n\n"
-                "**발표 지연**을 반드시 감안하세요. 거시지표는 한두 달 뒤에 발표되고 "
-                "이후 수정되므로, 기본값 2개월만큼 지표를 뒤로 밀어 그 시점에 실제로 "
-                "알 수 있었던 값만 씁니다. 지연을 0으로 두면 지금 시점의 최신 수정치를 "
-                "쓰게 되어 과거를 실제보다 정확히 맞힌 것처럼 보입니다.\n\n"
+                "**발표 지연**을 반드시 감안하세요. 거시지표는 한두 달 뒤에 발표되므로 "
+                "기본값 2개월만큼 지표를 뒤로 옮겨 그 시차를 근사적으로 반영합니다.\n\n"
+                "다만 **과거 수치의 사후 수정 효과까지 없애지는 못합니다.** 지금 FRED에서 "
+                "받는 값은 최신 개정치라서요. 완전히 재현하려면 ALFRED의 발표 당시 "
+                "데이터가 필요한데, 이 도구는 거기까지 다루지 않습니다. "
+                "그래서 이 화면은 **현재 상황을 읽는 용도**이고 과거 백테스트에는 "
+                "쓰지 않습니다.\n\n"
                 "**시장 내재 신호**는 야후 가격으로 계산합니다. 거시지표는 실물이고 "
                 "시장은 선반영이라, **둘이 엇갈릴 때가 오히려 정보**입니다.\n\n"
                 "**과거 국면별 성과**는 접어두었습니다. 표본이 적고 사후 수정 문제가 "
@@ -2488,6 +2684,14 @@ def render_help():
             "**화면끼리 표를 공유하지는 않습니다.** 각 화면의 표는 독립적이므로, "
             "한쪽을 고쳐도 다른 쪽은 그대로입니다. 옮기고 싶을 때만 복사·붙여넣기를 "
             "쓰시면 됩니다.")
+
+        st.divider()
+        st.subheader("계산이 맞는지 확인하려면")
+        st.markdown(
+            "**🧪 자체 점검** 탭에서 이 도구의 핵심 계산이 지켜야 할 성질 12가지를 "
+            "직접 확인할 수 있습니다. 기여도 합계가 총수익과 맞는지, 비중 합이 100%인지, "
+            "종목별 제약이 실제로 지켜지는지 같은 것들입니다.\n\n"
+            "하나라도 실패하면 그 결과는 믿지 마시고 알려주세요.")
 
         st.divider()
         st.subheader("저장 · 내보내기")
@@ -2853,7 +3057,7 @@ ASSET_META = {
     # 국채
     "SHY": ("국채", 1.9, 5), "IEI": ("국채", 4.3, 25), "IEF": ("국채", 7.5, 70),
     "TLH": ("국채", 11.5, 150), "TLT": ("국채", 16.0, 250), "EDV": ("국채", 23.0, 600),
-    "GOVT": ("국채", 6.0, 50), "SHV": ("국채", 0.3, 1), "BIL": ("국채", 0.2, 1),
+    "GOVT": ("국채", 6.0, 50),
     "TIP": ("국채", 6.8, 60), "SCHO": ("국채", 1.9, 5), "SPTL": ("국채", 15.5, 240),
     "148070.KS": ("국채", 7.0, 60), "152380.KS": ("국채", 4.5, 25),
     "114260.KS": ("국채", 2.8, 10), "304660.KS": ("국채", 17.0, 280),
@@ -2872,6 +3076,25 @@ ASSET_META = {
     "GSG": ("원자재", None, None), "PDBC": ("원자재", None, None),
     "USO": ("원자재", None, None), "COMT": ("원자재", None, None),
     "DBA": ("원자재", None, None), "COPX": ("원자재", None, None),
+    # 대표 주식형 ETF — quoteType 이 ETF 라도 유형이 분명하다
+    "SPY": ("주식", None, None), "VOO": ("주식", None, None),
+    "IVV": ("주식", None, None), "QQQ": ("주식", None, None),
+    "VTI": ("주식", None, None), "DIA": ("주식", None, None),
+    "IWM": ("주식", None, None), "EFA": ("주식", None, None),
+    "EEM": ("주식", None, None), "VEA": ("주식", None, None),
+    "VWO": ("주식", None, None), "ACWI": ("주식", None, None),
+    "SCHD": ("주식", None, None), "VIG": ("주식", None, None),
+    "VNQ": ("주식", None, None), "XLK": ("주식", None, None),
+    "XLF": ("주식", None, None), "XLE": ("주식", None, None),
+    "XLY": ("주식", None, None), "XLP": ("주식", None, None),
+    "XLV": ("주식", None, None), "XLI": ("주식", None, None),
+    "XLU": ("주식", None, None), "SOXX": ("주식", None, None),
+    "SMH": ("주식", None, None), "SPMO": ("주식", None, None),
+    "069500.KS": ("주식", None, None), "229200.KS": ("주식", None, None),
+    "371460.KS": ("주식", None, None), "379800.KS": ("주식", None, None),
+    "133690.KS": ("주식", None, None), "360750.KS": ("주식", None, None),
+    # 현금성
+    "SHV": ("현금", 0.3, 1), "BIL": ("현금", 0.2, 1),
 }
 
 # 유형별 신용 스프레드 민감도 (스프레드 듀레이션, 연)
@@ -2893,10 +3116,17 @@ SHOCK_PRESETS = {
                  "gold": 15.0, "cm": -25.0},
 }
 
-MARKET_SIGNALS_STRESS = {"USD": "미국", "KRW": "한국", "JPY": "일본", "EUR": "유럽"}
+# 통화 → 금리 시장. 금리와 환율은 시장마다 따로 움직이므로 구분한다.
+CCY_MARKET = {"USD": "미국", "KRW": "한국", "JPY": "일본", "EUR": "유럽",
+              "GBP": "영국", "CNY": "중국", "HKD": "홍콩", "TWD": "대만"}
 
 
-def guess_asset_kind(ticker: str, name: str = "") -> tuple:
+def asset_market(ticker: str, ccy: str) -> str:
+    """자산이 어느 금리 시장에 속하는지. 통화를 기준으로 본다."""
+    return CCY_MARKET.get(str(ccy).upper(), str(ccy).upper() or "기타")
+
+
+def guess_asset_kind(ticker: str, name: str = "", quote_type: str = "") -> tuple:
     """
     티커·종목명으로 자산 유형을 추정한다.
     반환: (유형, 듀레이션, 볼록성, 자동판정 여부)
@@ -2920,8 +3150,19 @@ def guess_asset_kind(ticker: str, name: str = "") -> tuple:
         return "원자재", None, None, False
     if any(x in nm for x in ("BOND", "채권", "FIXED INCOME")):
         return "기타·혼합", 5.0, 40, False
-    # 확실하지 않으면 주식으로 단정하지 않는다. 이름을 못 받아온 채권 ETF가
-    # 주식으로 처리되면 금리 충격이 통째로 빠진다.
+    # 상품 구분이 있으면 그걸 우선한다.
+    #   EQUITY  → 개별 주식이 확실하다
+    #   ETF·펀드 → 안에 무엇이 들었는지 모르므로 기타·혼합으로 두고 확인받는다
+    qt = str(quote_type or "").upper()
+    if qt == "EQUITY":
+        return "주식", None, None, True
+    if qt in ("ETF", "MUTUALFUND", "FUND"):
+        return "기타·혼합", None, None, False
+    if qt in ("INDEX", "CURRENCY", "FUTURE", "CRYPTOCURRENCY"):
+        return "기타·혼합", None, None, False
+
+    # 상품 구분을 못 받았을 때만 티커 형식으로 추정한다.
+    # 이름을 못 받아온 채권 ETF가 주식으로 처리되면 금리 충격이 통째로 빠진다.
     if re.fullmatch(r"[A-Z]{1,5}", key) or re.fullmatch(r"\d{6}\.(KS|KQ)", key):
         return "주식", None, None, False
     return "기타·혼합", None, None, False
@@ -3371,8 +3612,13 @@ def render_hypo_stress(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fi
                                   "추정됩니다. 국가를 섞었다면 주별을 권합니다.")
     bench_h = b3.text_input("베타 기준 지수", value="^GSPC", key="_hypo_bench")
 
-    run_h = st.button("🔎 자산 유형·민감도 확인", width="stretch", key="_hypo_scan")
-    if run_h:
+    # 종목 구성이 바뀌면 다시 확인해야 하지만, 베타 설정만 바꾼 경우에는
+    # 화면이 스캔 이전으로 되돌아가지 않도록 상태를 유지한다.
+    _scan_sig = tuple(tickers)
+    if st.session_state.get("_hypo_scan_sig") != _scan_sig:
+        st.session_state["_hypo_scan_done"] = False
+        st.session_state["_hypo_scan_sig"] = _scan_sig
+    if st.button("🔎 자산 유형·민감도 확인", width="stretch", key="_hypo_scan"):
         st.session_state["_hypo_scan_done"] = True
     if not st.session_state.get("_hypo_scan_done"):
         st.info("👆 먼저 **자산 유형·민감도 확인**을 눌러 각 종목의 성격을 확인하세요.")
@@ -3409,7 +3655,9 @@ def render_hypo_stress(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fi
     akey = "_hypo_attr"
     guess = []
     for t_ in use_tk:
-        k_, d_, c_, auto = guess_asset_kind(t_, meta.get(t_, {}).get("name", ""))
+        _mt = meta.get(t_, {})
+        k_, d_, c_, auto = guess_asset_kind(t_, _mt.get("name", ""),
+                                            _mt.get("quote_type", ""))
         q = bq.get(t_, {})
         guess.append({
             "티커": t_, "유형": k_,
@@ -3493,7 +3741,7 @@ def render_hypo_stress(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fi
                                float(pre.get("fx", 0.0)), step=1.0,
                                key=f"_hypo_fx_{preset}",
                                help=f"{base_ccy} 외 통화 자산에 곱셈으로 적용됩니다. "
-                                    f"사이드바에서 환율효과를 제외했다면 무시됩니다.")
+                                    f"아래에서 통화별로 다르게 줄 수도 있습니다.")
     gold_shock = s5.number_input("금 (%)", -40.0, 50.0,
                                  float(pre.get("gold", 0.0)), step=1.0,
                                  key=f"_hypo_gold_{preset}",
@@ -3503,11 +3751,39 @@ def render_hypo_stress(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fi
                                float(pre.get("cm", 0.0)), step=1.0,
                                key=f"_hypo_cm_{preset}")
 
+    # ---------------- 시장·통화별 세부 조정 ----------------
+    _ccys = sorted({str(A.loc[t_, "통화"]).upper() for t_ in use_tk})
+    _mkts = sorted({asset_market(t_, A.loc[t_, "통화"]) for t_ in use_tk
+                    if str(A.loc[t_, "유형"]) in ("국채", "회사채", "하이일드",
+                                                "기타·혼합")})
+    dy_by_mkt, fx_by_ccy = {}, {}
+    if len(_mkts) > 1 or len([c for c in _ccys if c != base_ccy]) > 1:
+        with st.expander("🌍 시장·통화별로 다르게 주기", expanded=False):
+            st.caption("금리와 환율은 나라마다 따로 움직입니다. 비워두면 위에서 정한 "
+                       "값을 모든 시장·통화에 동일하게 적용합니다.")
+            if len(_mkts) > 1:
+                st.markdown("**금리 (bp)**")
+                _cols = st.columns(len(_mkts))
+                for c_, mk in zip(_cols, _mkts):
+                    dy_by_mkt[mk] = c_.number_input(
+                        f"{mk} 금리", -300.0, 400.0, float(dy_shock), step=10.0,
+                        key=f"_hypo_dy_{mk}_{preset}")
+            _fcys = [c for c in _ccys if c != base_ccy]
+            if len(_fcys) > 1:
+                st.markdown(f"**환율 ({base_ccy} 대비 절하, %)**")
+                _cols2 = st.columns(len(_fcys))
+                for c_, cy in zip(_cols2, _fcys):
+                    fx_by_ccy[cy] = c_.number_input(
+                        f"{cy}/{base_ccy}", -20.0, 30.0, float(fx_shock), step=1.0,
+                        key=f"_hypo_fx_{cy}_{preset}")
+
     # 충격 설정이 바뀌면 결과를 무효화하고, 그 외 재실행에서는 결과를 유지한다.
     # (버튼은 누른 그 실행에서만 True 라, 아래 위젯을 건드리면 결과가 사라진다)
     _sig = (preset, eq_shock, dy_shock, cs_shock, fx_shock, gold_shock, cm_shock,
+            tuple(sorted(dy_by_mkt.items())), tuple(sorted(fx_by_ccy.items())),
             tuple(use_tk), tuple(np.round(live["비중(%)"].fillna(0).values, 4)),
-            tuple(map(str, attr.values.ravel())))
+            tuple(map(str, attr.values.ravel())),
+            tuple(sorted(st.session_state.get("_hypo_sd", {}).items())))
     if st.session_state.get("_hypo_sig") != _sig:
         st.session_state["_hypo_run"] = False
         st.session_state["_hypo_sig"] = _sig
@@ -3528,16 +3804,21 @@ def render_hypo_stress(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fi
         for t_ in use_tk:
             a = A.loc[t_]
             kind = str(a["유형"])
+            ccy = str(a["통화"]).upper()
             _sd = st.session_state.get("_hypo_sd", {}).get(t_)
+            # 시장·통화별로 다르게 지정했으면 그 값을 쓴다
+            _mk = asset_market(t_, ccy)
+            _dy = dy_by_mkt.get(_mk, dy_) if dy_by_mkt else dy_
             f = shock_asset(kind, float(a["듀레이션"]) or None,
                             float(a["볼록성"]) or None, float(a["주식 베타"]),
-                            eq_, dy_, cs_, gold_, cm_, spread_dur=_sd)
-            ccy = str(a["통화"])
-            fx_e = fx_ if (not fx_hedge and ccy != base_ccy) else 0.0
+                            eq_, _dy, cs_, gold_, cm_, spread_dur=_sd)
+            _fx = fx_by_ccy.get(ccy, fx_) if fx_by_ccy else fx_
+            fx_e = _fx if (not fx_hedge and ccy != base_ccy) else 0.0
             tot_e = combine_shock(f, fx_e)
             contrib = tot_e * float(w[t_]) / 100
             total += contrib
-            rows.append({"티커": t_, "유형": kind, "비중(%)": float(w[t_]),
+            rows.append({"티커": t_, "유형": kind, "시장": _mk,
+                         "비중(%)": float(w[t_]),
                          "주식효과(%)": f["주식"], "금리효과(%)": f["금리"],
                          "신용효과(%)": f["신용"], "원자재효과(%)": f["원자재"],
                          "환율효과(%)": fx_e, "합계(%)": tot_e,
@@ -4605,15 +4886,15 @@ def rolling_z(s: pd.Series, win=60, minp=24) -> pd.Series:
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def load_fred(start="1990-01-01"):
+def load_fred(start="1990-01-01", end=None):
     """FRED 거시지표. 실패하면 (None, 오류문)을 돌려준다."""
     try:
         from pandas_datareader import data as pdr
     except Exception:
         return None, "pandas-datareader 가 설치되어 있지 않습니다."
     try:
-        df = pdr.DataReader(list(FRED_SERIES), "fred", start,
-                            pd.Timestamp.today().strftime("%Y-%m-%d"))
+        _end = pd.Timestamp(end or pd.Timestamp.today()).strftime("%Y-%m-%d")
+        df = pdr.DataReader(list(FRED_SERIES), "fred", start, _end)
         try:
             df = df.resample("ME").last()
         except ValueError:
@@ -4673,9 +4954,10 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
 
     c1, c2, c3 = st.columns(3)
     lag_m = c1.slider("발표 지연 반영 (개월)", 0, 3, 2, step=1, key="_mac_lag",
-                      help="거시지표는 한두 달 뒤에 발표되고 이후 수정됩니다. "
-                           "그 시점에 실제로 알 수 있었던 값만 쓰도록 뒤로 밉니다. "
-                           "0으로 두면 지금 시점에서 본 최신 수정치를 씁니다.")
+                      help="거시지표는 한두 달 뒤에 발표됩니다. 그 시차를 근사적으로 "
+                           "반영하려고 지표를 이 개월 수만큼 뒤로 옮깁니다.\n\n"
+                           "다만 **과거 수치의 사후 수정 효과는 제거되지 않습니다.** "
+                           "지금 FRED에서 받는 값은 최신 개정치이기 때문입니다.")
     z_win = c2.selectbox("z점수 기준 기간", [36, 60, 120], index=1, key="_mac_win",
                          format_func=lambda x: f"{x}개월",
                          help="점수를 매기는 비교 구간입니다. 길수록 안정적이지만 "
@@ -4690,7 +4972,8 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
         return
 
     with st.spinner("FRED 거시지표 조회 중..."):
-        fred, err = load_fred()
+        # 시장 신호와 같은 종료일을 써야 두 국면을 같은 시점에서 비교할 수 있다
+        fred, err = load_fred(end=end_date)
     if fred is None:
         st.error(f"🚫 FRED 데이터를 가져오지 못했습니다.\n\n{err}")
         st.caption("네트워크가 막혀 있거나 FRED 서비스가 일시적으로 응답하지 않을 수 "
@@ -4856,7 +5139,8 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
             st.markdown(f"현재 국면 **{last['국면']}** · 유리 `{fav}` · 불리 `{unf}`")
         st.caption("각 종목이 어느 쪽인지는 직접 골라주세요. 자동 분류는 "
                    "종목마다 성격이 달라 오히려 잘못된 진단을 줄 수 있습니다.")
-        cls_key = "_mac_cls"
+        # 다른 구성을 고르면 이전 선택이 남지 않도록 키를 구성별로 만든다
+        cls_key = f"_mac_cls_{abs(hash(pick_src)) % 100000}"
         cdf0 = pd.DataFrame([{"티커": r["티커"], "비중(%)": r["비중"], "성격": "중립"}
                              for r in rows_p])
         cls = st.data_editor(
@@ -4929,8 +5213,9 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
                 except Exception as ex:
                     st.error(f"계산하지 못했습니다: {ex}")
 
-    st.caption("거시 국면은 **현재 상황을 읽는 참고 자료**입니다. 발표 지연과 사후 수정 "
-               "때문에 과거를 정확히 재현하기 어려우므로, 이 화면의 판정을 과거 "
+    st.caption("발표 시차는 지표를 뒤로 옮겨 근사적으로 반영하지만, **과거 수치의 사후 "
+               "수정 효과는 제거되지 않습니다**(최신 개정치를 쓰기 때문입니다). "
+               "그래서 이 화면은 현재 상황을 읽는 참고 자료이며, 판정을 과거 "
                "백테스트에 쓰지 않습니다. 교육·참고용이며 투자 자문이 아닙니다.")
 
 
@@ -5019,7 +5304,7 @@ def regime_segments(px: pd.Series, lab: pd.Series) -> pd.DataFrame:
 
 
 def render_regimes(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, rf_rate):
-    st.title("📉 시장 국면")
+    st.title("📉 시장·거시 국면")
     _t1, _t2 = st.tabs(["📈 시장 추세 국면 (가격 기반)", "🌡 거시 경기·물가 국면 (FRED)"])
     with _t2:
         render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill)
@@ -7524,7 +7809,7 @@ IS_BL = tool.endswith("자산배분")
 if IS_STRESS:
     render_stress(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, rf_rate)
     st.stop()
-IS_REG = tool.endswith("추세 국면")
+IS_REG = tool.endswith("거시 국면")
 
 if IS_BL:
     render_black_litterman(base_ccy, start_date, end_date, use_div,
