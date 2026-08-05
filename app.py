@@ -16,6 +16,7 @@ streamlit run app.py
 
 import io
 import json
+import os
 import re
 from pathlib import Path
 
@@ -31,6 +32,10 @@ import streamlit as st
 
 TRADING_DAYS = 252
 MAX_PORTFOLIOS = 6
+# 공개 배포(예: Streamlit Cloud)는 접속자 전원이 프로세스 하나를 공유하므로,
+# 서버 파일에 저장하면 다른 세션의 구성이 섞여 보일 수 있다.
+# 본인 컴퓨터에서 혼자 실행할 때만 명시적으로 켜서 쓴다.
+ENABLE_LOCAL_PERSISTENCE = os.environ.get("ENABLE_LOCAL_PERSISTENCE", "").lower() == "true"
 
 # 사이드바 메뉴 — 성격별로 묶어 표시한다
 TOOL_GROUPS = [
@@ -111,13 +116,15 @@ def _suffix_currency(ticker: str) -> str:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_ticker(ticker: str, start, end):
+def load_ticker(ticker: str, start, end, currency: str = None, name: str = None):
     """
-    종목 1개의 가격 + 통화를 가져온다.
+    종목 1개의 가격을 가져온다.
     반환: {"close": Series, "adjclose": Series, "currency": str, "name": str}
     - close    : 액면분할만 보정된 주가 (배당 제외)
     - adjclose : 액면분할 + 배당 재투자까지 보정
-    통화는 야후 메타데이터에서 직접 읽는다.
+
+    currency/name 을 인자로 주면(보통 probe_ticker 결과) 그대로 쓰고 야후에
+    다시 묻지 않는다 — 안 주면 여기서 새로 감지한다(단독 호출 대비).
     """
     tk = yf.Ticker(ticker)
     hist = tk.history(start=start, end=end, auto_adjust=False)
@@ -130,21 +137,21 @@ def load_ticker(ticker: str, start, end):
     close = hist["Close"].dropna()
     adj = hist["Adj Close"].dropna() if "Adj Close" in hist.columns else close.copy()
 
-    # --- 통화 자동 감지 ---
-    currency, name = None, ticker
-    try:
-        fi = tk.fast_info
-        currency = (fi.get("currency") if hasattr(fi, "get") else getattr(fi, "currency", None))
-    except Exception:
-        pass
     if not currency:
         try:
-            info = tk.info or {}
-            currency = info.get("currency")
-            name = info.get("shortName") or info.get("longName") or ticker
+            fi = tk.fast_info
+            currency = (fi.get("currency") if hasattr(fi, "get") else getattr(fi, "currency", None))
         except Exception:
             pass
+        if not currency:
+            try:
+                info = tk.info or {}
+                currency = info.get("currency")
+                name = name or info.get("shortName") or info.get("longName")
+            except Exception:
+                pass
     currency = (currency or _suffix_currency(ticker)).upper()
+    name = name or ticker
 
     return {"close": close, "adjclose": adj, "currency": currency, "name": name}
 
@@ -795,6 +802,18 @@ def render_ticker_table(*, state_key, editor_key, gen_key, cols, weight_col=None
         st.rerun()
 
     live = f[f["티커"] != ""].copy()
+
+    # 정규화 후 같은 티커가 두 번 이상 있으면 이후 set_index/reindex 가 깨지거나
+    # 최소·최대 비중 같은 행별 조건이 모호해진다. 자동 합산 대신 차단한다.
+    _tk_list = list(live["티커"])
+    _dup_tk = sorted({t for t in _tk_list if _tk_list.count(t) > 1})
+    if _dup_tk:
+        st.error(f"같은 종목이 여러 행에 중복 입력됐습니다: **{', '.join(_dup_tk)}**\n\n"
+                 f"`005930`과 `005930.KS`처럼 표기가 달라도 정규화하면 같은 "
+                 f"티커가 되면 중복으로 처리됩니다. 자동으로 합치지 않으니, "
+                 f"위 표에서 중복된 행을 지우거나 한 행으로 정리해주세요.")
+        st.stop()
+
     return live, list(live["티커"]), bad
 
 
@@ -887,7 +906,13 @@ STORE_KEY = "_saved_store"
 
 
 def _disk_read() -> dict:
-    """로컬 실행 시에만 쓰이는 파일 읽기. 클라우드에서는 보통 비어 있다."""
+    """
+    로컬 파일 읽기. ENABLE_LOCAL_PERSISTENCE=true 로 명시적으로 켠 경우에만
+    동작한다. 공개 배포 기본값은 세션 저장만 쓴다 (여러 사용자가 프로세스를
+    공유해 서버 파일이 섞일 수 있기 때문).
+    """
+    if not ENABLE_LOCAL_PERSISTENCE:
+        return {}
     try:
         if SAVE_PATH.exists():
             return json.loads(SAVE_PATH.read_text(encoding="utf-8"))
@@ -897,10 +922,9 @@ def _disk_read() -> dict:
 
 
 def _disk_write(data: dict) -> bool:
-    """
-    파일 저장 시도. Streamlit Cloud 는 쓰기가 되더라도 서버 재시작 시 사라지므로
-    실패해도 문제 삼지 않는다 (세션 보관 + 파일 내려받기로 보완).
-    """
+    """ENABLE_LOCAL_PERSISTENCE=true 인 로컬 실행에서만 파일로 저장한다."""
+    if not ENABLE_LOCAL_PERSISTENCE:
+        return False
     try:
         SAVE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                              encoding="utf-8")
@@ -920,6 +944,30 @@ def write_saved(data: dict) -> bool:
     st.session_state[STORE_KEY] = data
     _disk_write(data)          # 로컬이면 파일로도 남고, 클라우드면 조용히 무시
     return True
+
+
+MAX_IMPORT_BYTES = 2_000_000  # 저장 파일은 보통 수십~수백 KB 수준이면 충분하다
+
+
+def _safe_import_json(uploaded_file):
+    """
+    가져오기 파일을 검증한다 (크기 + 최소 형식).
+    반환: (data, None) 성공 / (None, 에러 메시지) 실패
+    """
+    size = getattr(uploaded_file, "size", None)
+    if size is not None and size > MAX_IMPORT_BYTES:
+        return None, (f"파일이 너무 큽니다 ({size / 1e6:.1f}MB). "
+                      f"{MAX_IMPORT_BYTES / 1e6:.0f}MB 이하만 허용합니다.")
+    try:
+        data = json.loads(uploaded_file.getvalue().decode("utf-8"))
+    except Exception as ex:
+        return None, f"JSON으로 읽지 못했습니다: {ex}"
+    if not isinstance(data, dict):
+        return None, "파일 형식이 올바르지 않습니다 (저장 이름 → 구성 객체 형태가 아닙니다)."
+    for k, v in data.items():
+        if not isinstance(v, dict):
+            return None, f"'{k}' 항목의 형식이 올바르지 않습니다."
+    return data, None
 
 
 def snapshot(port_specs, bench_list, base_ccy, use_div, rf_rate, label="") -> dict:
@@ -1171,17 +1219,21 @@ OPT_SAVE_PATH = Path(__file__).parent / "optimizations.json"
 
 def load_opt_saved() -> dict:
     if OPT_STORE_KEY not in st.session_state:
-        try:
-            st.session_state[OPT_STORE_KEY] = (
-                json.loads(OPT_SAVE_PATH.read_text(encoding="utf-8"))
-                if OPT_SAVE_PATH.exists() else {})
-        except Exception:
-            st.session_state[OPT_STORE_KEY] = {}
+        st.session_state[OPT_STORE_KEY] = {}
+        if ENABLE_LOCAL_PERSISTENCE:
+            try:
+                st.session_state[OPT_STORE_KEY] = (
+                    json.loads(OPT_SAVE_PATH.read_text(encoding="utf-8"))
+                    if OPT_SAVE_PATH.exists() else {})
+            except Exception:
+                st.session_state[OPT_STORE_KEY] = {}
     return st.session_state[OPT_STORE_KEY]
 
 
 def write_opt_saved(data: dict) -> bool:
     st.session_state[OPT_STORE_KEY] = data
+    if not ENABLE_LOCAL_PERSISTENCE:
+        return True
     try:
         OPT_SAVE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                                  encoding="utf-8")
@@ -1297,16 +1349,20 @@ def build_price_frame(tickers, start, end, base_ccy: str, use_dividends: bool,
     series, meta, fx_cache = {}, {}, {}
 
     for t in tickers:
-        d = load_ticker(t, start, end)
-        px = d["adjclose"] if use_dividends else d["close"]
-        ccy = d["currency"]
-        # 자산 유형 판정에 쓸 상품 구분은 probe_ticker 결과에서 가져온다
-        _qt = ""
+        # 통화·종목명·상품구분은 probe_ticker 한 번으로 같이 얻는다.
+        # (예전에는 load_ticker 가 통화·이름을 따로 조회해 야후를 두 번 불렀고,
+        #  그마저도 fast_info 가 통화를 주면 이름 조회를 건너뛰어 이름이 티커
+        #  그대로 남는 경우가 많았다.)
         try:
             _pr = probe_ticker((t,))
-            _qt = str(_pr.get("quote_type") or "")
         except Exception:
-            _qt = ""
+            _pr = {"currency": None, "name": "", "quote_type": ""}
+        _qt = str(_pr.get("quote_type") or "")
+        _nm = _pr.get("name") or None
+        _ccy = _pr.get("currency") or None
+        d = load_ticker(t, start, end, currency=_ccy, name=_nm)
+        px = d["adjclose"] if use_dividends else d["close"]
+        ccy = d["currency"]
         meta[t] = {"currency": ccy, "name": d["name"], "rows": len(px),
                    "quote_type": _qt}
 
@@ -4840,34 +4896,61 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
     with st.expander("📐 기간을 바꿔도 민감도가 유지되는가", expanded=False):
         st.caption("R²가 높아도 **개별 요인 계수는 표본에 따라 흔들릴 수 있습니다.** "
                    "추정 기간을 바꿔가며 부호가 유지되는지 확인합니다. "
-                   "부호가 뒤집히면 그 요인은 판정을 유보하는 게 안전합니다.")
+                   "부호가 뒤집히면 그 요인은 판정을 유보하는 게 안전합니다.\n\n"
+                   "자산 가격은 여기서 **최대 5년치를 따로 조회**해 1·3·5년 구간을 "
+                   "정확히 잘라 씁니다. 위 4️⃣ 표(추정 기간이 짧으면)와는 표본이 "
+                   "달라 값이 다를 수 있습니다.")
         if st.button("📐 안정성 확인", width="stretch", key="_mv_stab"):
-            srows = []
+            srows, r2rows = [], []
             with st.spinner("기간별로 다시 추정 중..."):
                 per = {}
-                for yrs in (1, 3, 5):
-                    s_ = pd.Timestamp(end_date) - pd.DateOffset(years=yrs)
-                    Fy, _bad = build_factors(s_, end_date, f_freq, tuple(picks))
-                    if Fy is None or Fy.empty:
-                        continue
-                    Ry = R.loc[Fy.index[0]:]
-                    per[yrs] = {t_: factor_betas(Ry[t_], Fy)[0] for t_ in use_tk
-                                if t_ in Ry.columns}
-                for t_ in use_tk:
-                    for fac in F.columns:
-                        vals = [per[y].get(t_, {}).get(fac) for y in per
-                                if t_ in per[y]]
-                        vals = [v for v in vals if v is not None and np.isfinite(v)]
-                        if len(vals) < 2:
+                _stab_start = pd.Timestamp(end_date) - pd.DateOffset(years=5)
+                try:
+                    stab_px, _sm, _sf = build_price_frame(
+                        use_tk, _stab_start, end_date, base_ccy, use_div,
+                        True, gap_fill)
+                except Exception as ex:
+                    st.error(f"안정성 검사용 자산 데이터를 가져오지 못했습니다: {ex}")
+                    stab_px = None
+                if stab_px is not None and not stab_px.empty:
+                    _stab_p = (stab_px if f_freq == "일별"
+                              else stab_px.resample("W-FRI").last())
+                    Rall = _stab_p.pct_change()
+                    for yrs in (1, 3, 5):
+                        s_ = pd.Timestamp(end_date) - pd.DateOffset(years=yrs)
+                        Fy, _bad = build_factors(s_, end_date, f_freq, tuple(picks))
+                        if Fy is None or Fy.empty:
                             continue
-                        signs = {np.sign(v) for v in vals if abs(v) > 1e-9}
-                        stable = len(signs) <= 1
-                        srows.append({
-                            "티커": t_, "요인": fac,
-                            **{f"{y}년": per[y].get(t_, {}).get(fac, np.nan)
-                               for y in sorted(per)},
-                            "부호 유지": "✅" if stable else "❌ 뒤집힘",
-                            "변동폭": float(max(vals) - min(vals))})
+                        Fyz, _ = standardize(Fy)
+                        Ry = Rall.loc[Fyz.index[0]:]
+                        per[yrs] = {t_: factor_betas(Ry[t_], Fyz) for t_ in use_tk
+                                    if t_ in Ry.columns}
+            for t_ in use_tk:
+                r2row = {"티커": t_}
+                for y in (1, 3, 5):
+                    rec = per.get(y, {}).get(t_)
+                    r2row[f"{y}년 R²"] = rec[1] if rec else np.nan
+                    r2row[f"{y}년 표본"] = rec[2] if rec else np.nan
+                r2rows.append(r2row)
+                for fac in F.columns:
+                    year_vals = {}
+                    for y in per:
+                        rec = per[y].get(t_)
+                        if rec is None:
+                            continue
+                        v = rec[0].get(fac)
+                        if v is not None and np.isfinite(v):
+                            year_vals[y] = v * 100
+                    if len(year_vals) < 2:
+                        continue
+                    vals = list(year_vals.values())
+                    signs = {np.sign(v) for v in vals if abs(v) > 1e-9}
+                    stable = len(signs) <= 1
+                    srows.append({
+                        "티커": t_, "요인": fac,
+                        **{f"{y}년": year_vals.get(y, np.nan) for y in (1, 3, 5)},
+                        "부호 유지": "✅" if stable else "❌ 뒤집힘",
+                        "변동폭": float(max(vals) - min(vals))})
             if srows:
                 sdf = pd.DataFrame(srows)
                 _flip = sdf[sdf["부호 유지"].astype(str).str.startswith("❌")]
@@ -4883,9 +4966,18 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
                     width="stretch", hide_index=True)
                 st.caption("**변동폭**이 클수록 기간에 따라 민감도가 크게 달라진다는 "
                            "뜻입니다. 부호가 유지되더라도 변동폭이 크면 크기를 "
-                           "그대로 믿기는 어렵습니다.")
+                           "그대로 믿기는 어렵습니다. 값은 각 기간의 요인을 그 "
+                           "기간 안에서 다시 표준화한 뒤 비교한 것입니다(1σ 기준 %).")
+                st.dataframe(pd.DataFrame(r2rows).style.format(
+                    {c: "{:.2f}" for c in pd.DataFrame(r2rows).columns
+                     if c.endswith("R²")}
+                    | {c: "{:.0f}" for c in pd.DataFrame(r2rows).columns
+                       if c.endswith("표본")}, na_rep="-"),
+                    width="stretch", hide_index=True)
+                st.caption("기간이 짧을수록 표본(주별 기준 1년≈52개)이 적어 R²가 "
+                           "불안정할 수 있습니다.")
             else:
-                st.warning("기간별 추정에 필요한 데이터가 부족합니다.")
+                st.warning("안정성 검사에 필요한 데이터가 부족합니다.")
 
     # ---------------- 자동 검증 ----------------
     with st.expander("🧪 민감도가 상식과 맞는지 확인", expanded=False):
@@ -5029,7 +5121,11 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
     idf = pd.DataFrame(irows).sort_values("조정점수", ascending=False)
     # 자산군마다 민감도 크기가 달라(채권은 듀레이션 탓에 큼) 절대 기준으로는
     # 전부 '긍정'이 된다. 포트폴리오 안에서의 상대 크기로 등급을 매긴다.
-    _scale = float(idf["조정점수"].abs().max()) or 1.0
+    # 판정 유보(R²<0.10) 자산은 계수가 우연히 클 수 있어 기준에서 뺀다 —
+    # 안 빼면 판정 가능한 자산들의 등급 기준 자체가 왜곡된다.
+    _valid_r2 = idf["R²"].notna() & (idf["R²"] >= 0.10)
+    _scale = (float(idf.loc[_valid_r2, "조정점수"].abs().max())
+              if _valid_r2.any() else 1.0) or 1.0
     idf["종합 영향"] = [
         "판정 유보" if (not np.isfinite(r2_) or r2_ < 0.10)
         else impact_label(v, _scale)
@@ -5293,11 +5389,23 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
     h1, h2 = st.columns([1, 3])
     horizon = h1.selectbox("전망 기간", ["6개월", "1년", "2년", "3년"], index=1,
                            key="_bl_horizon",
-                           help="이 전망이 어느 기간을 내다본 것인지입니다. "
-                                "기간이 짧을수록 같은 전망이라도 불확실성이 커집니다.")
-    h2.caption("전망 기간이 짧으면 **같은 확신도라도 반영 강도를 낮춥니다.** "
-               "6개월 앞을 3년 앞만큼 확신하기는 어렵기 때문입니다. "
-               "입력하신 수익률은 **연율 기준**으로 해석합니다.")
+                           help="이 전망이 어느 기간을 내다본 것인지입니다.")
+    use_bl_hz = h1.checkbox(
+        "⏱ 기간조정 사용", value=False, key="_bl_hz_on",
+        help="켜면 짧은 기간(6개월)의 전망은 확신도를 더 크게 낮추고, 긴 "
+             "기간(3년)은 덜 낮춥니다 (6개월 1.6배 ~ 3년 0.7배). 이 배수는 "
+             "이론적으로 정해진 값이 아니라 휴리스틱이라 **기본은 꺼져 "
+             "있습니다**. 꺼두면 전망 기간은 기록용으로만 쓰이고, 확신도는 "
+             "위에서 고른 값 그대로 반영됩니다.")
+    if use_bl_hz:
+        h2.caption("전망 기간이 짧으면 **같은 확신도라도 반영 강도를 낮춥니다** "
+                   "(6개월 1.6배 ~ 3년 0.7배, 휴리스틱). 6개월 앞을 3년 앞만큼 "
+                   "확신하기는 어렵다는 가정입니다. "
+                   "입력하신 수익률은 **연율 기준**으로 해석합니다.")
+    else:
+        h2.caption("**기간조정이 꺼져 있어** 전망 기간은 기록용으로만 쓰이고 "
+                   "확신도 반영 강도에는 영향을 주지 않습니다. "
+                   "입력하신 수익률은 **연율 기준**으로 해석합니다.")
 
     p1, p2, p3 = st.columns(3)
     auto_delta = p1.checkbox("위험회피계수 자동 추정", value=True, key="_bl_autod",
@@ -5373,9 +5481,9 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
     P, Q, conf, vdesc = [], [], [], []
     sig = np.sqrt(np.diag(cov))          # 자산별 연 변동성
 
-    # 전망 기간이 짧을수록 불확실성을 키운다 (1년 기준 1.0)
+    # 전망 기간이 짧을수록 불확실성을 키운다 (1년 기준 1.0) — 기간조정을 켰을 때만
     HZ_MULT = {"6개월": 1.6, "1년": 1.0, "2년": 0.8, "3년": 0.7}
-    hz = HZ_MULT.get(horizon, 1.0)
+    hz = HZ_MULT.get(horizon, 1.0) if use_bl_hz else 1.0
 
     if mode == "간단 모드" and simple_df is not None:
         scale = float(np.clip((100 - conf_pct) / max(conf_pct, 1) * hz, 0.02, 12.0))
@@ -5642,6 +5750,7 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
                 "표본": f"{len(R):,}일", "자산별 최대 비중": f"{wmax_bl}%",
                 "공매도": "허용" if allow_short else "금지",
                 "기준 통화": base_ccy, "무위험 수익률": f"{rf_rate*100:.2f}%",
+                "기간조정 사용": "예" if use_bl_hz else "아니오",
             }.items()), columns=["항목", "값"]).to_excel(xw, sheet_name="6_설정",
                                                        index=False)
         st.download_button("📊 엑셀 파일 받기", buf.getvalue(),
@@ -5655,7 +5764,9 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
                               + (" (자동 추정)" if auto_delta else "")),
                              ("τ", f"{tau:.3f} (고정)"),
                              ("공분산 추정", lookback),
-                             ("전망 기간", horizon),
+                             ("전망 기간", f"{horizon} · 가중치로 반영 (6개월 1.6~3년 0.7)"
+                              if use_bl_hz else
+                              f"{horizon} · 기록용만 — 기간조정 미사용, 확신도엔 반영 안 함"),
                              ("과거 성과 리밸런싱", "분기별 고정")])
     st.caption("이 모형은 기준 비중이 합리적인 출발점이라는 가정에 기대며, 공분산은 과거에서 "
                "추정합니다. 전망이 빗나가면 결과도 빗나갑니다. "
@@ -7907,16 +8018,15 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
         up_o = st.file_uploader("설정 파일 가져오기", type=["json"],
                                 key="_opt_up", label_visibility="collapsed")
         if up_o is not None and not st.session_state.get("_opt_imported"):
-            try:
-                inc = json.loads(up_o.getvalue().decode("utf-8"))
-                if isinstance(inc, dict):
-                    merged = dict(load_opt_saved()); merged.update(inc)
-                    write_opt_saved(merged)
-                    st.session_state["_opt_imported"] = True
-                    st.success(f"{len(inc)}개 설정을 불러왔습니다.")
-                    st.rerun()
-            except Exception as ex:
-                st.error(f"파일을 읽지 못했습니다: {ex}")
+            inc, err = _safe_import_json(up_o)
+            if err:
+                st.error(err)
+            else:
+                merged = dict(load_opt_saved()); merged.update(inc)
+                write_opt_saved(merged)
+                st.session_state["_opt_imported"] = True
+                st.success(f"{len(inc)}개 설정을 불러왔습니다.")
+                st.rerun()
         st.caption("설정은 브라우저 세션에 보관됩니다. 오래 쓰실 구성은 "
                    "**📥 내보내기**로 파일을 받아두세요.")
 
@@ -8746,16 +8856,15 @@ with st.expander("💾 구성 저장 / 불러오기", expanded=False):
                            label_visibility="collapsed",
                            help="내려받아 둔 portfolios.json 을 올리면 복원됩니다.")
     if up is not None and not st.session_state.get("_imported_once"):
-        try:
-            incoming = json.loads(up.getvalue().decode("utf-8"))
-            if isinstance(incoming, dict):
-                merged = dict(load_saved()); merged.update(incoming)
-                write_saved(merged)
-                st.session_state["_imported_once"] = True
-                st.success(f"{len(incoming)}개 구성을 불러왔습니다.")
-                st.rerun()
-        except Exception as ex:
-            st.error(f"파일을 읽지 못했습니다: {ex}")
+        incoming, err = _safe_import_json(up)
+        if err:
+            st.error(err)
+        else:
+            merged = dict(load_saved()); merged.update(incoming)
+            write_saved(merged)
+            st.session_state["_imported_once"] = True
+            st.success(f"{len(incoming)}개 구성을 불러왔습니다.")
+            st.rerun()
 
 
 st.subheader("벤치마크 (Benchmark)")
