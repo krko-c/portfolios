@@ -795,6 +795,18 @@ def render_ticker_table(*, state_key, editor_key, gen_key, cols, weight_col=None
         st.rerun()
 
     live = f[f["티커"] != ""].copy()
+
+    # 정규화 후 같은 티커가 두 번 이상 있으면 이후 set_index/reindex 가 깨지거나
+    # 최소·최대 비중 같은 행별 조건이 모호해진다. 자동 합산 대신 차단한다.
+    _tk_list = list(live["티커"])
+    _dup_tk = sorted({t for t in _tk_list if _tk_list.count(t) > 1})
+    if _dup_tk:
+        st.error(f"같은 종목이 여러 행에 중복 입력됐습니다: **{', '.join(_dup_tk)}**\n\n"
+                 f"`005930`과 `005930.KS`처럼 표기가 달라도 정규화하면 같은 "
+                 f"티커가 되면 중복으로 처리됩니다. 자동으로 합치지 않으니, "
+                 f"위 표에서 중복된 행을 지우거나 한 행으로 정리해주세요.")
+        st.stop()
+
     return live, list(live["티커"]), bad
 
 
