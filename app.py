@@ -4377,7 +4377,7 @@ FACTOR_PROXY = {
     # TIP/IEF 는 둘 다 금리에 민감해 물가가 아니라 잔여 금리를 재는 문제가 있었다.
     # 원자재로 바꾸면 물가 압력을 더 직접 반영한다(경기와 겹칠 수 있으니 VIF 확인).
     "물가·원자재": ("DBC", None, "원자재 지수 ETF", "원자재·물가 압력이 커지면 +"),
-    "달러": ("UUP", None, "달러지수 ETF", "달러가 강해지면 +"),
+    "글로벌 달러 강세": ("UUP", None, "달러지수 ETF", "달러가 강해지면 +"),
     "신용": ("HYG", "LQD", "하이일드 / 우량회사채", "신용환경이 좋아지면 +"),
     "위험선호": ("SPY", "TLT", "주식 / 장기채", "위험선호가 커지면 +"),
 }
@@ -4390,13 +4390,13 @@ FACTOR_EXPECT = {
     ("SHY", "장기금리"): (-3.5, -0.8),
     ("SPY", "경기"): (0.4, 2.0),
     ("SPY", "장기금리"): (None, 0.0),
-    ("GLD", "달러"): (None, 0.0),
+    ("GLD", "글로벌 달러 강세"): (None, 0.0),
     ("XLE", "물가·원자재"): (0.0, None),
     ("XLP", "경기"): (None, 0.6),
 }
 FACTOR_CHECK_TK = ["TLT", "IEF", "SHY", "SPY", "GLD", "XLE", "XLP"]
 # 기본 4개. 신용·위험선호는 경기와 많이 겹쳐 선택 사항으로 둔다.
-FACTOR_DEFAULT = ["장기금리", "경기", "물가·원자재", "달러"]
+FACTOR_DEFAULT = ["장기금리", "경기", "물가·원자재", "글로벌 달러 강세"]
 
 VIEW_DIRS = {"강한 상승": 2.0, "상승": 1.0, "보합": 0.0, "하락": -1.0, "강한 하락": -2.0}
 VIEW_HORIZON = ["3개월", "6개월", "1년", "2년"]
@@ -4410,7 +4410,7 @@ MARKET_VIEWS = {
     "장기금리": ("장기금리", 1.0, ""),
     "경기": ("경기", 1.0, ""),
     "물가": ("물가·원자재", 1.0, "원자재 가격으로 물가 압력을 대신 잽니다"),
-    "달러": ("달러", 1.0, ""),
+    "달러": ("글로벌 달러 강세", 1.0, ""),
     "신용환경": ("신용", 1.0, ""),
     "위험선호": ("위험선호", 1.0, ""),
 }
@@ -4705,6 +4705,13 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
         st.info("전망을 하나 이상 **사용**으로 체크하고 방향을 정해주세요. "
                 "예를 들어 `장기금리 · 하락 · 확신도 70%` 처럼요.")
 
+    use_hz_weight = st.checkbox(
+        "⏱ 전망 기간에 따라 강도 조정 (기간조정 사용)", value=False, key="_mv_hz_on",
+        help="켜면 짧은 기간(3개월)의 전망은 약하게, 긴 기간(2년)은 강하게 반영합니다 "
+             "(3개월 0.6배 ~ 2년 1.15배). 이 배수는 이론적으로 정해진 값이 아니라 "
+             "휴리스틱이라 **기본은 꺼져 있습니다**. 꺼두면 전망 기간은 기록용으로만 "
+             "쓰이고, 점수는 전망 방향·확신도·요인 민감도만으로 계산됩니다.")
+
     # ---------------- 요인 설정 ----------------
     st.subheader("3️⃣ 민감도 추정 설정")
     f1, f2, f3 = st.columns(3)
@@ -4947,6 +4954,13 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
     if _used.empty:
         st.info("전망을 입력하면 여기에 영향 분석이 나타납니다.")
         return
+    if _pre_dup:
+        st.error("같은 요인에 전망이 겹쳐 있어 영향 분석을 진행할 수 없습니다 — "
+                 + " · ".join(f"**{k}** ← {', '.join(v)}" for k, v in _pre_dup.items())
+                 + "\n\n두 전망을 그대로 두면 같은 요인이 두 번 반영됩니다. "
+                   "위 **2️⃣ 시장 전망**에서 하나만 **사용** 체크하거나 "
+                   "방향을 **보합**으로 되돌린 뒤 다시 시도해주세요.")
+        return
 
     st.subheader("5️⃣ 포트폴리오 영향 분석")
     st.info("**영향 등급(긍정·중립·부정)은 지금 입력한 자산들 사이의 상대평가**입니다. "
@@ -4970,11 +4984,12 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
             continue
         d = VIEW_DIRS.get(str(r_["방향"]), 0.0)
         conf = float(r_["확신도(%)"] or 0) / 100.0
-        hz = VIEW_HZ_WEIGHT.get(str(r_["전망 기간"]), 1.0)
+        hz = VIEW_HZ_WEIGHT.get(str(r_["전망 기간"]), 1.0) if use_hz_weight else 1.0
         fdir[fac] = fdir.get(fac, 0.0) + d * conf * mult * hz
         _dbl.setdefault(fac, []).append(var)
         vdesc.append(f"**{var}** {r_['방향']} · 확신도 {r_['확신도(%)']:.0f}% · "
-                     f"{r_['전망 기간']}(가중 {hz:.2f})"
+                     f"{r_['전망 기간']}"
+                     + (f"(가중 {hz:.2f})" if use_hz_weight else "(기간조정 미사용)")
                      + (f" · {note}" if note else ""))
     if not fdir:
         st.warning("입력한 전망을 지금 요인 목록으로 표현할 수 없습니다. "
@@ -5053,15 +5068,23 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
         st.info(f"포트폴리오의 **{_hold:.1f}%** 는 지금 요인 세트로 설명되지 않아 "
                 f"판단을 유보했습니다. 이 부분은 다른 근거로 판단하셔야 합니다.")
 
-    _wavg = float((idf["조정점수"] * idf["비중(%)"] / 100).sum())
-    if _neg > 50:
+    # 가중 평균은 판정 가능한 자산만으로 계산한다 (판정 유보는 비중까지 왜곡시킴)
+    _ok_df = idf[_ok]
+    _ok_wsum = float(_ok_df["비중(%)"].sum())
+    _wavg = (float((_ok_df["조정점수"] * _ok_df["비중(%)"]).sum() / _ok_wsum)
+             if _ok_wsum > 1e-9 else np.nan)
+    _wavg_txt = (f"{_wavg:+.2f} (판정 가능한 자산 기준)" if np.isfinite(_wavg)
+                 else "계산 불가 (판정 가능한 자산 없음)")
+    if not np.isfinite(_wavg):
+        st.info("모든 자산이 판정 유보라 가중 평균 점수를 계산할 수 없습니다.")
+    elif _neg > 50:
         st.warning(f"입력한 전망이 맞다면 포트폴리오의 **{_neg:.1f}%** 가 불리한 "
-                   f"자산입니다. 가중 평균 점수는 **{_wavg:+.2f}** 입니다.")
+                   f"자산입니다. 가중 평균 점수는 **{_wavg_txt}** 입니다.")
     elif _pos > 50:
         st.success(f"전망에 유리한 자산이 **{_pos:.1f}%** 입니다. "
-                   f"가중 평균 점수 **{_wavg:+.2f}**.")
+                   f"가중 평균 점수 **{_wavg_txt}**.")
     else:
-        st.info(f"유불리가 뚜렷하지 않습니다. 가중 평균 점수 **{_wavg:+.2f}**.")
+        st.info(f"유불리가 뚜렷하지 않습니다. 가중 평균 점수 **{_wavg_txt}**.")
 
     fb = go.Figure(go.Bar(
         x=idf["조정점수"], y=idf["티커"], orientation="h",
@@ -5116,6 +5139,7 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
                 "표본": f"{len(F):,}개",
                 "기간": f"{F.index[0].date()} ~ {F.index[-1].date()}",
                 "기준 통화": base_ccy,
+                "기간조정 사용": "예" if use_hz_weight else "아니오",
             }.items()), columns=["항목", "값"]).to_excel(xw, sheet_name="6_설정",
                                                        index=False)
         st.download_button("📊 엑셀 파일 받기", buf.getvalue(),
@@ -5129,7 +5153,9 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
                       extra=[("민감도 추정", f"{f_yrs}년 · {f_freq} · 다중회귀 · 표준화"),
                              ("요인", ", ".join(F.columns)),
                              ("환율", "제외 (현지통화 기준) — 달러 요인을 따로 재기 위함"),
-                             ("전망 기간", "가중치로 반영 (3개월 0.6 ~ 2년 1.15)")])
+                             ("전망 기간", "가중치로 반영 (3개월 0.6 ~ 2년 1.15)"
+                              if use_hz_weight else
+                              "기록용만 — 기간조정 미사용, 점수엔 반영 안 함")])
     st.caption("민감도는 **과거 평균**입니다. 실제로는 시기에 따라 크게 달라지고, "
                "위기에는 모든 자산이 함께 움직여 요인 구분이 흐려집니다. "
                "이 화면은 **방향을 가늠하는 진단**이지 수익률 예측이 아닙니다. "
