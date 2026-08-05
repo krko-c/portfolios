@@ -4705,6 +4705,13 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
         st.info("전망을 하나 이상 **사용**으로 체크하고 방향을 정해주세요. "
                 "예를 들어 `장기금리 · 하락 · 확신도 70%` 처럼요.")
 
+    use_hz_weight = st.checkbox(
+        "⏱ 전망 기간에 따라 강도 조정 (기간조정 사용)", value=False, key="_mv_hz_on",
+        help="켜면 짧은 기간(3개월)의 전망은 약하게, 긴 기간(2년)은 강하게 반영합니다 "
+             "(3개월 0.6배 ~ 2년 1.15배). 이 배수는 이론적으로 정해진 값이 아니라 "
+             "휴리스틱이라 **기본은 꺼져 있습니다**. 꺼두면 전망 기간은 기록용으로만 "
+             "쓰이고, 점수는 전망 방향·확신도·요인 민감도만으로 계산됩니다.")
+
     # ---------------- 요인 설정 ----------------
     st.subheader("3️⃣ 민감도 추정 설정")
     f1, f2, f3 = st.columns(3)
@@ -4977,11 +4984,12 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
             continue
         d = VIEW_DIRS.get(str(r_["방향"]), 0.0)
         conf = float(r_["확신도(%)"] or 0) / 100.0
-        hz = VIEW_HZ_WEIGHT.get(str(r_["전망 기간"]), 1.0)
+        hz = VIEW_HZ_WEIGHT.get(str(r_["전망 기간"]), 1.0) if use_hz_weight else 1.0
         fdir[fac] = fdir.get(fac, 0.0) + d * conf * mult * hz
         _dbl.setdefault(fac, []).append(var)
         vdesc.append(f"**{var}** {r_['방향']} · 확신도 {r_['확신도(%)']:.0f}% · "
-                     f"{r_['전망 기간']}(가중 {hz:.2f})"
+                     f"{r_['전망 기간']}"
+                     + (f"(가중 {hz:.2f})" if use_hz_weight else "(기간조정 미사용)")
                      + (f" · {note}" if note else ""))
     if not fdir:
         st.warning("입력한 전망을 지금 요인 목록으로 표현할 수 없습니다. "
@@ -5123,6 +5131,7 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
                 "표본": f"{len(F):,}개",
                 "기간": f"{F.index[0].date()} ~ {F.index[-1].date()}",
                 "기준 통화": base_ccy,
+                "기간조정 사용": "예" if use_hz_weight else "아니오",
             }.items()), columns=["항목", "값"]).to_excel(xw, sheet_name="6_설정",
                                                        index=False)
         st.download_button("📊 엑셀 파일 받기", buf.getvalue(),
@@ -5136,7 +5145,9 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
                       extra=[("민감도 추정", f"{f_yrs}년 · {f_freq} · 다중회귀 · 표준화"),
                              ("요인", ", ".join(F.columns)),
                              ("환율", "제외 (현지통화 기준) — 달러 요인을 따로 재기 위함"),
-                             ("전망 기간", "가중치로 반영 (3개월 0.6 ~ 2년 1.15)")])
+                             ("전망 기간", "가중치로 반영 (3개월 0.6 ~ 2년 1.15)"
+                              if use_hz_weight else
+                              "기록용만 — 기간조정 미사용, 점수엔 반영 안 함")])
     st.caption("민감도는 **과거 평균**입니다. 실제로는 시기에 따라 크게 달라지고, "
                "위기에는 모든 자산이 함께 움직여 요인 구분이 흐려집니다. "
                "이 화면은 **방향을 가늠하는 진단**이지 수익률 예측이 아닙니다. "
