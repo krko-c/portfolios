@@ -4947,6 +4947,13 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
     if _used.empty:
         st.info("전망을 입력하면 여기에 영향 분석이 나타납니다.")
         return
+    if _pre_dup:
+        st.error("같은 요인에 전망이 겹쳐 있어 영향 분석을 진행할 수 없습니다 — "
+                 + " · ".join(f"**{k}** ← {', '.join(v)}" for k, v in _pre_dup.items())
+                 + "\n\n두 전망을 그대로 두면 같은 요인이 두 번 반영됩니다. "
+                   "위 **2️⃣ 시장 전망**에서 하나만 **사용** 체크하거나 "
+                   "방향을 **보합**으로 되돌린 뒤 다시 시도해주세요.")
+        return
 
     st.subheader("5️⃣ 포트폴리오 영향 분석")
     st.info("**영향 등급(긍정·중립·부정)은 지금 입력한 자산들 사이의 상대평가**입니다. "
