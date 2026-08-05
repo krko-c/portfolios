@@ -2604,6 +2604,13 @@ def render_help():
                 "**📉 시장·거시 국면** 화면에서 현재 국면을 전망 초안으로 가져올 수 "
                 "있습니다. 국면은 현재 상태이고 전망은 앞으로이므로, 확정하지 않고 "
                 "수정 가능한 초안으로만 넘깁니다.\n\n"
+                "**전망 기간**은 가중치로 반영됩니다. 3개월(0.6)은 2년(1.15)보다 약하게 "
+                "반영되는데, 가까운 앞을 먼 앞만큼 확신하기 어렵기 때문입니다.\n\n"
+                "**정책금리와 장기금리를 함께 넣으면** 같은 금리 요인에 두 번 반영됩니다. "
+                "이 경우 화면에 경고가 뜨니, 하나만 쓰시거나 확신도를 낮추세요.\n\n"
+                "**달러 민감도는 현지통화 기준**입니다. '달러가 강해질 때 그 자산 자체가 "
+                "어떻게 움직이나'를 재는 것이고, 해외자산의 원화 환산 효과는 별개입니다. "
+                "그건 🌩 스트레스 테스트의 환율 충격에서 다룹니다.\n\n"
                 "이 단계에서는 **비중을 바꾸지 않고 진단만** 합니다.")
         with st.expander("🧭 뷰 기반 자산배분 · 자산수익률 전망"):
             st.markdown(
@@ -4371,6 +4378,9 @@ FACTOR_DEFAULT = ["장기금리", "경기", "물가", "달러"]
 
 VIEW_DIRS = {"강한 상승": 2.0, "상승": 1.0, "보합": 0.0, "하락": -1.0, "강한 하락": -2.0}
 VIEW_HORIZON = ["3개월", "6개월", "1년", "2년"]
+# 기간이 짧을수록 같은 확신도라도 약하게 반영한다.
+# 3개월 앞을 2년 앞만큼 확신하기는 어렵기 때문이다.
+VIEW_HZ_WEIGHT = {"3개월": 0.6, "6개월": 0.8, "1년": 1.0, "2년": 1.15}
 
 # 시장전망 변수 → 요인 매핑. 사용자가 익숙한 말로 묻고 내부에서 요인으로 옮긴다.
 MARKET_VIEWS = {
@@ -4644,6 +4654,15 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
                                   "흐려질 수 있습니다.")
     picks = FACTOR_DEFAULT + list(extra_f)
 
+    if base_ccy != "USD":
+        st.info(f"**달러 전망을 읽는 법** — 민감도는 **현지통화 기준**으로 잽니다. "
+                f"기준통화({base_ccy})로 환산한 값에는 환율이 이미 섞여 있어, "
+                f"달러 요인을 따로 떼어낼 수 없기 때문입니다.\n\n"
+                f"따라서 여기서 말하는 **달러 민감도는 '달러가 강해질 때 그 자산 자체가 "
+                f"현지통화로 어떻게 움직이나'** 입니다. 달러 강세가 "
+                f"{base_ccy} 환산 수익에 주는 효과(해외자산 평가액 상승)는 "
+                f"**별도**이며, 그건 🌩 스트레스 테스트의 환율 충격에서 다룹니다.")
+
     with st.expander("요인을 무엇으로 재는지", expanded=False):
         st.dataframe(pd.DataFrame(
             [{"요인": k, "대용치": FACTOR_PROXY[k][0] +
@@ -4671,9 +4690,10 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
     if bad_f:
         st.warning(f"데이터를 못 받은 요인은 제외했습니다: {', '.join(bad_f)}")
 
+    # 달러 요인을 따로 재려면 자산 수익률에서 환율이 빠져 있어야 한다.
+    # 기준통화로 환산한 값에는 이미 환율이 섞여 있어 달러 민감도가 이중으로 잡힌다.
     try:
         with st.spinner("자산 데이터 조회 중..."):
-            # 환율이 섞이지 않도록 현지통화 기준으로 민감도를 잰다
             px, meta, _f = build_price_frame(tickers, _start, end_date, base_ccy,
                                              use_div, True, gap_fill)
     except Exception as ex:
@@ -4813,6 +4833,7 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
     # 전망을 요인 방향으로 옮긴다
     fdir = {}
     vdesc = []
+    _dbl = {}          # 같은 요인에 여러 전망이 몰렸는지 확인용
     for _, r_ in _used.iterrows():
         var = str(r_["전망 변수"])
         fac, mult, note = MARKET_VIEWS.get(var, (None, 0, ""))
@@ -4820,15 +4841,32 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
             continue
         d = VIEW_DIRS.get(str(r_["방향"]), 0.0)
         conf = float(r_["확신도(%)"] or 0) / 100.0
-        fdir[fac] = fdir.get(fac, 0.0) + d * conf * mult
+        hz = VIEW_HZ_WEIGHT.get(str(r_["전망 기간"]), 1.0)
+        fdir[fac] = fdir.get(fac, 0.0) + d * conf * mult * hz
+        _dbl.setdefault(fac, []).append(var)
         vdesc.append(f"**{var}** {r_['방향']} · 확신도 {r_['확신도(%)']:.0f}% · "
-                     f"{r_['전망 기간']}" + (f" ({note})" if note else ""))
+                     f"{r_['전망 기간']}(가중 {hz:.2f})"
+                     + (f" · {note}" if note else ""))
     if not fdir:
         st.warning("입력한 전망을 지금 요인 목록으로 표현할 수 없습니다. "
                    "추가 요인을 켜보세요.")
         return
 
     st.markdown("**반영한 전망**\n\n" + "\n".join(f"- {v}" for v in vdesc))
+    _dup = {k: v for k, v in _dbl.items() if len(v) > 1}
+    if _dup:
+        st.warning("같은 요인에 전망이 여러 개 겹쳤습니다 — "
+                   + " · ".join(f"**{k}** ← {', '.join(v)}" for k, v in _dup.items())
+                   + "\n\n두 전망이 더해져 영향이 실제보다 크게 잡힐 수 있습니다. "
+                   "예를 들어 정책금리와 장기금리를 함께 하락으로 두면 금리 요인이 "
+                   "두 번 반영됩니다. 하나만 쓰시거나 확신도를 낮춰주세요.")
+    st.dataframe(pd.DataFrame([{"요인": k, "합산 방향": v,
+                                "반영된 전망": ", ".join(_dbl.get(k, []))}
+                               for k, v in fdir.items()])
+                 .style.format({"합산 방향": "{:+.2f}"}),
+                 width="stretch", hide_index=True)
+    st.caption("**합산 방향**은 방향 × 확신도 × 기간가중을 더한 값입니다. "
+               "이 값이 각 자산의 민감도와 곱해져 영향 점수가 됩니다.")
 
     irows = []
     for t_ in use_tk:
@@ -4940,9 +4978,10 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
         st.error(f"엑셀 생성 실패: {ex}")
 
     assumptions_panel(period=f"{F.index[0].date()} ~ {F.index[-1].date()}",
-                      extra=[("민감도 추정", f"{f_yrs}년 · {f_freq} · 다중회귀"),
+                      extra=[("민감도 추정", f"{f_yrs}년 · {f_freq} · 다중회귀 · 표준화"),
                              ("요인", ", ".join(F.columns)),
-                             ("환율", "제외 (현지통화 기준으로 민감도 추정)")])
+                             ("환율", "제외 (현지통화 기준) — 달러 요인을 따로 재기 위함"),
+                             ("전망 기간", "가중치로 반영 (3개월 0.6 ~ 2년 1.15)")])
     st.caption("민감도는 **과거 평균**입니다. 실제로는 시기에 따라 크게 달라지고, "
                "위기에는 모든 자산이 함께 움직여 요인 구분이 흐려집니다. "
                "이 화면은 **방향을 가늠하는 진단**이지 수익률 예측이 아닙니다. "
