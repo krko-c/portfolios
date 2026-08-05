@@ -2598,16 +2598,38 @@ def render_help():
                 "TLT·SHY·SPY·GLD 같이 성격이 분명한 자산의 민감도가 알려진 범위 안에 "
                 "있는지 자동으로 봅니다. 여기서 어긋나면 요인 대용치에 문제가 있다는 "
                 "뜻이니 영향 분석을 믿지 마세요.\n\n"
-                "**R²(설명력)를 꼭 확인하세요.** 낮으면 그 자산의 움직임이 이 요인들로 "
-                "설명되지 않는다는 뜻이라, 영향 분석도 믿기 어렵습니다. 요인 대용치가 "
-                "모두 미국 지표라 한국 자산은 설명력이 낮을 수 있습니다.\n\n"
+                "**R²(설명력)에 따라 판단 강도가 자동으로 조절됩니다.** 영향 점수에 "
+                "√R²를 곱해, 설명력이 낮은 자산은 방향을 약하게만 말합니다. "
+                "**R²가 0.10 미만이면 '판정 유보'** 로 두고 아예 방향을 말하지 "
+                "않습니다.\n\n"
+                "| R² | 표시 |\n|---|---|\n"
+                "| 0.40 이상 | 일반 참고 가능 |\n"
+                "| 0.20~0.40 | 제한적 참고 |\n"
+                "| 0.10~0.20 | 신뢰도 매우 낮음 |\n"
+                "| 0.10 미만 | 판정 유보 |\n\n"
+                "요인 대용치가 모두 미국 지표라 **한국 개별종목은 설명력이 낮게** "
+                "나옵니다. 예를 들어 반도체는 업황·메모리 가격·원달러·중국 경기가 "
+                "지배하는데 그 요인들이 여기 없기 때문입니다. 거시와 무관하다는 뜻이 "
+                "아니라, **이 모형만으로는 방향을 판단하기 어렵다**는 뜻입니다.\n\n"
+                "**📐 기간을 바꿔도 민감도가 유지되는가** 로 계수 안정성도 확인할 수 "
+                "있습니다. R²가 높아도 개별 계수는 표본에 따라 흔들릴 수 있어, "
+                "1·3·5년에서 부호가 유지되는지 봅니다.\n\n"
                 "**📉 시장·거시 국면** 화면에서 현재 국면을 전망 초안으로 가져올 수 "
                 "있습니다. 국면은 현재 상태이고 전망은 앞으로이므로, 확정하지 않고 "
                 "수정 가능한 초안으로만 넘깁니다.\n\n"
                 "**전망 기간**은 가중치로 반영됩니다. 3개월(0.6)은 2년(1.15)보다 약하게 "
                 "반영되는데, 가까운 앞을 먼 앞만큼 확신하기 어렵기 때문입니다.\n\n"
                 "**정책금리와 장기금리를 함께 넣으면** 같은 금리 요인에 두 번 반영됩니다. "
-                "이 경우 화면에 경고가 뜨니, 하나만 쓰시거나 확신도를 낮추세요.\n\n"
+                "입력 단계에서 경고가 뜨니 하나만 쓰세요. 국면 화면에서 초안을 가져올 "
+                "때는 **장기금리만 자동으로 켜집니다.**\n\n"
+                "**전망은 켰는데 해당 요인이 꺼져 있으면** 계산에서 조용히 빠집니다. "
+                "이 경우에도 경고가 뜨며, 국면 초안을 가져올 때는 필요한 요인이 "
+                "자동으로 함께 켜집니다.\n\n"
+                "**영향 등급은 상대평가**입니다. 지금 입력한 자산들 사이에서 가장 크게 "
+                "반응하는 자산을 기준으로 나머지를 견줍니다. 장기채처럼 민감도가 큰 "
+                "자산이 섞이면 다른 자산이 상대적으로 중립에 가깝게 보일 수 있습니다.\n\n"
+                "**물가 요인은 원자재(DBC)로 잽니다.** CPI 자체가 아니라 원유·금속·농산물 "
+                "가격을 반영하므로, 화면에도 '물가·원자재'로 표기했습니다.\n\n"
                 "**달러 민감도는 현지통화 기준**입니다. '달러가 강해질 때 그 자산 자체가 "
                 "어떻게 움직이나'를 재는 것이고, 해외자산의 원화 환산 효과는 별개입니다. "
                 "그건 🌩 스트레스 테스트의 환율 충격에서 다룹니다.\n\n"
@@ -4354,7 +4376,7 @@ FACTOR_PROXY = {
     "경기": ("XLY", "XLP", "경기소비재 / 필수소비재", "경기가 좋아지면 +"),
     # TIP/IEF 는 둘 다 금리에 민감해 물가가 아니라 잔여 금리를 재는 문제가 있었다.
     # 원자재로 바꾸면 물가 압력을 더 직접 반영한다(경기와 겹칠 수 있으니 VIF 확인).
-    "물가": ("DBC", None, "원자재 지수 ETF", "물가 압력이 커지면 +"),
+    "물가·원자재": ("DBC", None, "원자재 지수 ETF", "원자재·물가 압력이 커지면 +"),
     "달러": ("UUP", None, "달러지수 ETF", "달러가 강해지면 +"),
     "신용": ("HYG", "LQD", "하이일드 / 우량회사채", "신용환경이 좋아지면 +"),
     "위험선호": ("SPY", "TLT", "주식 / 장기채", "위험선호가 커지면 +"),
@@ -4369,12 +4391,12 @@ FACTOR_EXPECT = {
     ("SPY", "경기"): (0.4, 2.0),
     ("SPY", "장기금리"): (None, 0.0),
     ("GLD", "달러"): (None, 0.0),
-    ("XLE", "물가"): (0.0, None),
+    ("XLE", "물가·원자재"): (0.0, None),
     ("XLP", "경기"): (None, 0.6),
 }
 FACTOR_CHECK_TK = ["TLT", "IEF", "SHY", "SPY", "GLD", "XLE", "XLP"]
 # 기본 4개. 신용·위험선호는 경기와 많이 겹쳐 선택 사항으로 둔다.
-FACTOR_DEFAULT = ["장기금리", "경기", "물가", "달러"]
+FACTOR_DEFAULT = ["장기금리", "경기", "물가·원자재", "달러"]
 
 VIEW_DIRS = {"강한 상승": 2.0, "상승": 1.0, "보합": 0.0, "하락": -1.0, "강한 하락": -2.0}
 VIEW_HORIZON = ["3개월", "6개월", "1년", "2년"]
@@ -4387,7 +4409,7 @@ MARKET_VIEWS = {
     "정책금리": ("장기금리", 0.6, "정책금리는 장기금리에 부분적으로 전이됩니다"),
     "장기금리": ("장기금리", 1.0, ""),
     "경기": ("경기", 1.0, ""),
-    "물가": ("물가", 1.0, ""),
+    "물가": ("물가·원자재", 1.0, "원자재 가격으로 물가 압력을 대신 잽니다"),
     "달러": ("달러", 1.0, ""),
     "신용환경": ("신용", 1.0, ""),
     "위험선호": ("위험선호", 1.0, ""),
@@ -4483,6 +4505,29 @@ def factor_vif(F: pd.DataFrame) -> dict:
         except Exception:
             out[c] = np.nan
     return out
+
+
+# R² 구간별 판단 강도. 설명력이 낮으면 결과를 단정하지 않는다.
+R2_GRADE = [(0.40, "일반 참고 가능"), (0.20, "제한적 참고"),
+            (0.10, "신뢰도 매우 낮음"), (0.0, "판정 유보")]
+
+
+def r2_grade(r2: float) -> str:
+    if not np.isfinite(r2):
+        return "판정 유보"
+    for th, lbl in R2_GRADE:
+        if r2 >= th:
+            return lbl
+    return "판정 유보"
+
+
+def r2_weight(r2: float) -> float:
+    """
+    설명력이 낮은 자산의 판단 강도를 낮추는 가중치.
+    √R² 는 상관계수와 같은 척도라 해석이 자연스럽고,
+    낮은 자산은 확실히 줄이면서 정상 자산은 과하게 깎지 않는다.
+    """
+    return float(np.sqrt(max(r2, 0.0))) if np.isfinite(r2) else 0.0
 
 
 def impact_label(score: float, scale: float = 1.0) -> str:
@@ -4635,6 +4680,27 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
     st.session_state["_mv_views"] = mv
     _used = mv[mv["사용"].fillna(False).astype(bool) &
                (mv["방향"] != "보합")]
+    # 전망표에는 있는데 회귀 요인에 없으면 계산에서 조용히 빠진다
+    _need = {MARKET_VIEWS[str(v)][0] for v in _used["전망 변수"]
+             if str(v) in MARKET_VIEWS} - set(FACTOR_DEFAULT)
+    _miss = sorted(_need - set(st.session_state.get("_mv_extra", [])))
+    if _miss:
+        st.warning(f"**{', '.join(_miss)}** 전망을 넣으셨는데 해당 요인이 꺼져 "
+                   f"있습니다. 이대로는 계산에 반영되지 않습니다. "
+                   f"아래 **추가 요인**에서 켜주세요.")
+    # 같은 요인에 두 전망이 겹치는지 입력 단계에서 미리 알린다
+    _fmap = {}
+    for v in _used["전망 변수"]:
+        f_ = MARKET_VIEWS.get(str(v), (None,))[0]
+        if f_:
+            _fmap.setdefault(f_, []).append(str(v))
+    _pre_dup = {k: v for k, v in _fmap.items() if len(v) > 1}
+    if _pre_dup:
+        st.warning("같은 요인에 전망이 겹칩니다 — "
+                   + " · ".join(f"**{k}** ← {', '.join(v)}" for k, v in _pre_dup.items())
+                   + "\n\n둘 다 켜두면 그 요인이 두 번 반영돼 영향이 부풀려집니다. "
+                     "**하나만 사용**하시길 권합니다. "
+                     "(정책금리는 장기금리에 0.6배로 전이되어 들어갑니다)")
     if _used.empty:
         st.info("전망을 하나 이상 **사용**으로 체크하고 방향을 정해주세요. "
                 "예를 들어 `장기금리 · 하락 · 확신도 70%` 처럼요.")
@@ -4647,7 +4713,10 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
     f_freq = f2.selectbox("계산 주기", ["주별", "일별"], index=0, key="_mv_freq",
                           help="거래 시간대가 다른 국가를 섞으면 일별은 민감도가 "
                                "낮게 추정됩니다. 주별을 권합니다.")
-    extra_f = f3.multiselect("추가 요인", ["신용", "위험선호"], default=[],
+    # 세션에 미리 넣은 값(국면 초안 등)이 있으면 그것을 기본값으로 삼는다.
+    # default= 를 함께 주면 위젯이 그 값으로 덮어써 버린다.
+    st.session_state.setdefault("_mv_extra", [])
+    extra_f = f3.multiselect("추가 요인", ["신용", "위험선호"],
                              key="_mv_extra",
                              help="경기와 많이 겹쳐 기본에서 제외했습니다. "
                                   "넣으면 설명력은 오르지만 요인별 해석이 "
@@ -4720,8 +4789,7 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
         rows.append({"티커": t_,
                      **{k: bz.get(k, np.nan) * 100 for k in Fz.columns},
                      "R²": r2, "표본": n_,
-                     "신뢰도": ("높음" if (r2 or 0) >= 0.5 else
-                              "보통" if (r2 or 0) >= 0.25 else "낮음 ⚠️")})
+                     "신뢰도": r2_grade(r2 if r2 is not None else np.nan)})
         raws.append({"티커": t_, **{k: br.get(k, np.nan) for k in F.columns}})
     bdf = pd.DataFrame(rows)
     rawdf = pd.DataFrame(raws)
@@ -4747,14 +4815,71 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
                      .style.format({"1σ (요인 변동폭)": "{:.5f}"}),
                      width="stretch", hide_index=True)
 
-    _low = bdf[bdf["신뢰도"].astype(str).str.contains("낮음")]["티커"].tolist()
+    _low = bdf[bdf["신뢰도"].astype(str).isin(["판정 유보", "신뢰도 매우 낮음"])
+               ]["티커"].tolist()
     if _low:
-        st.warning(f"설명력이 낮은 자산: {', '.join(_low)} — 이 요인들로는 움직임을 "
-                   f"잘 설명하지 못합니다. 영향 분석 결과를 그대로 믿지 마세요.")
+        st.warning(f"**{', '.join(_low)}** 는 지금 요인 세트(금리·경기·물가·달러)로 "
+                   f"움직임이 잘 설명되지 않습니다.\n\n"
+                   f"이 자산들이 거시와 무관하다는 뜻은 아닙니다. 예를 들어 한국 "
+                   f"반도체는 **업황·메모리 가격·원달러·중국 경기** 같은 다른 요인이 "
+                   f"지배할 수 있는데, 그 요인들이 여기 없을 뿐입니다. "
+                   f"**이 모형만으로는 방향을 판단하기 어렵다**고 보시면 됩니다.\n\n"
+                   f"아래 영향 분석에서는 설명력만큼 판단 강도를 낮춰 반영합니다.")
     if _hi_vif:
         st.warning(f"요인끼리 많이 겹칩니다: {', '.join(_hi_vif)} — "
                    f"각 요인의 민감도를 따로 떼어 해석하기 어렵습니다. "
                    f"추가 요인을 빼보세요.")
+    # ---------------- 계수 안정성 ----------------
+    with st.expander("📐 기간을 바꿔도 민감도가 유지되는가", expanded=False):
+        st.caption("R²가 높아도 **개별 요인 계수는 표본에 따라 흔들릴 수 있습니다.** "
+                   "추정 기간을 바꿔가며 부호가 유지되는지 확인합니다. "
+                   "부호가 뒤집히면 그 요인은 판정을 유보하는 게 안전합니다.")
+        if st.button("📐 안정성 확인", width="stretch", key="_mv_stab"):
+            srows = []
+            with st.spinner("기간별로 다시 추정 중..."):
+                per = {}
+                for yrs in (1, 3, 5):
+                    s_ = pd.Timestamp(end_date) - pd.DateOffset(years=yrs)
+                    Fy, _bad = build_factors(s_, end_date, f_freq, tuple(picks))
+                    if Fy is None or Fy.empty:
+                        continue
+                    Ry = R.loc[Fy.index[0]:]
+                    per[yrs] = {t_: factor_betas(Ry[t_], Fy)[0] for t_ in use_tk
+                                if t_ in Ry.columns}
+                for t_ in use_tk:
+                    for fac in F.columns:
+                        vals = [per[y].get(t_, {}).get(fac) for y in per
+                                if t_ in per[y]]
+                        vals = [v for v in vals if v is not None and np.isfinite(v)]
+                        if len(vals) < 2:
+                            continue
+                        signs = {np.sign(v) for v in vals if abs(v) > 1e-9}
+                        stable = len(signs) <= 1
+                        srows.append({
+                            "티커": t_, "요인": fac,
+                            **{f"{y}년": per[y].get(t_, {}).get(fac, np.nan)
+                               for y in sorted(per)},
+                            "부호 유지": "✅" if stable else "❌ 뒤집힘",
+                            "변동폭": float(max(vals) - min(vals))})
+            if srows:
+                sdf = pd.DataFrame(srows)
+                _flip = sdf[sdf["부호 유지"].astype(str).str.startswith("❌")]
+                if len(_flip):
+                    st.warning(f"부호가 뒤집힌 조합이 **{len(_flip)}개** 있습니다. "
+                               f"해당 요인은 기간에 따라 방향이 달라지므로, "
+                               f"그 자산의 영향 분석을 신중하게 보세요.")
+                else:
+                    st.success("모든 조합에서 부호가 유지됩니다.")
+                st.dataframe(sdf.style.format(
+                    {c: "{:+.2f}" for c in sdf.columns if c.endswith("년")}
+                    | {"변동폭": "{:.2f}"}, na_rep="-"),
+                    width="stretch", hide_index=True)
+                st.caption("**변동폭**이 클수록 기간에 따라 민감도가 크게 달라진다는 "
+                           "뜻입니다. 부호가 유지되더라도 변동폭이 크면 크기를 "
+                           "그대로 믿기는 어렵습니다.")
+            else:
+                st.warning("기간별 추정에 필요한 데이터가 부족합니다.")
+
     # ---------------- 자동 검증 ----------------
     with st.expander("🧪 민감도가 상식과 맞는지 확인", expanded=False):
         st.caption("성격이 분명한 자산으로 민감도를 뽑아 **알려진 방향·크기와 맞는지** "
@@ -4824,6 +4949,10 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
         return
 
     st.subheader("5️⃣ 포트폴리오 영향 분석")
+    st.info("**영향 등급(긍정·중립·부정)은 지금 입력한 자산들 사이의 상대평가**입니다. "
+            "가장 크게 반응하는 자산을 기준으로 나머지를 견줍니다. 따라서 장기채처럼 "
+            "민감도가 큰 자산이 섞이면 다른 자산이 상대적으로 중립에 가깝게 보일 수 "
+            "있습니다.")
     w = live.set_index("티커")["비중(%)"].reindex(use_tk).fillna(0)
     if w.sum() <= 0:
         w = pd.Series(1.0, index=use_tk)
@@ -4877,37 +5006,54 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
             eff[f"{fac} 영향"] = e
             if np.isfinite(e):
                 tot += e
-        r2 = float(B.loc[t_, "R²"]) if np.isfinite(B.loc[t_, "R²"]) else 0.0
+        _r2 = float(B.loc[t_, "R²"])
+        _wt = r2_weight(_r2)
         irows.append({"티커": t_, "비중(%)": float(w[t_]), **eff,
-                      "종합 점수": tot, "신뢰도": B.loc[t_, "신뢰도"]})
-    idf = pd.DataFrame(irows).sort_values("종합 점수", ascending=False)
+                      "원점수": tot, "R²": _r2, "가중(√R²)": _wt,
+                      "조정점수": tot * _wt, "신뢰도": B.loc[t_, "신뢰도"]})
+    idf = pd.DataFrame(irows).sort_values("조정점수", ascending=False)
     # 자산군마다 민감도 크기가 달라(채권은 듀레이션 탓에 큼) 절대 기준으로는
     # 전부 '긍정'이 된다. 포트폴리오 안에서의 상대 크기로 등급을 매긴다.
-    _scale = float(idf["종합 점수"].abs().max()) or 1.0
-    idf["종합 영향"] = [impact_label(v, _scale) for v in idf["종합 점수"]]
-    idf = idf[[c for c in idf.columns if c != "신뢰도"] + ["신뢰도"]]
-    _f2 = {"비중(%)": "{:.2f}", "종합 점수": "{:+.2f}"}
+    _scale = float(idf["조정점수"].abs().max()) or 1.0
+    idf["종합 영향"] = [
+        "판정 유보" if (not np.isfinite(r2_) or r2_ < 0.10)
+        else impact_label(v, _scale)
+        for v, r2_ in zip(idf["조정점수"], idf["R²"])]
+    idf = idf[[c for c in idf.columns if c not in ("종합 영향", "신뢰도")]
+              + ["종합 영향", "신뢰도"]]
+    _f2 = {"비중(%)": "{:.2f}", "원점수": "{:+.2f}", "R²": "{:.2f}",
+           "가중(√R²)": "{:.2f}", "조정점수": "{:+.2f}"}
     _f2.update({c: "{:+.2f}" for c in idf.columns if c.endswith("영향")
                 and c != "종합 영향"})
     st.dataframe(idf.style.format(_f2, na_rep="-")
                  .map(_heat_color, subset=[c for c in idf.columns
                                            if c.endswith("영향") and c != "종합 영향"]),
                  width="stretch", hide_index=True)
-    st.caption("**종합 점수(%)** 는 민감도 × 전망 방향 × 확신도를 더한 값입니다. "
-               "'전망이 평소 수준으로 실현되면 대략 이만큼 유불리하다'로 읽으시면 "
-               "됩니다. 절대적인 수익률 예측이 아니라 **자산 간 상대적인 유불리**를 "
-               "가늠하는 지표입니다.")
+    st.caption("**원점수(%)** 는 민감도 × 전망 방향 × 확신도를 더한 값이고, "
+               "**조정점수**는 거기에 설명력 가중(√R²)을 곱한 값입니다.\n\n"
+               "설명력이 낮은 자산은 민감도 자체가 우연일 수 있어, 그만큼 판단 강도를 "
+               "낮춥니다. **R²가 0.10 미만이면 '판정 유보'** 로 두고 방향을 말하지 "
+               "않습니다. 아래 유불리 비중도 조정점수 기준입니다.\n\n"
+               "절대적인 수익률 예측이 아니라 **자산 간 상대적인 유불리**를 가늠하는 "
+               "지표로 보세요.")
 
     # 포트폴리오 노출
-    _pos = float((idf[idf["종합 점수"] > 0.18 * _scale]["비중(%)"]).sum())
-    _neg = float((idf[idf["종합 점수"] < -0.18 * _scale]["비중(%)"]).sum())
-    _neu = 100.0 - _pos - _neg
-    k1, k2, k3 = st.columns(3)
-    k1.metric("전망에 유리한 자산", f"{_pos:.1f}%")
+    _ok = idf["종합 영향"] != "판정 유보"
+    _pos = float(idf[_ok & (idf["조정점수"] > 0.18 * _scale)]["비중(%)"].sum())
+    _neg = float(idf[_ok & (idf["조정점수"] < -0.18 * _scale)]["비중(%)"].sum())
+    _hold = float(idf[~_ok]["비중(%)"].sum())
+    _neu = 100.0 - _pos - _neg - _hold
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("전망에 유리", f"{_pos:.1f}%")
     k2.metric("중립", f"{_neu:.1f}%")
-    k3.metric("불리한 자산", f"{_neg:.1f}%")
+    k3.metric("불리", f"{_neg:.1f}%")
+    k4.metric("판정 유보", f"{_hold:.1f}%",
+              help="설명력이 낮아 방향을 판단하지 않은 자산의 비중입니다.")
+    if _hold > 20:
+        st.info(f"포트폴리오의 **{_hold:.1f}%** 는 지금 요인 세트로 설명되지 않아 "
+                f"판단을 유보했습니다. 이 부분은 다른 근거로 판단하셔야 합니다.")
 
-    _wavg = float((idf["종합 점수"] * idf["비중(%)"] / 100).sum())
+    _wavg = float((idf["조정점수"] * idf["비중(%)"] / 100).sum())
     if _neg > 50:
         st.warning(f"입력한 전망이 맞다면 포트폴리오의 **{_neg:.1f}%** 가 불리한 "
                    f"자산입니다. 가중 평균 점수는 **{_wavg:+.2f}** 입니다.")
@@ -4918,12 +5064,14 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
         st.info(f"유불리가 뚜렷하지 않습니다. 가중 평균 점수 **{_wavg:+.2f}**.")
 
     fb = go.Figure(go.Bar(
-        x=idf["종합 점수"], y=idf["티커"], orientation="h",
-        marker_color=["#0d9488" if v > 0 else "#dc2626" for v in idf["종합 점수"]],
-        text=[f"{v:+.2f} ({l})" for v, l in zip(idf["종합 점수"], idf["종합 영향"])],
+        x=idf["조정점수"], y=idf["티커"], orientation="h",
+        marker_color=["#94a3b8" if l == "판정 유보" else
+                      ("#0d9488" if v > 0 else "#dc2626")
+                      for v, l in zip(idf["조정점수"], idf["종합 영향"])],
+        text=[f"{v:+.2f} ({l})" for v, l in zip(idf["조정점수"], idf["종합 영향"])],
         textposition="outside"))
     fb.update_layout(height=90 + 42 * len(idf), margin=dict(l=0, r=90, t=30, b=0),
-                     xaxis=dict(title="종합 영향 점수"),
+                     xaxis=dict(title="조정 영향 점수 (설명력 가중 후)"),
                      yaxis=dict(autorange="reversed"))
     st.plotly_chart(fb, width="stretch")
 
@@ -5773,12 +5921,16 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
             return "보합"
 
         _draft = {"경기": _dir(_g), "물가": _dir(_i)}
-        # 경기 둔화 + 물가 둔화면 금리 인하 압력, 반대면 인상 압력
+        # 경기 둔화 + 물가 둔화면 금리 인하 압력, 반대면 인상 압력.
+        # 정책금리와 장기금리는 같은 요인으로 들어가므로 **장기금리 하나만** 켠다.
+        # (둘 다 켜면 금리 요인이 두 번 반영돼 영향이 부풀려진다)
         _rate = -(_g * 0.4 + _i * 0.6)
-        _draft["정책금리"] = _dir(-_rate)
         _draft["장기금리"] = _dir(-_rate)
+        _need_extra = []
         if mkt_dir.get("위험선호") is not None:
             _draft["위험선호"] = "상승" if mkt_dir["위험선호"] > 0 else "하락"
+            if _draft["위험선호"] != "보합":
+                _need_extra.append("위험선호")
         _conf = int(min(90, max(20, abs(_g) * 40 + 30)))
 
         st.dataframe(pd.DataFrame(
@@ -5793,6 +5945,14 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
                 _mvdf.loc[_m, "확신도(%)"] = _conf
                 _mvdf.loc[_m, "메모"] = f"{reg.index[-1].strftime('%Y-%m')} 거시국면: {last['국면']}"
             st.session_state["_mv_views"] = _mvdf
+            # 편집기 위젯 상태를 지우지 않으면 이전 입력이 계속 보인다
+            st.session_state.pop("_mv_view_editor", None)
+            # 전망표에는 있는데 회귀 요인에 없으면 계산에서 조용히 빠진다.
+            # 필요한 추가 요인을 함께 켜준다.
+            if _need_extra:
+                _cur = list(st.session_state.get("_mv_extra", []))
+                st.session_state["_mv_extra"] = list(
+                    dict.fromkeys(_cur + _need_extra))
             st.session_state["_mv_draft_flag"] = True
             st.session_state["_va_mode"] = "🌍 시장·거시 전망"
             st.session_state["_pending_tool"] = "🧭 뷰 기반 자산배분"
