@@ -2589,6 +2589,15 @@ def render_help():
                 "**민감도는 다중회귀로 구합니다.** 요인끼리 상관이 있을 때 단순회귀는 "
                 "크게 빗나가기 때문입니다. 요인은 기본 4개(금리·경기·물가·달러)이고, "
                 "신용·위험선호는 경기와 많이 겹쳐 선택 사항으로 뒀습니다.\n\n"
+                "**민감도는 표준화해서 보여줍니다.** 요인마다 평소 움직이는 폭이 달라"
+                "(금리는 작고 경기는 큼), 그대로 두면 계수가 스케일 차이만큼 부풀려져 "
+                "요인 간 비교가 안 됩니다. 표의 값은 **요인이 평소만큼(1σ) 움직일 때 "
+                "자산이 몇 % 반응하는지**입니다. 원래 단위는 접이식에서 볼 수 있고, "
+                "거기서는 금리 민감도를 채권 듀레이션과 비교할 수 있습니다.\n\n"
+                "**🧪 민감도가 상식과 맞는지 확인** 버튼으로 검증할 수 있습니다. "
+                "TLT·SHY·SPY·GLD 같이 성격이 분명한 자산의 민감도가 알려진 범위 안에 "
+                "있는지 자동으로 봅니다. 여기서 어긋나면 요인 대용치에 문제가 있다는 "
+                "뜻이니 영향 분석을 믿지 마세요.\n\n"
                 "**R²(설명력)를 꼭 확인하세요.** 낮으면 그 자산의 움직임이 이 요인들로 "
                 "설명되지 않는다는 뜻이라, 영향 분석도 믿기 어렵습니다. 요인 대용치가 "
                 "모두 미국 지표라 한국 자산은 설명력이 낮을 수 있습니다.\n\n"
@@ -4336,11 +4345,27 @@ def _render_hist_stress(base_ccy, start_date, end_date, use_div,
 FACTOR_PROXY = {
     "장기금리": ("^TNX", None, "10년 국채 금리", "금리가 오르면 +"),
     "경기": ("XLY", "XLP", "경기소비재 / 필수소비재", "경기가 좋아지면 +"),
-    "물가": ("TIP", "IEF", "물가연동채 / 명목채", "물가 압력이 커지면 +"),
+    # TIP/IEF 는 둘 다 금리에 민감해 물가가 아니라 잔여 금리를 재는 문제가 있었다.
+    # 원자재로 바꾸면 물가 압력을 더 직접 반영한다(경기와 겹칠 수 있으니 VIF 확인).
+    "물가": ("DBC", None, "원자재 지수 ETF", "물가 압력이 커지면 +"),
     "달러": ("UUP", None, "달러지수 ETF", "달러가 강해지면 +"),
     "신용": ("HYG", "LQD", "하이일드 / 우량회사채", "신용환경이 좋아지면 +"),
     "위험선호": ("SPY", "TLT", "주식 / 장기채", "위험선호가 커지면 +"),
 }
+
+# 민감도가 상식과 맞는지 자동 확인할 때 쓰는 기대치.
+# (자산, 요인) → (하한, 상한). None 이면 부호만 본다.
+FACTOR_EXPECT = {
+    ("TLT", "장기금리"): (-20.0, -11.0),
+    ("IEF", "장기금리"): (-9.5, -5.5),
+    ("SHY", "장기금리"): (-3.5, -0.8),
+    ("SPY", "경기"): (0.4, 2.0),
+    ("SPY", "장기금리"): (None, 0.0),
+    ("GLD", "달러"): (None, 0.0),
+    ("XLE", "물가"): (0.0, None),
+    ("XLP", "경기"): (None, 0.6),
+}
+FACTOR_CHECK_TK = ["TLT", "IEF", "SHY", "SPY", "GLD", "XLE", "XLP"]
 # 기본 4개. 신용·위험선호는 경기와 많이 겹쳐 선택 사항으로 둔다.
 FACTOR_DEFAULT = ["장기금리", "경기", "물가", "달러"]
 
@@ -4391,6 +4416,17 @@ def build_factors(start, end, freq="주별", picks=tuple(FACTOR_DEFAULT)):
     if not cols:
         return None, list(picks)
     return pd.DataFrame(cols).dropna(), bad
+
+
+def standardize(F: pd.DataFrame):
+    """
+    요인을 표준편차 1로 맞춘다.
+    요인마다 변동성이 크게 다르면(금리 0.0015 vs 경기 0.010) 회귀 계수가
+    스케일 차이만큼 부풀려져 요인 간 비교가 불가능해진다.
+    반환: (표준화된 F, 요인별 표준편차)
+    """
+    sd = F.std().replace(0, np.nan)
+    return (F - F.mean()) / sd, sd
 
 
 def factor_betas(r: pd.Series, F: pd.DataFrame):
@@ -4652,25 +4688,44 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
 
     # ---------------- 민감도 ----------------
     st.subheader("4️⃣ 자산별 민감도 (Factor Betas)")
-    vif = factor_vif(F)
+    # 요인마다 변동성이 크게 달라(금리는 작고 경기는 큼) 원단위 계수는
+    # 요인 간 비교가 불가능하다. 표준화한 값을 기본으로 쓰고 원단위는 함께 보여준다.
+    Fz, f_sd = standardize(F)
+    vif = factor_vif(Fz)
     _hi_vif = [k for k, v in vif.items() if np.isfinite(v) and v > 10]
-    rows = []
+    rows, raws = [], []
     for t_ in use_tk:
-        b, r2, n_ = factor_betas(R[t_], F)
-        row = {"티커": t_, **{f"{k}": b.get(k, np.nan) for k in F.columns},
-               "R²": r2, "표본": n_}
-        row["신뢰도"] = ("높음" if (r2 or 0) >= 0.5 else
-                       "보통" if (r2 or 0) >= 0.25 else "낮음 ⚠️")
-        rows.append(row)
+        bz, r2, n_ = factor_betas(R[t_], Fz)
+        br, _, _ = factor_betas(R[t_], F)
+        rows.append({"티커": t_,
+                     **{k: bz.get(k, np.nan) * 100 for k in Fz.columns},
+                     "R²": r2, "표본": n_,
+                     "신뢰도": ("높음" if (r2 or 0) >= 0.5 else
+                              "보통" if (r2 or 0) >= 0.25 else "낮음 ⚠️")})
+        raws.append({"티커": t_, **{k: br.get(k, np.nan) for k in F.columns}})
     bdf = pd.DataFrame(rows)
-    _fmt = {k: "{:+.2f}" for k in F.columns}
+    rawdf = pd.DataFrame(raws)
+    _fmt = {k: "{:+.2f}" for k in Fz.columns}
     _fmt.update({"R²": "{:.2f}", "표본": "{:.0f}"})
     st.dataframe(bdf.style.format(_fmt, na_rep="-"), width="stretch",
                  hide_index=True)
-    st.caption("**민감도**는 그 요인이 1단위 움직일 때 자산이 몇 % 움직이는지입니다. "
-               "예를 들어 장기금리 −4.0이면 금리가 1%p 오를 때 약 4% 하락한다는 뜻입니다.\n\n"
+    st.caption("**민감도(%)** 는 그 요인이 **평소 움직이는 만큼(1σ)** 변할 때 자산이 몇 % "
+               "반응하는지입니다. 요인마다 변동폭이 달라서, 이렇게 맞춰야 요인 간 "
+               "크기를 비교할 수 있습니다.\n\n"
                "**R²는 설명력**입니다. 낮으면 그 자산의 움직임이 이 요인들로 잘 설명되지 "
                "않는다는 뜻이니, 아래 영향 분석도 신중하게 보세요.")
+
+    with st.expander("원래 단위로 보기 (금리는 듀레이션으로 읽힘)", expanded=False):
+        st.dataframe(rawdf.style.format({k: "{:+.2f}" for k in F.columns},
+                                        na_rep="-"),
+                     width="stretch", hide_index=True)
+        st.caption("장기금리 −16.0이면 금리가 1%p 오를 때 약 16% 하락한다는 뜻으로, "
+                   "채권 듀레이션과 비교해볼 수 있습니다. "
+                   "다른 요인은 대용치의 변화율 기준이라 직접 해석이 어렵습니다.")
+        st.dataframe(pd.DataFrame({"요인": list(F.columns),
+                                   "1σ (요인 변동폭)": [float(f_sd[c]) for c in F.columns]})
+                     .style.format({"1σ (요인 변동폭)": "{:.5f}"}),
+                     width="stretch", hide_index=True)
 
     _low = bdf[bdf["신뢰도"].astype(str).str.contains("낮음")]["티커"].tolist()
     if _low:
@@ -4680,8 +4735,63 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
         st.warning(f"요인끼리 많이 겹칩니다: {', '.join(_hi_vif)} — "
                    f"각 요인의 민감도를 따로 떼어 해석하기 어렵습니다. "
                    f"추가 요인을 빼보세요.")
+    # ---------------- 자동 검증 ----------------
+    with st.expander("🧪 민감도가 상식과 맞는지 확인", expanded=False):
+        st.caption("성격이 분명한 자산으로 민감도를 뽑아 **알려진 방향·크기와 맞는지** "
+                   "확인합니다. 여기서 어긋나면 요인 대용치나 추정 방식에 문제가 "
+                   "있다는 뜻이라, 위 영향 분석도 믿기 어렵습니다.")
+        if st.button("🧪 검증 실행", width="stretch", key="_mv_check"):
+            try:
+                with st.spinner("검증용 자산 조회 중..."):
+                    cpx, _cm, _cf = build_price_frame(
+                        FACTOR_CHECK_TK, _start, end_date, "USD",
+                        use_div, True, gap_fill)
+                ctk = [x for x in FACTOR_CHECK_TK if x in cpx.columns]
+                _cp = cpx[ctk] if f_freq == "일별" else cpx[ctk].resample("W-FRI").last()
+                CR = _cp.pct_change()
+                crows = []
+                for t_ in ctk:
+                    br_, r2_, n2_ = factor_betas(CR[t_], F)
+                    for fac in F.columns:
+                        exp = FACTOR_EXPECT.get((t_, fac))
+                        if exp is None:
+                            continue
+                        lo_, hi_ = exp
+                        v = br_.get(fac, np.nan)
+                        if not np.isfinite(v):
+                            ok_ = "– 계산 불가"
+                        elif (lo_ is None or v >= lo_) and (hi_ is None or v <= hi_):
+                            ok_ = "✅"
+                        else:
+                            ok_ = "❌"
+                        rng_ = ("음수" if (hi_ == 0.0 and lo_ is None) else
+                                "양수" if (lo_ == 0.0 and hi_ is None) else
+                                f"{lo_:.1f} ~ {hi_:.1f}" if lo_ is not None
+                                and hi_ is not None else
+                                f"{hi_:.1f} 이하")
+                        crows.append({"자산": t_, "요인": fac,
+                                      "추정(원단위)": v, "기대": rng_,
+                                      "판정": ok_, "R²": r2_})
+                if crows:
+                    cdf2 = pd.DataFrame(crows)
+                    nfail = int((cdf2["판정"] == "❌").sum())
+                    if nfail:
+                        st.error(f"🚫 {nfail}개 항목이 기대와 어긋납니다. "
+                                 f"요인 대용치를 손봐야 할 수 있습니다.")
+                    else:
+                        st.success("✅ 모든 항목이 기대 범위 안에 있습니다.")
+                    st.dataframe(cdf2.style.format({"추정(원단위)": "{:+.2f}",
+                                                    "R²": "{:.2f}"}, na_rep="-"),
+                                 width="stretch", hide_index=True)
+                    st.caption("금리 민감도는 채권 듀레이션과 비교할 수 있습니다. "
+                               "TLT는 −12~−18, SHY는 −1~−3 정도가 정상입니다.")
+                else:
+                    st.warning("검증용 자산 데이터를 가져오지 못했습니다.")
+            except Exception as ex:
+                st.error(f"검증에 실패했습니다: {ex}")
+
     with st.expander("요인 간 상관·중복 정도", expanded=False):
-        st.dataframe(F.corr().round(2).style.format("{:.2f}").map(_corr_color),
+        st.dataframe(Fz.corr().round(2).style.format("{:.2f}").map(_corr_color),
                      width="stretch")
         st.dataframe(pd.DataFrame({"요인": list(vif), "VIF": list(vif.values())})
                      .style.format({"VIF": "{:.2f}"}), width="stretch",
@@ -4745,9 +4855,10 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
                  .map(_heat_color, subset=[c for c in idf.columns
                                            if c.endswith("영향") and c != "종합 영향"]),
                  width="stretch", hide_index=True)
-    st.caption("**종합 점수**는 민감도 × 전망 방향 × 확신도를 더한 값입니다. "
-               "절대적인 수익률 예측이 아니라 **자산 간 상대적인 유불리**를 "
-               "가늠하는 지표로 보세요.")
+    st.caption("**종합 점수(%)** 는 민감도 × 전망 방향 × 확신도를 더한 값입니다. "
+               "'전망이 평소 수준으로 실현되면 대략 이만큼 유불리하다'로 읽으시면 "
+               "됩니다. 절대적인 수익률 예측이 아니라 **자산 간 상대적인 유불리**를 "
+               "가늠하는 지표입니다.")
 
     # 포트폴리오 노출
     _pos = float((idf[idf["종합 점수"] > 0.18 * _scale]["비중(%)"]).sum())
@@ -4808,10 +4919,11 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
             mv.to_excel(xw, sheet_name="1_전망", index=False)
-            bdf.to_excel(xw, sheet_name="2_민감도", index=False)
+            bdf.to_excel(xw, sheet_name="2_민감도(표준화)", index=False)
+            rawdf.to_excel(xw, sheet_name="2b_민감도(원단위)", index=False)
             idf.to_excel(xw, sheet_name="3_영향분석", index=False)
             udf.to_excel(xw, sheet_name="4_전망표현", index=False)
-            F.corr().round(3).to_excel(xw, sheet_name="5_요인상관")
+            Fz.corr().round(3).to_excel(xw, sheet_name="5_요인상관")
             pd.DataFrame(list({
                 "추정 기간": f"{f_yrs}년", "계산 주기": f_freq,
                 "요인": ", ".join(F.columns),
