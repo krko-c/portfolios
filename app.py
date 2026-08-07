@@ -28,6 +28,7 @@ from scipy.spatial.distance import squareform
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 import plotly.graph_objects as go
 import streamlit as st
@@ -5943,6 +5944,65 @@ def fred_yoy_summary(df: pd.DataFrame, series: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# ======================================================================
+# 한국 거시지표 (ECOS, 한국은행)
+# ======================================================================
+# 통계표코드/항목코드는 하드코딩하지 않는다. 자산 티커와 달리 이 코드들은
+# 사전 검증 수단이 없어, 틀린 코드를 넣으면 "그럴듯하지만 틀린 지표"가
+# 조용히 나올 수 있다. 대신 ECOS가 제공하는 메타데이터 API로 이름 검색 →
+# 세부 항목 선택 → 조회 순서를 강제한다.
+ECOS_BASE = "https://ecos.bok.or.kr/api"
+ECOS_FREQ_FMT = {"D": "%Y%m%d", "M": "%Y%m", "A": "%Y"}
+
+
+def _ecos_get(service: str, api_key: str, path_parts: list, timeout: int = 15) -> list:
+    """
+    ECOS REST 공통 호출. 성공 시 row 리스트를 돌려주고, 실패하면 예외를 던진다.
+    오류 응답은 최상위(RESULT)나 서비스명 아래(예: {"StatisticSearch":{"RESULT":...}})
+    양쪽 다 올 수 있어 둘 다 확인한다.
+    """
+    url = "/".join([ECOS_BASE, service, api_key, "json", "kr"]
+                   + [str(p) for p in path_parts])
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    err = data.get("RESULT") or (data.get(service) or {}).get("RESULT")
+    if err:
+        raise ValueError(f"ECOS 오류({err.get('CODE', '?')}): "
+                         f"{err.get('MESSAGE', '알 수 없는 오류')}")
+    body = data.get(service)
+    if not isinstance(body, dict) or "row" not in body:
+        raise ValueError(f"ECOS 응답 형식이 예상과 다릅니다: {str(data)[:200]}")
+    return body["row"]
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def ecos_table_list(api_key: str) -> list:
+    """전체 통계표 목록(통계표코드·통계명). 이름으로 검색하기 위한 메타데이터."""
+    return _ecos_get("StatisticTableList", api_key, [1, 1000])
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def ecos_item_list(api_key: str, stat_code: str) -> list:
+    """특정 통계표 안의 세부 항목 목록(통계항목코드·항목명)."""
+    return _ecos_get("StatisticItemList", api_key, [1, 1000, stat_code])
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def ecos_series(api_key: str, stat_code: str, item_code: str, freq: str,
+                start: str, end: str) -> pd.Series:
+    """실제 시계열. freq: D(일)/M(월)/A(년). start/end는 해당 주기 포맷."""
+    rows = _ecos_get("StatisticSearch", api_key,
+                     [1, 1000, stat_code, freq, start, end, item_code])
+    if not rows:
+        return pd.Series(dtype=float)
+    df = pd.DataFrame(rows)
+    vals = pd.to_numeric(df["DATA_VALUE"], errors="coerce")
+    idx = pd.to_datetime(df["TIME"], format=ECOS_FREQ_FMT.get(freq, "%Y%m"), errors="coerce")
+    s = pd.Series(vals.values, index=idx).dropna()
+    return s.sort_index()
+
+
 def build_macro_regime(data: pd.DataFrame, lag_months=2, win=60) -> pd.DataFrame:
     """
     경기 × 물가 4분면.
@@ -6185,6 +6245,84 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
         if not len(rc) and not len(liq):
             st.info("표시할 지표가 없습니다.")
 
+    # ---------------- 한국 거시 (ECOS) ----------------
+    st.subheader("5️⃣ 한국 거시 (ECOS)")
+    st.caption("한국은행 ECOS에서 원하는 지표를 이름으로 검색해 조회합니다. "
+              "**통계표코드를 미리 정해두지 않습니다** — 잘못 외운 코드로 조용히 "
+              "엉뚱한 지표를 보여주는 사고를 막기 위해 매번 이름 검색부터 시작합니다.")
+    ecos_key = st.text_input("ECOS API 인증키", type="password", key="_ecos_key",
+                             help="https://ecos.bok.or.kr 에서 무료 발급받습니다. "
+                                  "이 키는 이 브라우저 세션에만 남고 저장되지 않습니다.")
+    if not ecos_key.strip():
+        st.info("👆 인증키를 입력하면 통계표를 검색할 수 있습니다.")
+    else:
+        kw = st.text_input("통계표 검색 (예: 기준금리, 소비자물가, 국고채)", key="_ecos_kw")
+        if kw.strip():
+            try:
+                with st.spinner("통계표 검색 중..."):
+                    tables = ecos_table_list(ecos_key.strip())
+            except Exception as ex:
+                st.error(f"🚫 통계표 목록을 가져오지 못했습니다: {ex}")
+                tables = []
+            matches = [t for t in tables if kw.strip() in str(t.get("STAT_NAME", ""))]
+            if not matches:
+                st.warning("검색 결과가 없습니다. 다른 표현으로 검색해보세요 "
+                           "(예: '금리' 대신 '기준금리').")
+            else:
+                if len(matches) > 50:
+                    st.caption(f"{len(matches)}건 중 상위 50건만 표시합니다. "
+                               "검색어를 좁혀보세요.")
+                opts = {f"{t['STAT_NAME']} ({t['STAT_CODE']})": t["STAT_CODE"]
+                       for t in matches[:50]}
+                pick = st.selectbox("통계표 선택", list(opts), key="_ecos_table_pick")
+                stat_code = opts[pick]
+                try:
+                    with st.spinner("세부 항목 조회 중..."):
+                        items = ecos_item_list(ecos_key.strip(), stat_code)
+                except Exception as ex:
+                    st.error(f"🚫 세부 항목을 가져오지 못했습니다: {ex}")
+                    items = []
+                if items:
+                    iopts = {f"{it.get('ITEM_NAME1', '(이름 없음)')} "
+                            f"({it.get('ITEM_CODE1', '')})": it.get("ITEM_CODE1", "")
+                            for it in items}
+                    ipick = st.selectbox("세부 항목 선택", list(iopts), key="_ecos_item_pick")
+                    item_code = iopts[ipick]
+                    fc1, fc2 = st.columns([1, 2])
+                    freq_label = fc1.radio("주기", ["월", "년", "일"], horizontal=True,
+                                           key="_ecos_freq")
+                    years_back = fc2.slider("조회 기간 (년)", 1, 20, 10, key="_ecos_years")
+                    if st.button("📈 조회", key="_ecos_go", type="primary"):
+                        freq = {"월": "M", "년": "A", "일": "D"}[freq_label]
+                        fmt = ECOS_FREQ_FMT[freq]
+                        end_s = pd.Timestamp(end_date)
+                        start_s = end_s - pd.DateOffset(years=years_back)
+                        try:
+                            with st.spinner("시계열 조회 중..."):
+                                s = ecos_series(ecos_key.strip(), stat_code, item_code, freq,
+                                               start_s.strftime(fmt), end_s.strftime(fmt))
+                        except Exception as ex:
+                            st.error(f"🚫 조회 실패: {ex}")
+                            s = pd.Series(dtype=float)
+                        if s.empty:
+                            st.warning("데이터가 없습니다. 주기나 기간을 바꿔보세요.")
+                        else:
+                            fk = go.Figure(go.Scatter(x=s.index, y=s.values, mode="lines",
+                                                      line=dict(color="#2563eb")))
+                            fk.update_layout(height=320, margin=dict(l=0, r=0, t=20, b=0),
+                                             yaxis=dict(title=ipick.split(" (")[0]))
+                            st.plotly_chart(fk, width="stretch")
+                            last_v = float(s.iloc[-1])
+                            mc1, mc2, mc3 = st.columns(3)
+                            mc1.metric("최근값", f"{last_v:,.2f}",
+                                      help=f"기준: {s.index[-1].strftime('%Y-%m-%d')}")
+                            if len(s) > 3:
+                                mc2.metric("3구간 전 대비",
+                                          f"{last_v - float(s.iloc[-4]):+,.2f}")
+                            if len(s) > 12:
+                                mc3.metric("12구간 전 대비",
+                                          f"{last_v - float(s.iloc[-13]):+,.2f}")
+
     # ---------------- 포트폴리오 노출 ----------------
     # ---------------- 전망 초안으로 넘기기 ----------------
     if reg is not None and len(reg):
@@ -6243,7 +6381,7 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
             st.session_state["_pending_tool"] = "🧭 뷰 기반 자산배분"
             st.rerun()
 
-    st.subheader("5️⃣ 내 포트폴리오 노출 점검")
+    st.subheader("6️⃣ 내 포트폴리오 노출 점검")
     st.caption("현재 국면에서 **통념상 유리한 자산과 불리한 자산에 얼마나 노출**돼 "
                "있는지 봅니다. 미래를 예측하지 않고, 지금 구성만 진단합니다.")
     clip = st.session_state.get(CLIP_KEY)
