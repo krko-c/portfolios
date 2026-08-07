@@ -19,6 +19,7 @@ import json
 import os
 import re
 import subprocess
+from functools import partial
 from pathlib import Path
 
 from scipy.cluster.hierarchy import fcluster, linkage, to_tree
@@ -40,7 +41,7 @@ ENABLE_LOCAL_PERSISTENCE = os.environ.get("ENABLE_LOCAL_PERSISTENCE", "").lower(
 
 # 사이드바 메뉴 — 성격별로 묶어 표시한다
 TOOL_GROUPS = [
-    ("분석", ["📊 포트폴리오 분석", "📉 시장·거시 국면", "🔗 자산 상관관계",
+    ("분석", ["📊 포트폴리오 분석", "🗞 시장동향", "📉 시장·거시 국면", "🔗 자산 상관관계",
               "🌩 스트레스 테스트"]),
     ("배분", ["🎯 포트폴리오 최적화", "🧭 뷰 기반 자산배분", "➕ 자산 추가 효과"]),
     ("결정", ["⚖️ 최종 대안 비교"]),
@@ -6248,6 +6249,111 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
                "백테스트에 쓰지 않습니다. 교육·참고용이며 투자 자문이 아닙니다.")
 
 
+# ======================================================================
+# 시장동향 — 자산군별 대표 지수/ETF 가격 스냅샷
+# ======================================================================
+MARKET_SNAPSHOT_GROUPS = {
+    "주가지수": [("^GSPC", "S&P 500"), ("^NDX", "나스닥100"), ("^KS11", "코스피"),
+              ("^KQ11", "코스닥"), ("^N225", "니케이225"), ("^STOXX50E", "유로스톡스50")],
+    "섹터 (미국)": [("XLK", "기술"), ("XLF", "금융"), ("XLE", "에너지"), ("XLV", "헬스케어"),
+                 ("XLI", "산업재"), ("XLY", "임의소비재"), ("XLP", "필수소비재"),
+                 ("XLU", "유틸리티"), ("XLB", "소재"), ("XLRE", "리츠")],
+    "채권·금리": [("SHY", "미 단기국채(1-3Y)"), ("IEF", "미 중기국채(7-10Y)"),
+               ("TLT", "미 장기국채(20Y+)"), ("LQD", "미 투자등급 회사채"),
+               ("HYG", "미 하이일드")],
+    "통화·원자재": [("DX-Y.NYB", "달러인덱스"), ("KRW=X", "원/달러"), ("GLD", "금"),
+                 ("USO", "WTI 원유"), ("BTC-USD", "비트코인")],
+}
+
+# (표시 열 이름, 기준일로부터의 오프셋). 1일은 달력일이 아니라 직전 거래일 대비로 따로 계산한다.
+SNAPSHOT_WINDOWS = [
+    ("1주", pd.DateOffset(weeks=1)),
+    ("1개월", pd.DateOffset(months=1)),
+    ("3개월", pd.DateOffset(months=3)),
+    ("1년", pd.DateOffset(years=1)),
+]
+SNAPSHOT_COLS = ["1일", "1주", "1개월", "3개월", "YTD", "1년"]
+
+
+def _snapshot_day_return(close: pd.Series) -> float:
+    """직전 거래일 대비 수익률(%). 달력일이 아니라 실제 거래일 기준."""
+    c = close.dropna()
+    if len(c) < 2:
+        return np.nan
+    prev = c.iloc[-2]
+    if not prev:
+        return np.nan
+    return (c.iloc[-1] / prev - 1) * 100
+
+
+def _snapshot_offset_return(close: pd.Series, ref: pd.Timestamp, base_date: pd.Timestamp) -> float:
+    """ref 시점 값 대비 base_date 이전 마지막 거래일 값의 수익률(%)."""
+    hist = close.loc[:ref].dropna()
+    if hist.empty:
+        return np.nan
+    base_hist = close.loc[:base_date].dropna()
+    if base_hist.empty:
+        return np.nan
+    base = base_hist.iloc[-1]
+    if not base:
+        return np.nan
+    return (hist.iloc[-1] / base - 1) * 100
+
+
+def render_market_snapshot(end_date):
+    st.title("🗞 시장동향")
+    st.caption("자산군별 대표 지수·ETF의 최근 가격 변동을 한눈에 봅니다. "
+              "**왜 움직였는지는 설명하지 않습니다** — 무엇이 얼마나 움직였는지만 "
+              "보여주는 스냅샷입니다. 뉴스·리서치와 함께 참고하세요.")
+
+    ref = pd.Timestamp(end_date)
+    lookback_start = ref - pd.DateOffset(years=2)  # 1년 수익률 계산 여유분
+
+    rows, fails = [], []
+    with st.spinner("시세 조회 중..."):
+        for group, items in MARKET_SNAPSHOT_GROUPS.items():
+            for tk, label in items:
+                try:
+                    close = load_ticker(tk, lookback_start, ref)["close"]
+                except Exception:
+                    fails.append(f"{label}({tk})")
+                    continue
+                hist = close.loc[:ref].dropna()
+                if hist.empty:
+                    fails.append(f"{label}({tk})")
+                    continue
+                row = {"구분": group, "자산": label, "티커": tk,
+                      "1일": _snapshot_day_return(close)}
+                for wname, offset in SNAPSHOT_WINDOWS:
+                    row[wname] = _snapshot_offset_return(close, ref, ref - offset)
+                row["YTD"] = _snapshot_offset_return(
+                    close, ref, pd.Timestamp(year=ref.year - 1, month=12, day=31))
+                row["기준일"] = hist.index[-1].strftime("%Y-%m-%d")
+                rows.append(row)
+
+    if fails:
+        st.warning(f"⚠️ 조회하지 못한 종목: {', '.join(fails)}")
+    if not rows:
+        st.error("🚫 조회된 시세가 없습니다.")
+        return
+
+    df = pd.DataFrame(rows)[["구분", "자산", "티커"] + SNAPSHOT_COLS + ["기준일"]]
+    RANGE = {"1일": 3.0, "1주": 5.0, "1개월": 10.0, "3개월": 15.0, "YTD": 25.0, "1년": 25.0}
+    for group in MARKET_SNAPSHOT_GROUPS:
+        gdf = df[df["구분"] == group].drop(columns=["구분"])
+        if gdf.empty:
+            continue
+        st.subheader(group)
+        sty = gdf.style.format({c: "{:+.2f}%" for c in SNAPSHOT_COLS}, na_rep="-")
+        apply_fn = sty.map if hasattr(sty, "map") else sty.applymap
+        for c, hi in RANGE.items():
+            sty = apply_fn(partial(_heat_color, lo=-hi, hi=hi), subset=[c])
+        st.dataframe(sty, width="stretch", hide_index=True)
+
+    st.caption(f"기준일 {ref.strftime('%Y-%m-%d')} (사이드바 종료일 기준) · 가격 변동률이며 "
+              "배당은 포함하지 않았습니다. 교육·참고용이며 투자 자문이 아닙니다.")
+
+
 REG_COLS = ["티커", "종목명"]
 REG_COLORS = {"강세": "#dcfce7", "약세": "#fee2e2", "횡보": "#f1f5f9"}
 REG_LINE = {"강세": "#16a34a", "약세": "#dc2626", "횡보": "#94a3b8"}
@@ -8845,6 +8951,11 @@ with st.sidebar:
 
 IS_CMP = tool.endswith("대안 비교")
 IS_STRESS = tool.endswith("스트레스 테스트")
+IS_SNAPSHOT = tool.endswith("시장동향")
+
+if IS_SNAPSHOT:
+    render_market_snapshot(end_date)
+    st.stop()
 
 if IS_CMP:
     render_compare(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, rf_rate,
