@@ -61,6 +61,26 @@ if mode == "⌨️ 직접 입력":
         })
     st.session_state["il_manual_df"] = edited
 
+    bc1, bc2 = st.columns(2)
+    bc1.download_button(
+        "📥 현재 표 CSV로 저장", edited.to_csv(index=False).encode("utf-8-sig"),
+        "index_lab_universe.csv", "text/csv", width="stretch",
+        help="앱 재배포·새로고침으로 세션이 초기화되면 입력한 내용이 사라집니다. "
+             "미리 받아두면 다음에 아래 '복원'으로 바로 이어서 할 수 있습니다.")
+    restore = bc2.file_uploader("📤 저장해둔 CSV로 복원", type=["csv"],
+                                key="il_restore_up", label_visibility="visible")
+    if restore is not None:
+        try:
+            restored = pd.read_csv(restore, dtype={"ticker": str})
+            for col in MANUAL_COLS:
+                if col not in restored.columns:
+                    restored[col] = None
+            st.session_state["il_manual_df"] = restored[MANUAL_COLS]
+            st.success(f"{len(restored)}개 행을 복원했습니다.")
+            st.rerun()
+        except Exception as ex:
+            st.error(f"🚫 복원 실패: {ex}")
+
     if st.button("🔍 야후파이낸스로 자동조회 (빈 칸만 채움)"):
         import yfinance as yf
         filled = edited.copy()
