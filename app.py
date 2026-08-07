@@ -18,6 +18,7 @@ import io
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 
 from scipy.cluster.hierarchy import fcluster, linkage, to_tree
@@ -817,14 +818,32 @@ def render_ticker_table(*, state_key, editor_key, gen_key, cols, weight_col=None
     return live, list(live["티커"]), bad
 
 
+@st.cache_data(show_spinner=False)
+def _git_commit() -> str:
+    """배포된 코드의 git commit 짧은 해시. 재현성 확인용 (결과 캡처 시점의 코드 버전)."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).parent, capture_output=True, text=True, timeout=3)
+        h = out.stdout.strip()
+        return h if h else "확인 불가"
+    except Exception:
+        return "확인 불가"
+
+
 def assumptions_panel(*, rebalance=None, cost=None, initial_cost=True,
-                      period=None, bench=None, extra=None, path_note=False):
+                      period=None, bench=None, extra=None, path_note=False,
+                      data_source="Yahoo Finance"):
     """
     화면 하단에 이 결과의 계산 가정을 모아 보여준다.
     가정이 화면 곳곳에 흩어져 있으면 사용자가 결과를 오해하기 쉽다.
     """
     with st.expander("📋 이 결과의 가정", expanded=False):
-        rows = []
+        rows = [
+            ("실행 시각", pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")),
+            ("코드 버전 (git commit)", _git_commit()),
+            ("가격 데이터 출처", data_source),
+        ]
         if period:
             rows.append(("분석 기간", period))
         if rebalance:
