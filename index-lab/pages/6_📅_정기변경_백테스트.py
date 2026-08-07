@@ -10,6 +10,7 @@ import yfinance as yf
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core import analytics as an
 from core.index_simulator import simulate_index
+from core.prices import fetch_close_prices
 
 st.set_page_config(page_title="Index Lab · 백테스트", page_icon="📅", layout="wide")
 st.title("📅 6️⃣ 정기변경 백테스트")
@@ -45,18 +46,19 @@ start = end - pd.DateOffset(years=years)
 fetch_list = list(tickers) + ([bench_tk.strip()] if bench_tk.strip() else [])
 try:
     with st.spinner("가격 데이터 조회 중..."):
-        raw = yf.download(fetch_list, start=start, end=end, auto_adjust=True,
-                          progress=False)
-    px = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
-    if isinstance(px, pd.Series):
-        px = px.to_frame(fetch_list[0])
+        downloader = lambda syms: yf.download(  # noqa: E731
+            syms, start=start, end=end, auto_adjust=True, progress=False)
+        px, missing = fetch_close_prices(fetch_list, downloader)
 except Exception as ex:
     st.error(f"🚫 가격 데이터를 가져오지 못했습니다: {ex}")
     st.stop()
 
-missing = [t for t in tickers if t not in px.columns or px[t].dropna().empty]
+missing = [t for t in missing if t in tickers]
 if missing:
     st.error(f"🚫 가격 데이터가 없는 종목: {', '.join(missing)}. "
+            f"티커 형식을 확인해주세요 — 한국 종목은 코스피 `.KS`(예: "
+            f"`005930.KS`) / 코스닥 `.KQ`(예: `247540.KQ`) 접미사가 필요합니다 "
+            f"(맨숫자만 있으면 `.KS`를 먼저, 안 되면 `.KQ`를 자동으로 시도했습니다). "
             f"샘플 티커를 쓰셨다면 실제 Yahoo Finance 티커로 유니버스를 다시 "
             f"올려주세요.")
     st.stop()
