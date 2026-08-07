@@ -1592,8 +1592,13 @@ def sharpe_ratio(r, rf=0.0):
 
 
 def sortino_ratio(r, rf=0.0):
+    """
+    하방편차는 '0(목표) 대비 편차'를 전체 표본 수로 나눠야 한다.
+    음수인 날들끼리의 표준편차(그 부분집합 평균 대비, 개수-1로 나눔)를 쓰면
+    전체 표본 크기에 둔감해지고 값이 왜곡된다 (risk_semisd 와 같은 정의여야 함).
+    """
     e = r - rf / TRADING_DAYS
-    d = e[e < 0].std()
+    d = np.sqrt(np.mean(np.minimum(e.values, 0.0) ** 2))
     if not np.isfinite(d) or d < _EPS_STD:
         return np.nan
     return e.mean() / d * np.sqrt(TRADING_DAYS)
@@ -1810,9 +1815,10 @@ def risk_ulcer(r, **k):
 
 
 def ratio_sortino(r, rf=0.0, **k):
+    """sortino_ratio 와 동일한 하방편차 정의(전체 표본 기준)를 쓴다."""
     e = r - rf / TRADING_DAYS
-    d = e[e < 0].std()
-    return -1e6 if (d == 0 or np.isnan(d)) else float(e.mean() / d * np.sqrt(TRADING_DAYS))
+    d = np.sqrt(np.mean(np.minimum(e.values, 0.0) ** 2))
+    return -1e6 if (d < _EPS_STD or np.isnan(d)) else float(e.mean() / d * np.sqrt(TRADING_DAYS))
 
 
 def ratio_omega(r, thr=0.0, **k):
@@ -1838,7 +1844,7 @@ RISK_DEFS = {
     "얼서지수 (Ulcer Index)": dict(group="낙폭 기반", fn=risk_ulcer, kind="risk",
                  desc="낙폭의 깊이와 지속기간을 함께 반영합니다."),
     "조건부 손실 (CVaR)": dict(group="꼬리위험", fn=risk_cvar, kind="risk",
-                          desc="최악 5% 일간 손실의 평균. 꼬리 위험에 민감합니다."),
+                          desc="최악 5% 손실의 평균 (연율화). 꼬리 위험에 민감합니다."),
 }
 
 
@@ -2496,10 +2502,19 @@ def run_self_tests(prices: pd.DataFrame = None) -> pd.DataFrame:
     # 8. 0분모 방어
     def t_zerodiv():
         flat = pd.Series(0.0, index=px.index[:200])
-        vals = [sharpe_ratio(flat, 0.03), sortino_ratio(flat, 0.03), calmar_ratio(flat)]
-        return all(pd.isna(v) for v in vals), "샤프·소르티노·칼마 모두 NaN"
+        # 샤프·칼마는 분모(표준편차·MDD)가 항상 0이라 무위험 수준과 무관하게 NaN.
+        base_nan = pd.isna(sharpe_ratio(flat, 0.03)) and pd.isna(calmar_ratio(flat))
+        # 소르티노는 초과수익이 정확히 0일 때만(무위험도 0) 진짜 0분모라 NaN.
+        sortino_zero = pd.isna(sortino_ratio(flat, 0.0))
+        # 무위험보다 낮은 채로 flat하면 실제 손실이 있으므로 유한한 값이 정상이다
+        # (여기서 NaN이 나오면 이전의 '음수 부분집합 표준편차' 버그가 재발한 것).
+        s_neg = sortino_ratio(flat, 0.03)
+        sortino_finite = np.isfinite(s_neg) and s_neg < 0
+        ok = base_nan and sortino_zero and sortino_finite
+        return ok, (f"샤프·칼마 NaN · 소르티노(무위험=0) NaN · "
+                    f"소르티노(무위험=3%) {s_neg:.2f} (유한)")
     check("변동성 0일 때 비율 폭주 방지", t_zerodiv,
-          "가격이 안 움직이면 비율 지표는 값을 낼 수 없어야 합니다")
+          "실제 초과수익이 0일 때만 NaN, 무위험보다 못한 채 flat하면 유한한 나쁜 값이어야 합니다")
 
     # 9. BL — 뷰가 없으면 기준 비중
     def t_bl():
