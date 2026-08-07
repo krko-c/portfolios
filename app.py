@@ -3421,7 +3421,8 @@ CRISIS_PRESETS = {
 # ======================================================================
 # 최종 대안 비교
 # ======================================================================
-def render_compare(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, rf_rate):
+def render_compare(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, rf_rate,
+                   cost_bp):
     st.title("⚖️ 최종 대안 비교")
     st.caption("여러 화면에서 만든 안을 **같은 조건으로 나란히** 비교합니다. "
                "각 화면 아래의 **비교 후보로 담기**로 안을 모아두세요.")
@@ -5311,7 +5312,7 @@ def render_macro_view(base_ccy, start_date, end_date, use_div,
 
 
 def render_view_alloc(base_ccy, start_date, end_date, use_div,
-                      fx_hedge, gap_fill, rf_rate):
+                      fx_hedge, gap_fill, rf_rate, cost_bp):
     """전망을 배분에 반영하는 두 가지 방식을 한 화면에서 고르게 한다."""
     st.title("🧭 뷰 기반 자산배분")
     mode = st.radio(
@@ -5329,11 +5330,11 @@ def render_view_alloc(base_ccy, start_date, end_date, use_div,
                           fx_hedge, gap_fill, rf_rate)
     else:
         render_black_litterman(base_ccy, start_date, end_date, use_div,
-                               fx_hedge, gap_fill, rf_rate)
+                               fx_hedge, gap_fill, rf_rate, cost_bp)
 
 
 def render_black_litterman(base_ccy, start_date, end_date, use_div,
-                           fx_hedge, gap_fill, rf_rate):
+                           fx_hedge, gap_fill, rf_rate, cost_bp):
     st.subheader("📈 자산수익률 전망 (Black-Litterman)")
     st.caption("시장 균형에서 출발해, 내가 가진 전망(뷰)을 **확신도만큼만** 반영해 "
                "자산배분을 산출합니다. 뷰를 넣지 않으면 기준 비중이 그대로 나옵니다.")
@@ -6718,7 +6719,7 @@ def solve_combo(R: pd.DataFrame, goal, risk_name, rf, wmin, wmax, min_ret, max_v
 
 
 def render_fixed_add(base_df, base_tk, cand_tk, base_ccy, start_date, end_date,
-                     use_div, rf_rate, fx_hedge, gap_fill, meta_bad=None):
+                     use_div, rf_rate, fx_hedge, gap_fill, cost_bp, meta_bad=None):
     """
     고정 비중 편입 효과.
     후보를 정해진 비중으로 넣었을 때 지표가 어떻게 달라지는지,
@@ -7025,7 +7026,7 @@ def render_fixed_add(base_df, base_tk, cand_tk, base_ccy, start_date, end_date,
 
 
 def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
-                            fx_hedge, gap_fill):
+                            fx_hedge, gap_fill, cost_bp):
     st.title("➕ 자산 추가 효과")
     st.caption("기존 포트폴리오에 후보 종목 중 몇 개를 더했을 때 가장 좋아지는 조합을 찾습니다. "
                "선정은 **학습 구간** 데이터로만 하고, 결과는 **표본외 성과**와 함께 보여드립니다.")
@@ -7085,7 +7086,7 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
 
     if cmode.startswith("📌"):
         render_fixed_add(base_df, base_tk, cand_tk, base_ccy, start_date, end_date,
-                         use_div, rf_rate, fx_hedge, gap_fill, meta_bad=bad)
+                         use_div, rf_rate, fx_hedge, gap_fill, cost_bp, meta_bad=bad)
         return
 
     # ---------------- 설정 ----------------
@@ -8018,7 +8019,8 @@ def _cmp_table(rows: dict, rf: float) -> pd.DataFrame:
     return df
 
 
-def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
+def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate,
+                     fx_hedge, gap_fill, cost_bp):
     key = "_opt_df"
 
     # 저장된 설정 적용 (위젯이 그려지기 전에 처리해야 함)
@@ -8845,7 +8847,8 @@ IS_CMP = tool.endswith("대안 비교")
 IS_STRESS = tool.endswith("스트레스 테스트")
 
 if IS_CMP:
-    render_compare(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, rf_rate)
+    render_compare(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill, rf_rate,
+                   cost_bp)
     st.stop()
 IS_BL = tool.endswith("자산배분")
 
@@ -8856,7 +8859,7 @@ IS_REG = tool.endswith("거시 국면")
 
 if IS_BL:
     render_view_alloc(base_ccy, start_date, end_date, use_div,
-                      fx_hedge, gap_fill, rf_rate)
+                      fx_hedge, gap_fill, rf_rate, cost_bp)
     st.stop()
 IS_CAND = tool.endswith("추가 효과")
 
@@ -8868,7 +8871,7 @@ IS_OPT = tool.endswith("최적화")
 
 if IS_CAND:
     render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
-                            fx_hedge, gap_fill)
+                            fx_hedge, gap_fill, cost_bp)
     st.stop()
 
 if IS_CORR:
@@ -8879,7 +8882,8 @@ if IS_OPT:
     st.title("🎯 포트폴리오 최적화")
     st.caption("종목을 넣으면 목적에 맞는 최적 비중을 계산합니다. "
                "과거 데이터 기반이며 미래 성과를 보장하지 않습니다.")
-    render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate)
+    render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate,
+                     fx_hedge, gap_fill, cost_bp)
     st.stop()
 
 st.title("📊 포트폴리오 분석")
