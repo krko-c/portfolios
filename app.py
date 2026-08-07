@@ -864,7 +864,14 @@ def assumptions_panel(*, rebalance=None, cost=None, initial_cost=True,
             rows.append(("벤치마크", bench))
         rows.append(("무위험 수익률", f"{rf_rate*100:.2f}%"))
         if extra:
-            rows.extend(list(extra))
+            extra = list(extra)
+            # 화면별로 사이드바 설정을 강제로 덮어쓰는 경우(예: 요인 추정 시
+            # 환율을 강제 제외) extra 로 그 사실을 알린다. 자동으로 채운
+            # 행과 항목명이 겹치면 화면이 명시한 쪽을 우선하고 자동 행은
+            # 빼서, 같은 항목이 서로 다른 값으로 두 번 뜨는 걸 막는다.
+            override_labels = {k for k, _ in extra}
+            rows = [r for r in rows if r[0] not in override_labels]
+            rows.extend(extra)
         st.dataframe(pd.DataFrame(rows, columns=["항목", "설정"]),
                      width="stretch", hide_index=True)
         notes = ["세금·호가스프레드·시장충격은 반영하지 않습니다.",
@@ -7274,7 +7281,12 @@ def render_candidate_search(base_ccy, start_date, end_date, use_div, rf_rate,
     base_oos = bt(oos_px, W_base)
     bench_oos = None
     if bench_norm and bench_norm in oos_px.columns:
-        bench_oos = bt(oos_px, {bench_norm: 100.0})
+        # 벤치마크는 매수 후 보유이므로 거래비용을 적용하지 않는다
+        # (🎯 포트폴리오 최적화 화면의 _bench() 와 같은 정책).
+        try:
+            bench_oos = portfolio_returns(oos_px, {bench_norm: 100.0}, REBAL_NONE)
+        except Exception:
+            bench_oos = None
 
     st.success(f"✅ 탐색 완료 · {mode} · 평가한 조합 **{len(uniq):,}가지** · "
                f"학습 {train_px.index[0].date()}~{opt_date.date()} · "
@@ -9416,15 +9428,25 @@ for name, v in series.items():
 
         st.markdown("**성장 기여도 (Contribution to Growth)**")
         st.caption("각 종목이 포트폴리오 총 성장률에 얼마나 기여했는지 보여줍니다. "
-                   "막대의 합이 곧 포트폴리오 총 성장률입니다.")
+                   "막대의 합(거래비용 포함)이 곧 포트폴리오 총 성장률입니다.")
         try:
             contrib = growth_contribution(prices, v["weights"], v["rebalance"], r) * 100
             contrib = contrib.sort_values(ascending=False)
-            total_g = float(contrib.sum())
+            # 종목별 기여도는 원시(비용 반영 전) 수익률로 계산되므로, 거래비용이
+            # 있으면 합계가 실제 총 성장률(비용 반영)보다 커진다. 그 차이를
+            # '거래비용' 막대로 따로 보여줘 합계가 실제 총 성장률과 맞게 한다.
+            total_g = float((1 + r).prod() - 1) * 100
+            cost_drag = float(contrib.sum() - total_g)
 
-            labels = list(contrib.index) + ["Portfolio"]
-            values = list(contrib.values) + [total_g]
-            measures = ["relative"] * len(contrib) + ["total"]
+            labels, values, measures = list(contrib.index), list(contrib.values), \
+                ["relative"] * len(contrib)
+            if abs(cost_drag) > 1e-6:
+                labels.append("거래비용")
+                values.append(-cost_drag)
+                measures.append("relative")
+            labels.append("Portfolio")
+            values.append(total_g)
+            measures.append("total")
 
             fw = go.Figure(go.Waterfall(
                 orientation="v", measure=measures, x=labels, y=values,
@@ -9464,9 +9486,10 @@ for name, v in series.items():
                                            "총성장 대비": "{:.1f}%",
                                            "위험기여도(%)": "{:.1f}"}, na_rep="-"),
                          width="stretch", hide_index=True)
-            st.caption(f"기여도 합계 **{total_g:+.2f}%** = 포트폴리오 총 성장률 · "
-                       f"**위험기여도**는 전체 변동성에서 각 종목이 차지하는 몫입니다. "
-                       f"비중보다 위험기여도가 훨씬 크다면 그 종목에 위험이 쏠려 있다는 뜻입니다.")
+            st.caption(f"막대 합계(종목 + 거래비용) **{total_g:+.2f}%** = 포트폴리오 총 "
+                       f"성장률(거래비용 반영) · **위험기여도**는 전체 변동성에서 각 종목이 "
+                       f"차지하는 몫입니다. 비중보다 위험기여도가 훨씬 크다면 그 종목에 위험이 "
+                       f"쏠려 있다는 뜻입니다.")
             try:
                 _mx = cdf.loc[cdf["위험기여도(%)"].idxmax()]
                 if float(_mx["위험기여도(%)"]) > float(_mx["비중(%)"]) * 1.5:
