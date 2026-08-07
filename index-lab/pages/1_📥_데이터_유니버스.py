@@ -84,6 +84,27 @@ st.subheader("3️⃣ 미리보기")
 st.dataframe(df, width="stretch", height=300)
 st.caption(f"총 {len(df):,}개 종목")
 
+with st.expander("🧩 4️⃣ DART로 업종·설립일 보강 (선택, 실험적)", expanded=False):
+    st.warning("⚠️ 이 기능은 개발 환경 네트워크 제약으로 실제 API 호출을 "
+              "검증하지 못했습니다. 응답 스키마가 문서와 다르면 실패할 수 "
+              "있습니다 — 소량으로 먼저 시도해보세요.")
+    api_key = st.text_input("DART API 키", type="password",
+                            help="https://opendart.fss.or.kr 에서 무료 발급")
+    if st.button("DART 조회 실행", disabled=not api_key):
+        try:
+            from core.dart_client import enrich_universe
+            with st.spinner("DART 조회 중... (종목 수가 많으면 오래 걸립니다)"):
+                df = enrich_universe(df, api_key)
+            n_fail = int(df["dart_오류"].notna().sum())
+            if n_fail:
+                st.warning(f"{n_fail}개 종목은 DART에서 매칭/조회하지 못했습니다.")
+                st.dataframe(df.loc[df["dart_오류"].notna(), ["ticker", "dart_오류"]],
+                            width="stretch", hide_index=True)
+            st.success("완료 — 아래 미리보기와 이후 단계에 반영됩니다.")
+            st.dataframe(df, width="stretch", height=300)
+        except Exception as ex:
+            st.error(f"🚫 DART 조회 실패: {ex}")
+
 st.session_state["il_universe_raw"] = df
 st.session_state["il_as_of_date"] = pd.Timestamp(as_of)
 st.session_state.setdefault("il_methodology", {})
