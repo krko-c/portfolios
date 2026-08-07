@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from core.prices import kr_candidates
 from core.validation import check_universe, has_blocking_errors
 
 st.set_page_config(page_title="Index Lab · 데이터·유니버스", page_icon="📥", layout="wide")
@@ -90,21 +91,35 @@ if mode == "⌨️ 직접 입력":
                 t = str(row.get("ticker") or "").strip()
                 if not t:
                     continue
-                try:
-                    info = yf.Ticker(t).info
-                    if not str(row.get("name") or "").strip():
-                        filled.at[i, "name"] = info.get("shortName") or info.get("longName") or t
-                    if pd.isna(row.get("market_cap")):
-                        mc = info.get("marketCap")
-                        if mc:
-                            filled.at[i, "market_cap"] = mc
-                    if not str(row.get("sector") or "").strip():
-                        filled.at[i, "sector"] = info.get("sector") or ""
-                    n_ok += 1
-                except Exception:
+                # 한국 맨숫자 티커(예: 005930)는 코스피(.KS)를 먼저,
+                # 안 되면 코스닥(.KQ)을 시도한다 — 야후는 접미사 없는
+                # 티커를 인식하지 못한다.
+                info, resolved = {}, t
+                for cand in kr_candidates(t):
+                    try:
+                        cand_info = yf.Ticker(cand).info
+                    except Exception:
+                        continue
+                    if cand_info.get("shortName") or cand_info.get("longName") \
+                            or cand_info.get("marketCap"):
+                        info, resolved = cand_info, cand
+                        break
+                if not info:
                     n_fail += 1
+                    continue
+                filled.at[i, "ticker"] = resolved
+                if not str(row.get("name") or "").strip():
+                    filled.at[i, "name"] = info.get("shortName") or info.get("longName") or resolved
+                if pd.isna(row.get("market_cap")):
+                    mc = info.get("marketCap")
+                    if mc:
+                        filled.at[i, "market_cap"] = mc
+                if not str(row.get("sector") or "").strip():
+                    filled.at[i, "sector"] = info.get("sector") or ""
+                n_ok += 1
         st.session_state["il_manual_df"] = filled
-        st.success(f"조회 완료 — 성공 {n_ok}건, 실패 {n_fail}건")
+        st.success(f"조회 완료 — 성공 {n_ok}건, 실패 {n_fail}건. "
+                  f"한국 맨숫자 티커는 성공 시 `.KS`/`.KQ`를 자동으로 붙였습니다.")
         st.rerun()
 
     live = edited.copy()
