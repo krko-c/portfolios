@@ -6044,7 +6044,7 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
     try:
         with st.spinner("시장 신호 조회 중..."):
             spx, _sm, _sf = build_price_frame(
-                sig_tk, pd.Timestamp.today() - pd.DateOffset(years=3),
+                sig_tk, pd.Timestamp(end_date) - pd.DateOffset(years=3),
                 end_date, "USD", use_div, True, gap_fill)
     except Exception as ex:
         st.warning(f"시장 신호를 가져오지 못했습니다: {ex}")
