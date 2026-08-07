@@ -95,9 +95,16 @@ if mode == "⌨️ 직접 입력":
 
 elif mode == "📤 파일 업로드":
     up = st.file_uploader("유니버스 파일 (Excel 또는 CSV)", type=["xlsx", "csv"])
+    st.caption("⚠️ `ticker`가 숫자로만 된 코드(예: `005930`)면, 앞자리 0이 "
+              "지워지지 않도록 자동으로 문자로 읽습니다. 그래도 잘리면 "
+              "엑셀에서 그 열의 서식을 '텍스트'로 바꿔서 다시 저장해주세요.")
     if up is not None:
         try:
-            df = pd.read_excel(up) if up.name.endswith("xlsx") else pd.read_csv(up)
+            # ticker 를 dtype=str 로 강제하지 않으면, 숫자로만 된 티커
+            # (예: 005930)의 앞자리 0이 정수로 읽히며 조용히 사라진다.
+            df = (pd.read_excel(up, dtype={"ticker": str})
+                 if up.name.endswith("xlsx")
+                 else pd.read_csv(up, dtype={"ticker": str}))
         except Exception as ex:
             st.error(f"파일을 읽지 못했습니다: {ex}")
 
