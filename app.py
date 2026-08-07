@@ -1922,29 +1922,31 @@ def _opt_solve(fn, n, wmin, wmax, extra=(), strict=False):
     return best / s if s > 1e-12 else (None if strict else np.ones(n) / n)
 
 
-def opt_max_sharpe(mu, cov, rf=0.0, wmin=0.0, wmax=1.0):
+def opt_max_sharpe(mu, cov, rf=0.0, wmin=0.0, wmax=1.0, strict=True):
     def neg(w):
         v = np.sqrt(w @ cov @ w)
         return 1e6 if v <= 0 else -(w @ mu - rf) / v
-    return _opt_solve(neg, len(mu), wmin, wmax)
+    return _opt_solve(neg, len(mu), wmin, wmax, strict=strict)
 
 
-def opt_min_vol(mu, cov, wmin=0.0, wmax=1.0):
-    return _opt_solve(lambda w: w @ cov @ w, len(mu), wmin, wmax)
+def opt_min_vol(mu, cov, wmin=0.0, wmax=1.0, strict=True):
+    return _opt_solve(lambda w: w @ cov @ w, len(mu), wmin, wmax, strict=strict)
 
 
-def opt_risk_parity(cov, wmin=0.0, wmax=1.0):
+def opt_risk_parity(cov, wmin=0.0, wmax=1.0, strict=True):
     def obj(w):
         rc = risk_contributions(w, cov)
         return float(((rc - rc.mean()) ** 2).sum()) * 1e4
     # 위험균형은 비중이 0이면 기여도가 정의되지 않으므로 아주 작은 하한을 둔다
     return _opt_solve(obj, len(cov),
-                      np.maximum(_as_bounds(wmin, len(cov), 0.0), 1e-4), wmax)
+                      np.maximum(_as_bounds(wmin, len(cov), 0.0), 1e-4), wmax,
+                      strict=strict)
 
 
-def opt_target_return(mu, cov, target, wmin=0.0, wmax=1.0):
+def opt_target_return(mu, cov, target, wmin=0.0, wmax=1.0, strict=True):
     extra = [{"type": "eq", "fun": lambda w: float(w @ mu) - target}]
-    return _opt_solve(lambda w: w @ cov @ w, len(mu), wmin, wmax, extra)
+    return _opt_solve(lambda w: w @ cov @ w, len(mu), wmin, wmax, extra,
+                      strict=strict)
 
 
 def efficient_frontier(mu, cov, n_points=30, wmin=0.0, wmax=1.0):
@@ -2080,8 +2082,9 @@ def walk_forward(prices, tickers, start, freq_code, train_win, rebal,
     dates = [pd.Timestamp(d) for d in
              pd.date_range(start, prices.index[-1], freq=freq_code)]
     if not dates:
-        return None, []
+        return None, [], 0
     segs, hist = [], []
+    fails = 0                # 최적해를 못 찾아 건너뛴 재최적화 시점 수
     prev_end = None          # 직전 구간 종료 시점의 비중
     for i, d in enumerate(dates):
         tr_start = prices.index[0] if train_win is None else max(prices.index[0], d - train_win)
@@ -2095,6 +2098,10 @@ def walk_forward(prices, tickers, start, freq_code, train_win, rebal,
             else:
                 w, _, _ = optimize(R, goal, risk_name, rf, wmin, wmax, min_ret, max_vol)
         except Exception:
+            continue
+        if w is None:
+            # 조용히 균등비중으로 대체하지 않고, 이 시점은 건너뛴다
+            fails += 1
             continue
         end = dates[i + 1] if i + 1 < len(dates) else prices.index[-1]
         seg = prices.loc[d:end]
@@ -2118,10 +2125,10 @@ def walk_forward(prices, tickers, start, freq_code, train_win, rebal,
         if progress:
             progress((i + 1) / len(dates))
     if not segs:
-        return None, []
+        return None, [], fails
     full = pd.concat(segs)
     full = full[~full.index.duplicated(keep="first")].sort_index()
-    return full, hist
+    return full, hist, fails
 
 
 OPT_GOALS = {
@@ -2159,13 +2166,14 @@ def feasibility(mu, cov, wmin, wmax, min_ret=None, max_vol=None):
 
     if min_ret is not None and max_vol is not None:
         w_t = opt_target_return(mu, cov, min_ret, wmin, wmax)
-        v_at = float(np.sqrt(w_t @ cov @ w_t))
-        if v_at > max_vol + 1e-6:
-            return (False,
-                    f"두 목표를 동시에 만족할 수 없습니다. 수익률 {min_ret*100:.2f}% 를 "
-                    f"달성하려면 변동성이 최소 **{v_at*100:.2f}%** 는 되어야 합니다 "
-                    f"(목표 {max_vol*100:.2f}%). 목표수익률을 낮추거나 변동성 한도를 높여주세요.",
-                    ret_max, vol_min)
+        if w_t is not None:
+            v_at = float(np.sqrt(w_t @ cov @ w_t))
+            if v_at > max_vol + 1e-6:
+                return (False,
+                        f"두 목표를 동시에 만족할 수 없습니다. 수익률 {min_ret*100:.2f}% 를 "
+                        f"달성하려면 변동성이 최소 **{v_at*100:.2f}%** 는 되어야 합니다 "
+                        f"(목표 {max_vol*100:.2f}%). 목표수익률을 낮추거나 변동성 한도를 높여주세요.",
+                        ret_max, vol_min)
     return True, "", ret_max, vol_min
 
 
@@ -2197,17 +2205,18 @@ def optimize(R: pd.DataFrame, goal: str, risk_name: str, rf=0.0,
             return float(((rc - rc.mean()) ** 2).sum()) * 1e4
         return (_opt_solve(rp_obj, n,
                            np.maximum(_as_bounds(wmin, n, 0.0), 1e-4),
-                           wmax, extra), mu, cov)
+                           wmax, extra, strict=True), mu, cov)
 
     if goal.startswith("수익률"):
-        return _opt_solve(lambda w: -float(w @ mu), n, wmin, wmax, extra), mu, cov
+        return (_opt_solve(lambda w: -float(w @ mu), n, wmin, wmax, extra,
+                           strict=True), mu, cov)
 
     if goal.startswith("위험 최소화"):
         if d["kind"] == "ratio":
             fn = lambda w: -float(d["fn"](_series(R, w), rf=rf))
         else:
             fn = lambda w: float(d["fn"](_series(R, w), rf=rf))
-        return _opt_solve(fn, n, wmin, wmax, extra), mu, cov
+        return _opt_solve(fn, n, wmin, wmax, extra, strict=True), mu, cov
 
     # 위험 대비 수익 최대화
     if d["kind"] == "ratio":
@@ -2220,7 +2229,7 @@ def optimize(R: pd.DataFrame, goal: str, risk_name: str, rf=0.0,
                 return 1e6
             ann_ret = float(np.asarray(w) @ mu)
             return -(ann_ret - rf) / risk
-    return _opt_solve(fn, n, wmin, wmax, extra), mu, cov
+    return _opt_solve(fn, n, wmin, wmax, extra, strict=True), mu, cov
 
 
 
@@ -2464,6 +2473,8 @@ def run_self_tests(prices: pd.DataFrame = None) -> pd.DataFrame:
         lo = np.array([0.0, 0.0, 0.15][:len(tk)])
         hi = np.array([0.40, 1.0, 1.0][:len(tk)])
         w = opt_max_sharpe(mu, cov, 0.03, lo, hi)
+        if w is None:
+            return False, "최적해를 찾지 못함"
         ok = ((w >= lo - 1e-6).all() and (w <= hi + 1e-6).all()
               and abs(w.sum() - 1) < 1e-6)
         return ok, " ".join(f"{t}:{x*100:.1f}%" for t, x in zip(tk, w))
@@ -4686,7 +4697,7 @@ def bl_weights(mu, cov, delta, wmin=0.0, wmax=1.0, allow_short=False):
     # 공매도를 허용하면 음수 하한을 그대로 쓴다.
     # (예전에는 항상 0 이상으로 잘라 공매도 설정이 무시됐다)
     lo = lo_arr if allow_short else np.maximum(lo_arr, 0.0)
-    return _opt_solve(obj, n, lo, wmax)
+    return _opt_solve(obj, n, lo, wmax, strict=True)
 
 
 MV_COLS = ["전망 변수", "방향", "확신도(%)", "전망 기간", "사용", "메모"]
@@ -8328,6 +8339,7 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                    "기간을 조금 바꿨는데 비중이 크게 달라진다면, 그 결과는 "
                    "우연에 기댄 것일 수 있습니다.")
         stab_rows = {}
+        stab_fails = []
         for lbl in ["6개월", "1년", "2년", "3년"]:
             twx = TRAIN_WINDOWS[lbl]
             tsx = prices.index[0] if twx is None else max(prices.index[0], opt_date - twx)
@@ -8341,9 +8353,15 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
                 else:
                     wx, _, _ = optimize(Rx, goal, risk_name, rf_rate,
                                         wmin, wmax, min_ret, max_vol)
+                if wx is None:
+                    stab_fails.append(lbl)
+                    continue
                 stab_rows[lbl] = pd.Series(wx * 100, index=tickers)
             except Exception:
                 continue
+        if stab_fails:
+            st.caption(f"⚠️ {', '.join(stab_fails)} 학습 기간에서는 최적해를 찾지 "
+                       f"못해 이 비교에서 제외했습니다 (균등비중으로 대체하지 않음).")
         if len(stab_rows) >= 2:
             sdf = pd.DataFrame(stab_rows)
             sdf["변동폭(%p)"] = sdf.max(axis=1) - sdf.min(axis=1)
@@ -8397,11 +8415,11 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
     oos_rows = {"원본 포트폴리오": _bt(oos_px, W_now),
                 "최적화 포트폴리오": _bt(oos_px, W_opt)}
 
-    wf_r, wf_hist = None, []
+    wf_r, wf_hist, wf_fails = None, [], 0
     if REOPT_FREQ[reopt] is not None:
         bar = st.progress(0.0, text="주기적 재최적화 계산 중...")
         try:
-            wf_r, wf_hist = walk_forward(
+            wf_r, wf_hist, wf_fails = walk_forward(
                 prices, tickers, opt_date, REOPT_FREQ[reopt], tw, rebal,
                 goal, risk_name, rf_rate, wmin, wmax, min_ret, max_vol,
                 progress=lambda x: bar.progress(min(1.0, x),
@@ -8414,6 +8432,10 @@ def render_optimizer(base_ccy, start_date, end_date, use_div, rf_rate):
             oos_rows[f"재최적화 ({reopt})"] = wf_r
             st.info(f"🔁 **{reopt}** 재최적화를 {len(wf_hist)}회 수행했습니다. "
                     f"각 시점까지의 데이터만 사용했으므로 미래 정보가 섞이지 않습니다.")
+        if wf_fails:
+            st.warning(f"⚠️ {wf_fails}개 재최적화 시점에서 최적해를 찾지 못해 "
+                       f"그 구간을 건너뛰었습니다 (균등비중 등으로 조용히 대체하지 "
+                       f"않았습니다). 제약이 너무 빡빡하지 않은지 확인해보세요.")
 
     b_oos = _bench(oos_px)
     if b_oos is not None:
