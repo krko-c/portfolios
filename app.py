@@ -5833,6 +5833,14 @@ def render_black_litterman(base_ccy, start_date, end_date, use_div,
 FRED_SERIES = {"INDPRO": "산업생산", "PAYEMS": "비농업고용",
                "CPIAUCSL": "소비자물가", "CPILFESL": "근원물가",
                "RPI": "실질개인소득"}
+# 경기·물가 국면 판정에는 쓰지 않고, 참고용 패널로만 따로 보여주는 지표.
+FRED_RATE_CREDIT = {
+    "FEDFUNDS": "기준금리", "DGS10": "미 국채 10년물",
+    "T10Y2Y": "장단기 금리차(10Y-2Y)", "BAMLH0A0HYM2": "하이일드 신용스프레드",
+    "BAMLC0A0CM": "투자등급 신용스프레드",
+}
+FRED_LIQUIDITY = {"M2SL": "M2 통화량", "WALCL": "Fed 총자산"}
+FRED_EXTRA_SERIES = {**FRED_RATE_CREDIT, **FRED_LIQUIDITY}
 MACRO_QUAD = {
     "경기상승·물가하락": {"유리": "주식 · 성장주 · 하이일드",
                    "불리": "원자재 · 현금", "색": "#dcfce7"},
@@ -5875,6 +5883,64 @@ def load_fred(start="1990-01-01", end=None):
         return df.ffill(), ""
     except Exception as ex:
         return None, f"{type(ex).__name__}: {str(ex)[:120]}"
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def load_fred_extra(start="2000-01-01", end=None):
+    """금리·신용스프레드·유동성 지표. 경기·물가 국면 계산과는 완전히 별개라,
+    실패해도 나머지 화면에 영향을 주지 않는다."""
+    try:
+        from pandas_datareader import data as pdr
+    except Exception:
+        return None, "pandas-datareader 가 설치되어 있지 않습니다."
+    try:
+        _end = pd.Timestamp(end or pd.Timestamp.today()).strftime("%Y-%m-%d")
+        df = pdr.DataReader(list(FRED_EXTRA_SERIES), "fred", start, _end)
+        try:
+            df = df.resample("ME").last()
+        except ValueError:
+            df = df.resample("M").last()
+        return df.ffill(), ""
+    except Exception as ex:
+        return None, f"{type(ex).__name__}: {str(ex)[:120]}"
+
+
+def fred_level_summary(df: pd.DataFrame, series: dict) -> pd.DataFrame:
+    """레벨 지표(금리·스프레드)의 현재값과 3·12개월 전 대비 변화(%p)."""
+    rows = []
+    for code, label in series.items():
+        if code not in df.columns:
+            continue
+        s = df[code].dropna()
+        if s.empty:
+            continue
+        last_v = float(s.iloc[-1])
+        rows.append({
+            "지표": label,
+            "기준월": s.index[-1].strftime("%Y-%m"),
+            "현재값(%)": last_v,
+            "3개월 전 대비(%p)": last_v - float(s.iloc[-4]) if len(s) > 3 else np.nan,
+            "12개월 전 대비(%p)": last_v - float(s.iloc[-13]) if len(s) > 12 else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def fred_yoy_summary(df: pd.DataFrame, series: dict) -> pd.DataFrame:
+    """규모가 커서 레벨보다 전년동월비가 더 읽기 쉬운 지표(통화량 등)."""
+    rows = []
+    for code, label in series.items():
+        if code not in df.columns:
+            continue
+        yoy = df[code].dropna().pct_change(12).dropna()
+        if yoy.empty:
+            continue
+        rows.append({
+            "지표": label,
+            "기준월": yoy.index[-1].strftime("%Y-%m"),
+            "전년동월비(%)": float(yoy.iloc[-1]) * 100,
+            "3개월 전 전년동월비(%)": float(yoy.iloc[-4]) * 100 if len(yoy) > 3 else np.nan,
+        })
+    return pd.DataFrame(rows)
 
 
 def build_macro_regime(data: pd.DataFrame, lag_months=2, win=60) -> pd.DataFrame:
@@ -6090,6 +6156,34 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
                                f"시간이 지나야 확인됩니다.")
     else:
         st.info("시장 신호를 계산하기에 데이터가 부족합니다.")
+
+    # ---------------- 금리·신용·유동성 ----------------
+    st.subheader("4️⃣ 금리·신용·유동성")
+    st.caption("경기·물가 국면 판정에는 쓰지 않는 **참고용 지표**입니다. 금리·신용스프레드는 "
+              "레벨 자체를, 통화량·Fed 총자산은 규모가 커서 전년동월 대비 증가율을 봅니다.")
+    try:
+        with st.spinner("금리·신용·유동성 지표 조회 중..."):
+            fred_x, err_x = load_fred_extra(end=end_date)
+    except Exception as ex:
+        fred_x, err_x = None, str(ex)
+    if fred_x is None:
+        st.warning(f"⚠️ 지표를 가져오지 못했습니다: {err_x}")
+    else:
+        rc = fred_level_summary(fred_x, FRED_RATE_CREDIT)
+        if len(rc):
+            st.markdown("**금리·신용스프레드**")
+            st.dataframe(rc.style.format(
+                {"현재값(%)": "{:.2f}", "3개월 전 대비(%p)": "{:+.2f}",
+                 "12개월 전 대비(%p)": "{:+.2f}"}, na_rep="-"),
+                width="stretch", hide_index=True)
+        liq = fred_yoy_summary(fred_x, FRED_LIQUIDITY)
+        if len(liq):
+            st.markdown("**유동성 (전년동월비)**")
+            st.dataframe(liq.style.format(
+                {"전년동월비(%)": "{:+.2f}", "3개월 전 전년동월비(%)": "{:+.2f}"}, na_rep="-"),
+                width="stretch", hide_index=True)
+        if not len(rc) and not len(liq):
+            st.info("표시할 지표가 없습니다.")
 
     # ---------------- 포트폴리오 노출 ----------------
     # ---------------- 전망 초안으로 넘기기 ----------------
