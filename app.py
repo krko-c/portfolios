@@ -6283,11 +6283,24 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
                     st.error(f"🚫 세부 항목을 가져오지 못했습니다: {ex}")
                     items = []
                 if items:
-                    iopts = {f"{it.get('ITEM_NAME1', '(이름 없음)')} "
-                            f"({it.get('ITEM_CODE1', '')})": it.get("ITEM_CODE1", "")
-                            for it in items}
-                    ipick = st.selectbox("세부 항목 선택", list(iopts), key="_ecos_item_pick")
-                    item_code = iopts[ipick]
+                    # 일부 통계표는 세부 항목 구분이 없어, 이름·코드가 빈 값인
+                    # 행 하나만 온다 — 이 경우 드롭다운 없이 그대로 전체 계열을
+                    # 조회한다(빈 item_code도 유효한 조회다).
+                    single_blank = (len(items) == 1
+                                   and not str(items[0].get("ITEM_NAME1", "")).strip())
+                    if single_blank:
+                        item_code = items[0].get("ITEM_CODE1", "")
+                        item_label = pick.split(" (")[0]
+                        st.caption("이 통계표는 세부 항목 구분이 없어 전체 계열을 그대로 "
+                                  "조회합니다.")
+                    else:
+                        iopts = {f"{it.get('ITEM_NAME1') or '(이름 없음)'} "
+                                f"({it.get('ITEM_CODE1', '')})": it.get("ITEM_CODE1", "")
+                                for it in items}
+                        ipick = st.selectbox("세부 항목 선택", list(iopts),
+                                             key="_ecos_item_pick")
+                        item_code = iopts[ipick]
+                        item_label = ipick.split(" (")[0]
                     fc1, fc2 = st.columns([1, 2])
                     freq_label = fc1.radio("주기", ["월", "년", "일"], horizontal=True,
                                            key="_ecos_freq")
@@ -6310,7 +6323,7 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
                             fk = go.Figure(go.Scatter(x=s.index, y=s.values, mode="lines",
                                                       line=dict(color="#2563eb")))
                             fk.update_layout(height=320, margin=dict(l=0, r=0, t=20, b=0),
-                                             yaxis=dict(title=ipick.split(" (")[0]))
+                                             yaxis=dict(title=item_label))
                             st.plotly_chart(fk, width="stretch")
                             last_v = float(s.iloc[-1])
                             mc1, mc2, mc3 = st.columns(3)
