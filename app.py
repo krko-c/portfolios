@@ -5989,11 +5989,20 @@ def ecos_item_list(api_key: str, stat_code: str) -> list:
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def ecos_series(api_key: str, stat_code: str, item_code: str, freq: str,
-                start: str, end: str) -> pd.Series:
-    """실제 시계열. freq: D(일)/M(월)/A(년). start/end는 해당 주기 포맷."""
+def ecos_series(api_key: str, stat_code: str, freq: str, start: str, end: str,
+                item_code1: str = "", item_code2: str = "", item_code3: str = "",
+                item_code4: str = "") -> pd.Series:
+    """
+    실제 시계열. freq: D(일)/M(월)/A(년). start/end는 해당 주기 포맷.
+
+    ECOS는 항목을 최대 4단계까지 쓴다(예: 시장금리 = 종류 × 만기).
+    item_code1만 주고 하위 단계를 안 주면, 그 아래 여러 세부 항목의
+    값이 한꺼번에 섞여 나온다 — leaf(더 이상 안 나뉘는 단계)까지
+    좁혀서 넘겨야 한다.
+    """
     rows = _ecos_get("StatisticSearch", api_key,
-                     [1, 1000, stat_code, freq, start, end, item_code])
+                     [1, 1000, stat_code, freq, start, end,
+                      item_code1, item_code2, item_code3, item_code4])
     if not rows:
         return pd.Series(dtype=float)
     df = pd.DataFrame(rows)
@@ -6001,6 +6010,30 @@ def ecos_series(api_key: str, stat_code: str, item_code: str, freq: str,
     idx = pd.to_datetime(df["TIME"], format=ECOS_FREQ_FMT.get(freq, "%Y%m"), errors="coerce")
     s = pd.Series(vals.values, index=idx).dropna()
     return s.sort_index()
+
+
+def ecos_next_level_options(items: list, chosen_codes: list) -> dict:
+    """
+    items(StatisticItemList 전체 응답, 각 행에 ITEM_CODE1~4/ITEM_NAME1~4가
+    있다) 중 이미 고른 chosen_codes(앞 단계들)에 맞는 행만 남긴 뒤, 다음
+    단계의 고유 (이름, 코드) 후보를 돌려준다. 빈 dict면 더 좁힐 단계가
+    없다는 뜻(leaf 도달)이다.
+    """
+    level = len(chosen_codes) + 1
+    if level > 4:
+        return {}
+    name_key, code_key = f"ITEM_NAME{level}", f"ITEM_CODE{level}"
+    opts = {}
+    for it in items:
+        if any(str(it.get(f"ITEM_CODE{i + 1}", "")).strip() != chosen_codes[i]
+               for i in range(len(chosen_codes))):
+            continue
+        code = str(it.get(code_key, "")).strip()
+        if not code:
+            continue
+        name = str(it.get(name_key, "")).strip() or code
+        opts[f"{name} ({code})"] = (name, code)
+    return opts
 
 
 def build_macro_regime(data: pd.DataFrame, lag_months=2, win=60) -> pd.DataFrame:
@@ -6283,24 +6316,33 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
                     st.error(f"🚫 세부 항목을 가져오지 못했습니다: {ex}")
                     items = []
                 if items:
-                    # 일부 통계표는 세부 항목 구분이 없어, 이름·코드가 빈 값인
-                    # 행 하나만 온다 — 이 경우 드롭다운 없이 그대로 전체 계열을
-                    # 조회한다(빈 item_code도 유효한 조회다).
-                    single_blank = (len(items) == 1
-                                   and not str(items[0].get("ITEM_NAME1", "")).strip())
-                    if single_blank:
-                        item_code = items[0].get("ITEM_CODE1", "")
-                        item_label = pick.split(" (")[0]
+                    # ECOS는 항목을 최대 4단계까지 쓴다(예: 시장금리 = 종류×만기).
+                    # 한 단계만 고르고 멈추면 그 아래 여러 세부항목이 뒤섞여
+                    # 나오므로(예: 국고채만 고르면 1·3·5·10년물이 다 섞임),
+                    # 더 못 좁힐 때까지(leaf) 단계별로 계속 좁힌다.
+                    chosen_codes, chosen_names = [], []
+                    for level in range(1, 5):
+                        opts = ecos_next_level_options(items, chosen_codes)
+                        if not opts:
+                            break
+                        if len(opts) == 1:
+                            name, code = next(iter(opts.values()))
+                            chosen_codes.append(code)
+                            chosen_names.append(name)
+                            continue
+                        wkey = f"_ecos_item_pick_{level}_{'_'.join(chosen_codes)}"
+                        label = st.selectbox(
+                            f"세부 항목 선택 ({level}단계)" if level > 1 else "세부 항목 선택",
+                            list(opts), key=wkey)
+                        name, code = opts[label]
+                        chosen_codes.append(code)
+                        chosen_names.append(name)
+                    item_codes = (chosen_codes + [""] * 4)[:4]
+                    item_label = " > ".join(chosen_names) if chosen_names \
+                        else pick.split(" (")[0]
+                    if not chosen_names:
                         st.caption("이 통계표는 세부 항목 구분이 없어 전체 계열을 그대로 "
                                   "조회합니다.")
-                    else:
-                        iopts = {f"{it.get('ITEM_NAME1') or '(이름 없음)'} "
-                                f"({it.get('ITEM_CODE1', '')})": it.get("ITEM_CODE1", "")
-                                for it in items}
-                        ipick = st.selectbox("세부 항목 선택", list(iopts),
-                                             key="_ecos_item_pick")
-                        item_code = iopts[ipick]
-                        item_label = ipick.split(" (")[0]
                     fc1, fc2 = st.columns([1, 2])
                     freq_label = fc1.radio("주기", ["월", "년", "일"], horizontal=True,
                                            key="_ecos_freq")
@@ -6312,8 +6354,9 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
                         start_s = end_s - pd.DateOffset(years=years_back)
                         try:
                             with st.spinner("시계열 조회 중..."):
-                                s = ecos_series(ecos_key.strip(), stat_code, item_code, freq,
-                                               start_s.strftime(fmt), end_s.strftime(fmt))
+                                s = ecos_series(ecos_key.strip(), stat_code, freq,
+                                               start_s.strftime(fmt), end_s.strftime(fmt),
+                                               *item_codes)
                         except Exception as ex:
                             st.error(f"🚫 조회 실패: {ex}")
                             s = pd.Series(dtype=float)
