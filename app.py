@@ -5953,6 +5953,7 @@ def fred_yoy_summary(df: pd.DataFrame, series: dict) -> pd.DataFrame:
 # 세부 항목 선택 → 조회 순서를 강제한다.
 ECOS_BASE = "https://ecos.bok.or.kr/api"
 ECOS_FREQ_FMT = {"D": "%Y%m%d", "M": "%Y%m", "A": "%Y"}
+ECOS_CYCLE_LABEL = {"D": "일", "M": "월", "Q": "분기", "A": "년"}
 
 
 def _ecos_get(service: str, api_key: str, path_parts: list, timeout: int = 15) -> list:
@@ -5984,56 +5985,85 @@ def ecos_table_list(api_key: str) -> list:
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def ecos_item_list(api_key: str, stat_code: str) -> list:
-    """특정 통계표 안의 세부 항목 목록(통계항목코드·항목명)."""
+    """
+    특정 통계표 안의 세부 항목 목록.
+
+    실제 응답 스키마(라이브 API로 확인함 — 문서/블로그 추정이 아니라
+    사용자가 받아온 실제 JSON 기준): 각 행은 자기 자신의 ``ITEM_CODE``/
+    ``ITEM_NAME``, 부모의 ``P_ITEM_CODE``/``P_ITEM_NAME``(최상위는
+    null), 그리고 그 항목이 지원하는 ``CYCLE``(D/M/Q/A)을 담고 있다.
+    같은 항목이 지원 주기마다 행이 반복된다(예: 월·분기·년 3번).
+    번호가 붙은 ITEM_CODE1~4 필드는 이 응답에 없다 — 계층은 트리
+    (P_ITEM_CODE)로 표현되지, 여러 축이 아니다.
+    """
     return _ecos_get("StatisticItemList", api_key, [1, 1000, stat_code])
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def ecos_series(api_key: str, stat_code: str, freq: str, start: str, end: str,
-                item_code1: str = "", item_code2: str = "", item_code3: str = "",
-                item_code4: str = "") -> pd.Series:
-    """
-    실제 시계열. freq: D(일)/M(월)/A(년). start/end는 해당 주기 포맷.
-
-    ECOS는 항목을 최대 4단계까지 쓴다(예: 시장금리 = 종류 × 만기).
-    item_code1만 주고 하위 단계를 안 주면, 그 아래 여러 세부 항목의
-    값이 한꺼번에 섞여 나온다 — leaf(더 이상 안 나뉘는 단계)까지
-    좁혀서 넘겨야 한다.
-    """
+                item_code: str = "") -> pd.Series:
+    """실제 시계열. freq: D(일)/M(월)/Q(분기)/A(년). start/end는 해당 주기 포맷."""
     rows = _ecos_get("StatisticSearch", api_key,
-                     [1, 1000, stat_code, freq, start, end,
-                      item_code1, item_code2, item_code3, item_code4])
+                     [1, 1000, stat_code, freq, start, end, item_code])
     if not rows:
         return pd.Series(dtype=float)
     df = pd.DataFrame(rows)
     vals = pd.to_numeric(df["DATA_VALUE"], errors="coerce")
-    idx = pd.to_datetime(df["TIME"], format=ECOS_FREQ_FMT.get(freq, "%Y%m"), errors="coerce")
+    if freq == "Q":
+        # "2003Q4" 형태 -> 그 분기 첫 달로 근사 변환한다(strptime이 못 읽는 포맷).
+        q_month = {"1": 1, "2": 4, "3": 7, "4": 10}
+
+        def _parse_q(t):
+            t = str(t)
+            if "Q" not in t:
+                return pd.NaT
+            y, q = t.split("Q")
+            return pd.Timestamp(year=int(y), month=q_month.get(q, 1), day=1)
+        idx = df["TIME"].map(_parse_q)
+    else:
+        idx = pd.to_datetime(df["TIME"], format=ECOS_FREQ_FMT.get(freq, "%Y%m"),
+                             errors="coerce")
     s = pd.Series(vals.values, index=idx).dropna()
     return s.sort_index()
 
 
-def ecos_next_level_options(items: list, chosen_codes: list) -> dict:
+def ecos_available_cycles(items: list) -> list:
+    """이 통계표가 실제로 지원하는 주기 목록(D/M/Q/A 중 응답에 실존하는 것만).
+    지원 안 하는 주기로 조회하면 ECOS가 INFO-200(데이터 없음)을 낸다."""
+    cycles = sorted({str(it.get("CYCLE", "")).strip() for it in items
+                     if str(it.get("CYCLE", "")).strip() in ECOS_CYCLE_LABEL},
+                    key=lambda c: list(ECOS_CYCLE_LABEL).index(c))
+    return cycles
+
+
+def ecos_item_paths(items: list, cycle: str) -> dict:
     """
-    items(StatisticItemList 전체 응답, 각 행에 ITEM_CODE1~4/ITEM_NAME1~4가
-    있다) 중 이미 고른 chosen_codes(앞 단계들)에 맞는 행만 남긴 뒤, 다음
-    단계의 고유 (이름, 코드) 후보를 돌려준다. 빈 dict면 더 좁힐 단계가
-    없다는 뜻(leaf 도달)이다.
+    items 중 cycle에 맞는 항목들을 '조상 > ... > 이름 (코드)' 형태의 평평한
+    선택지로 펼친다. 상위 항목(예: M2 총량) 자체를 고르고 싶을 때가 많아서
+    leaf까지 강제로 드릴다운시키지 않고, 트리 전체를 한 번에 펼쳐 고르게
+    한다.
     """
-    level = len(chosen_codes) + 1
-    if level > 4:
-        return {}
-    name_key, code_key = f"ITEM_NAME{level}", f"ITEM_CODE{level}"
-    opts = {}
+    by_code = {}
     for it in items:
-        if any(str(it.get(f"ITEM_CODE{i + 1}", "")).strip() != chosen_codes[i]
-               for i in range(len(chosen_codes))):
+        if str(it.get("CYCLE", "")).strip() != cycle:
             continue
-        code = str(it.get(code_key, "")).strip()
-        if not code:
+        code = str(it.get("ITEM_CODE", "")).strip()
+        if not code or code in by_code:
             continue
-        name = str(it.get(name_key, "")).strip() or code
-        opts[f"{name} ({code})"] = (name, code)
-    return opts
+        parent = it.get("P_ITEM_CODE")
+        by_code[code] = {"name": str(it.get("ITEM_NAME", "")).strip() or code,
+                         "parent": str(parent).strip() if parent else None}
+
+    def _path(code, seen):
+        if code in seen or code not in by_code:
+            return by_code.get(code, {}).get("name", code)
+        seen = seen | {code}
+        node = by_code[code]
+        if node["parent"] and node["parent"] in by_code:
+            return _path(node["parent"], seen) + " > " + node["name"]
+        return node["name"]
+
+    return {f"{_path(code, set())} ({code})": code for code in by_code}
 
 
 def build_macro_regime(data: pd.DataFrame, lag_months=2, win=60) -> pd.DataFrame:
@@ -6316,68 +6346,71 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
                     st.error(f"🚫 세부 항목을 가져오지 못했습니다: {ex}")
                     items = []
                 if items:
-                    # ECOS는 항목을 최대 4단계까지 쓴다(예: 시장금리 = 종류×만기).
-                    # 한 단계만 고르고 멈추면 그 아래 여러 세부항목이 뒤섞여
-                    # 나오므로(예: 국고채만 고르면 1·3·5·10년물이 다 섞임),
-                    # 더 못 좁힐 때까지(leaf) 단계별로 계속 좁힌다.
-                    chosen_codes, chosen_names = [], []
-                    for level in range(1, 5):
-                        opts = ecos_next_level_options(items, chosen_codes)
-                        if not opts:
-                            break
-                        if len(opts) == 1:
-                            name, code = next(iter(opts.values()))
-                            chosen_codes.append(code)
-                            chosen_names.append(name)
-                            continue
-                        wkey = f"_ecos_item_pick_{level}_{'_'.join(chosen_codes)}"
-                        label = st.selectbox(
-                            f"세부 항목 선택 ({level}단계)" if level > 1 else "세부 항목 선택",
-                            list(opts), key=wkey)
-                        name, code = opts[label]
-                        chosen_codes.append(code)
-                        chosen_names.append(name)
-                    item_codes = (chosen_codes + [""] * 4)[:4]
-                    item_label = " > ".join(chosen_names) if chosen_names \
-                        else pick.split(" (")[0]
-                    if not chosen_names:
-                        st.caption("이 통계표는 세부 항목 구분이 없어 전체 계열을 그대로 "
-                                  "조회합니다.")
-                    fc1, fc2 = st.columns([1, 2])
-                    freq_label = fc1.radio("주기", ["월", "년", "일"], horizontal=True,
-                                           key="_ecos_freq")
-                    years_back = fc2.slider("조회 기간 (년)", 1, 20, 10, key="_ecos_years")
-                    if st.button("📈 조회", key="_ecos_go", type="primary"):
-                        freq = {"월": "M", "년": "A", "일": "D"}[freq_label]
-                        fmt = ECOS_FREQ_FMT[freq]
-                        end_s = pd.Timestamp(end_date)
-                        start_s = end_s - pd.DateOffset(years=years_back)
-                        try:
-                            with st.spinner("시계열 조회 중..."):
-                                s = ecos_series(ecos_key.strip(), stat_code, freq,
-                                               start_s.strftime(fmt), end_s.strftime(fmt),
-                                               *item_codes)
-                        except Exception as ex:
-                            st.error(f"🚫 조회 실패: {ex}")
-                            s = pd.Series(dtype=float)
-                        if s.empty:
-                            st.warning("데이터가 없습니다. 주기나 기간을 바꿔보세요.")
+                    # 이 표가 실제 지원하는 주기만 고르게 한다 — 안 맞는 주기로
+                    # 조회하면 INFO-200(데이터 없음)이 난다. 항목 트리도 주기별로
+                    # 갈리므로(같은 항목이 D/M/Q/A마다 행이 반복됨) 주기부터 고른다.
+                    cycles = ecos_available_cycles(items)
+                    if not cycles:
+                        st.warning("이 통계표는 지원 주기 정보를 확인할 수 없습니다.")
+                    else:
+                        fc1, fc2 = st.columns([1, 2])
+                        cyc_label = fc1.radio(
+                            "주기", [ECOS_CYCLE_LABEL[c] for c in cycles],
+                            horizontal=True, key=f"_ecos_freq_{stat_code}")
+                        freq = {v: k for k, v in ECOS_CYCLE_LABEL.items()}[cyc_label]
+                        years_back = fc2.slider("조회 기간 (년)", 1, 20, 10,
+                                                key="_ecos_years")
+
+                        # 트리 전체를 평평하게 펼쳐 한 번에 고른다 — 상위 항목
+                        # (예: M2 총량) 자체를 고르고 싶을 때가 많아 단계별
+                        # 강제 드릴다운은 오히려 방해가 된다.
+                        paths = ecos_item_paths(items, freq)
+                        if not paths:
+                            item_code, item_label = "", pick.split(" (")[0]
+                            st.caption("이 통계표는 세부 항목 구분이 없어 전체 계열을 "
+                                      "그대로 조회합니다.")
                         else:
-                            fk = go.Figure(go.Scatter(x=s.index, y=s.values, mode="lines",
-                                                      line=dict(color="#2563eb")))
-                            fk.update_layout(height=320, margin=dict(l=0, r=0, t=20, b=0),
-                                             yaxis=dict(title=item_label))
-                            st.plotly_chart(fk, width="stretch")
-                            last_v = float(s.iloc[-1])
-                            mc1, mc2, mc3 = st.columns(3)
-                            mc1.metric("최근값", f"{last_v:,.2f}",
-                                      help=f"기준: {s.index[-1].strftime('%Y-%m-%d')}")
-                            if len(s) > 3:
-                                mc2.metric("3구간 전 대비",
-                                          f"{last_v - float(s.iloc[-4]):+,.2f}")
-                            if len(s) > 12:
-                                mc3.metric("12구간 전 대비",
-                                          f"{last_v - float(s.iloc[-13]):+,.2f}")
+                            ipick = st.selectbox("세부 항목 선택", list(paths),
+                                                 key=f"_ecos_item_{stat_code}_{freq}")
+                            item_code = paths[ipick]
+                            item_label = ipick.rsplit(" (", 1)[0]
+
+                        if st.button("📈 조회", key="_ecos_go", type="primary"):
+                            end_s = pd.Timestamp(end_date)
+                            start_s = end_s - pd.DateOffset(years=years_back)
+                            if freq == "Q":
+                                fmt_bound = (lambda t: f"{t.year}Q{(t.month - 1) // 3 + 1}")
+                            else:
+                                fmt_bound = ECOS_FREQ_FMT[freq]
+                                fmt_bound = (lambda t, _f=fmt_bound: t.strftime(_f))
+                            try:
+                                with st.spinner("시계열 조회 중..."):
+                                    s = ecos_series(ecos_key.strip(), stat_code, freq,
+                                                   fmt_bound(start_s), fmt_bound(end_s),
+                                                   item_code)
+                            except Exception as ex:
+                                st.error(f"🚫 조회 실패: {ex}")
+                                s = pd.Series(dtype=float)
+                            if s.empty:
+                                st.warning("데이터가 없습니다. 주기나 기간을 바꿔보세요.")
+                            else:
+                                fk = go.Figure(go.Scatter(x=s.index, y=s.values,
+                                                          mode="lines",
+                                                          line=dict(color="#2563eb")))
+                                fk.update_layout(height=320,
+                                                 margin=dict(l=0, r=0, t=20, b=0),
+                                                 yaxis=dict(title=item_label))
+                                st.plotly_chart(fk, width="stretch")
+                                last_v = float(s.iloc[-1])
+                                mc1, mc2, mc3 = st.columns(3)
+                                mc1.metric("최근값", f"{last_v:,.2f}",
+                                          help=f"기준: {s.index[-1].strftime('%Y-%m-%d')}")
+                                if len(s) > 3:
+                                    mc2.metric("3구간 전 대비",
+                                              f"{last_v - float(s.iloc[-4]):+,.2f}")
+                                if len(s) > 12:
+                                    mc3.metric("12구간 전 대비",
+                                              f"{last_v - float(s.iloc[-13]):+,.2f}")
 
     # ---------------- 포트폴리오 노출 ----------------
     # ---------------- 전망 초안으로 넘기기 ----------------
