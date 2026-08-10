@@ -6085,19 +6085,21 @@ def ecos_item_paths(items: list, cycle: str) -> dict:
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def load_ecos_overlay(api_key: str, end):
     """ECOS_KR_LEVEL·ECOS_KR_YOY 고정 지표를 한 번에 받는다. 지표 하나가
-    실패해도 나머지는 계속 진행한다. 반환: ({지표명: Series}, [실패한 지표명])."""
+    실패해도 나머지는 계속 진행한다.
+    반환: ({지표명: Series}, {실패한 지표명: 이유})."""
     end_s = pd.Timestamp(end)
     start_s = end_s - pd.DateOffset(years=5)
     fmt = ECOS_FREQ_FMT["M"]
-    data, fails = {}, []
+    data, fails = {}, {}
     for label, (stat_code, item_code) in {**ECOS_KR_LEVEL, **ECOS_KR_YOY}.items():
         try:
             s = ecos_series(api_key, stat_code, "M", start_s.strftime(fmt),
                             end_s.strftime(fmt), item_code)
-        except Exception:
+        except Exception as ex:
             s = pd.Series(dtype=float)
+            fails[label] = f"{type(ex).__name__}: {str(ex)[:150]}"
         if s.empty:
-            fails.append(label)
+            fails.setdefault(label, "빈 응답(데이터 없음)")
         else:
             data[label] = s
     return data, fails
@@ -6369,6 +6371,9 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
             ov_data, ov_fails = load_ecos_overlay(ecos_key.strip(), end_date)
         if ov_fails:
             st.warning(f"⚠️ 조회하지 못한 지표: {', '.join(ov_fails)}")
+            with st.expander("실패 이유 보기", expanded=False):
+                for label, reason in ov_fails.items():
+                    st.caption(f"**{label}**: {reason}")
         lvl_rows = []
         for label in ECOS_KR_LEVEL:
             s = ov_data.get(label)
