@@ -5955,6 +5955,13 @@ ECOS_BASE = "https://ecos.bok.or.kr/api"
 ECOS_FREQ_FMT = {"D": "%Y%m%d", "M": "%Y%m", "A": "%Y"}
 ECOS_CYCLE_LABEL = {"D": "일", "M": "월", "Q": "분기", "A": "년"}
 
+# 검색 없이 자동으로 보여주는 한국 금융여건 고정 지표. (통계표코드, 항목코드) 둘 다
+# 실제 배포 환경에서 라이브 조회로 검증된 값만 넣는다 — 추측으로 채우지 않는다.
+ECOS_KR_LEVEL = {"기준금리": ("722Y001", "0101000"), "원/달러": ("731Y003", "0000002")}
+ECOS_KR_YOY = {"소비자물가(CPI)": ("901Y009", "0"),
+               "전산업생산지수": ("901Y033", ""),
+               "M2 통화량": ("161Y006", "BBHA00")}
+
 
 def _ecos_get(service: str, api_key: str, path_parts: list, timeout: int = 15) -> list:
     """
@@ -6064,6 +6071,27 @@ def ecos_item_paths(items: list, cycle: str) -> dict:
         return node["name"]
 
     return {f"{_path(code, set())} ({code})": code for code in by_code}
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def load_ecos_overlay(api_key: str, end):
+    """ECOS_KR_LEVEL·ECOS_KR_YOY 고정 지표를 한 번에 받는다. 지표 하나가
+    실패해도 나머지는 계속 진행한다. 반환: ({지표명: Series}, [실패한 지표명])."""
+    end_s = pd.Timestamp(end)
+    start_s = end_s - pd.DateOffset(years=5)
+    fmt = ECOS_FREQ_FMT["M"]
+    data, fails = {}, []
+    for label, (stat_code, item_code) in {**ECOS_KR_LEVEL, **ECOS_KR_YOY}.items():
+        try:
+            s = ecos_series(api_key, stat_code, "M", start_s.strftime(fmt),
+                            end_s.strftime(fmt), item_code)
+        except Exception:
+            s = pd.Series(dtype=float)
+        if s.empty:
+            fails.append(label)
+        else:
+            data[label] = s
+    return data, fails
 
 
 def build_macro_regime(data: pd.DataFrame, lag_months=2, win=60) -> pd.DataFrame:
@@ -6309,108 +6337,171 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
             st.info("표시할 지표가 없습니다.")
 
     # ---------------- 한국 거시 (ECOS) ----------------
-    st.subheader("5️⃣ 한국 거시 (ECOS)")
-    st.caption("한국은행 ECOS에서 원하는 지표를 이름으로 검색해 조회합니다. "
-              "**통계표코드를 미리 정해두지 않습니다** — 잘못 외운 코드로 조용히 "
-              "엉뚱한 지표를 보여주는 사고를 막기 위해 매번 이름 검색부터 시작합니다.")
+    st.subheader("5️⃣ 한국 금융여건 (ECOS)")
+    st.caption("검색 없이 자동으로 뜨는 고정 지표입니다. 국면 판정(1️⃣~2️⃣)에는 "
+              "쓰지 않는 참고용이며, 한국 기준금리·물가·통화량·환율이 미국 "
+              "환경을 어떻게 전달받고 있는지 보는 용도입니다.")
     ecos_key = st.text_input("ECOS API 인증키", type="password", key="_ecos_key",
                              help="https://ecos.bok.or.kr 에서 무료 발급받습니다. "
                                   "이 키는 이 브라우저 세션에만 남고 저장되지 않습니다.")
     if not ecos_key.strip():
-        st.info("👆 인증키를 입력하면 통계표를 검색할 수 있습니다.")
+        st.info("👆 인증키를 입력하면 지표를 볼 수 있습니다.")
     else:
-        kw = st.text_input("통계표 검색 (예: 기준금리, 소비자물가, 국고채)", key="_ecos_kw")
-        if kw.strip():
-            try:
-                with st.spinner("통계표 검색 중..."):
-                    tables = ecos_table_list(ecos_key.strip())
-            except Exception as ex:
-                st.error(f"🚫 통계표 목록을 가져오지 못했습니다: {ex}")
-                tables = []
-            matches = [t for t in tables if kw.strip() in str(t.get("STAT_NAME", ""))]
-            if not matches:
-                st.warning("검색 결과가 없습니다. 다른 표현으로 검색해보세요 "
-                           "(예: '금리' 대신 '기준금리').")
-            else:
-                if len(matches) > 50:
-                    st.caption(f"{len(matches)}건 중 상위 50건만 표시합니다. "
-                               "검색어를 좁혀보세요.")
-                opts = {f"{t['STAT_NAME']} ({t['STAT_CODE']})": t["STAT_CODE"]
-                       for t in matches[:50]}
-                pick = st.selectbox("통계표 선택", list(opts), key="_ecos_table_pick")
-                stat_code = opts[pick]
+        with st.spinner("한국 금융여건 지표 조회 중..."):
+            ov_data, ov_fails = load_ecos_overlay(ecos_key.strip(), end_date)
+        if ov_fails:
+            st.warning(f"⚠️ 조회하지 못한 지표: {', '.join(ov_fails)}")
+        lvl_rows = []
+        for label in ECOS_KR_LEVEL:
+            s = ov_data.get(label)
+            if s is None or s.empty:
+                continue
+            last_v = float(s.iloc[-1])
+            lvl_rows.append({
+                "지표": label, "기준월": s.index[-1].strftime("%Y-%m"),
+                "현재값": last_v,
+                "3개월 전 대비": last_v - float(s.iloc[-4]) if len(s) > 3 else np.nan,
+                "12개월 전 대비": last_v - float(s.iloc[-13]) if len(s) > 12 else np.nan})
+        if lvl_rows:
+            st.markdown("**금리·환율**")
+            st.dataframe(pd.DataFrame(lvl_rows).style.format(
+                {"현재값": "{:,.2f}", "3개월 전 대비": "{:+,.2f}",
+                 "12개월 전 대비": "{:+,.2f}"}, na_rep="-"),
+                width="stretch", hide_index=True)
+
+        yoy_rows = []
+        for label in ECOS_KR_YOY:
+            s = ov_data.get(label)
+            if s is None or s.empty:
+                continue
+            yoy = s.pct_change(12).dropna()
+            if yoy.empty:
+                continue
+            yoy_rows.append({
+                "지표": label, "기준월": yoy.index[-1].strftime("%Y-%m"),
+                "전년동월비(%)": float(yoy.iloc[-1]) * 100,
+                "3개월 전 전년동월비(%)": float(yoy.iloc[-4]) * 100 if len(yoy) > 3 else np.nan})
+        if yoy_rows:
+            st.markdown("**물가·생산·통화량 (전년동월비)**")
+            st.dataframe(pd.DataFrame(yoy_rows).style.format(
+                {"전년동월비(%)": "{:+.2f}", "3개월 전 전년동월비(%)": "{:+.2f}"},
+                na_rep="-"), width="stretch", hide_index=True)
+
+        kr_rate = ov_data.get("기준금리")
+        us_rate = fred_x["FEDFUNDS"].dropna() if fred_x is not None and \
+            "FEDFUNDS" in fred_x.columns else None
+        if kr_rate is not None and len(kr_rate) and us_rate is not None and len(us_rate):
+            diff = float(kr_rate.iloc[-1]) - float(us_rate.iloc[-1])
+            st.metric("한·미 정책금리차 (환헤지 비용 압력)", f"{diff:+.2f}%p",
+                      help="한국 기준금리 − 미국 기준금리. 실제 환헤지 비용(선물환 "
+                           "프리미엄)은 대체로 이 금리차와 연동됩니다. 사이드바 "
+                           "**환율효과 제외** 옵션은 이 비용을 반영하지 않는 "
+                           "무비용 완전헤지 가정이라는 점을 참고하세요.")
+
+        with st.expander("🔍 다른 지표 찾아보기 (개발용)", expanded=False):
+            st.caption("위 고정 지표 외에 다른 통계를 보고 싶을 때 씁니다. "
+                      "**통계표코드를 미리 정해두지 않습니다** — 잘못 외운 코드로 "
+                      "조용히 엉뚱한 지표를 보여주는 사고를 막기 위해 매번 이름 "
+                      "검색부터 시작합니다.")
+            kw = st.text_input("통계표 검색 (예: 기준금리, 소비자물가, 국고채)",
+                               key="_ecos_kw")
+            if kw.strip():
                 try:
-                    with st.spinner("세부 항목 조회 중..."):
-                        items = ecos_item_list(ecos_key.strip(), stat_code)
+                    with st.spinner("통계표 검색 중..."):
+                        tables = ecos_table_list(ecos_key.strip())
                 except Exception as ex:
-                    st.error(f"🚫 세부 항목을 가져오지 못했습니다: {ex}")
-                    items = []
-                if items:
-                    # 이 표가 실제 지원하는 주기만 고르게 한다 — 안 맞는 주기로
-                    # 조회하면 INFO-200(데이터 없음)이 난다. 항목 트리도 주기별로
-                    # 갈리므로(같은 항목이 D/M/Q/A마다 행이 반복됨) 주기부터 고른다.
-                    cycles = ecos_available_cycles(items)
-                    if not cycles:
-                        st.warning("이 통계표는 지원 주기 정보를 확인할 수 없습니다.")
-                    else:
-                        fc1, fc2 = st.columns([1, 2])
-                        cyc_label = fc1.radio(
-                            "주기", [ECOS_CYCLE_LABEL[c] for c in cycles],
-                            horizontal=True, key=f"_ecos_freq_{stat_code}")
-                        freq = {v: k for k, v in ECOS_CYCLE_LABEL.items()}[cyc_label]
-                        years_back = fc2.slider("조회 기간 (년)", 1, 20, 10,
-                                                key="_ecos_years")
-
-                        # 트리 전체를 평평하게 펼쳐 한 번에 고른다 — 상위 항목
-                        # (예: M2 총량) 자체를 고르고 싶을 때가 많아 단계별
-                        # 강제 드릴다운은 오히려 방해가 된다.
-                        paths = ecos_item_paths(items, freq)
-                        if not paths:
-                            item_code, item_label = "", pick.split(" (")[0]
-                            st.caption("이 통계표는 세부 항목 구분이 없어 전체 계열을 "
-                                      "그대로 조회합니다.")
+                    st.error(f"🚫 통계표 목록을 가져오지 못했습니다: {ex}")
+                    tables = []
+                matches = [t for t in tables if kw.strip() in str(t.get("STAT_NAME", ""))]
+                if not matches:
+                    st.warning("검색 결과가 없습니다. 다른 표현으로 검색해보세요 "
+                               "(예: '금리' 대신 '기준금리').")
+                else:
+                    if len(matches) > 50:
+                        st.caption(f"{len(matches)}건 중 상위 50건만 표시합니다. "
+                                   "검색어를 좁혀보세요.")
+                    opts = {f"{t['STAT_NAME']} ({t['STAT_CODE']})": t["STAT_CODE"]
+                           for t in matches[:50]}
+                    pick = st.selectbox("통계표 선택", list(opts), key="_ecos_table_pick")
+                    stat_code = opts[pick]
+                    try:
+                        with st.spinner("세부 항목 조회 중..."):
+                            items = ecos_item_list(ecos_key.strip(), stat_code)
+                    except Exception as ex:
+                        st.error(f"🚫 세부 항목을 가져오지 못했습니다: {ex}")
+                        items = []
+                    if items:
+                        # 이 표가 실제 지원하는 주기만 고르게 한다 — 안 맞는 주기로
+                        # 조회하면 INFO-200(데이터 없음)이 난다. 항목 트리도
+                        # 주기별로 갈리므로(같은 항목이 D/M/Q/A마다 행이 반복됨)
+                        # 주기부터 고른다.
+                        cycles = ecos_available_cycles(items)
+                        if not cycles:
+                            st.warning("이 통계표는 지원 주기 정보를 확인할 수 없습니다.")
                         else:
-                            ipick = st.selectbox("세부 항목 선택", list(paths),
-                                                 key=f"_ecos_item_{stat_code}_{freq}")
-                            item_code = paths[ipick]
-                            item_label = ipick.rsplit(" (", 1)[0]
+                            fc1, fc2 = st.columns([1, 2])
+                            cyc_label = fc1.radio(
+                                "주기", [ECOS_CYCLE_LABEL[c] for c in cycles],
+                                horizontal=True, key=f"_ecos_freq_{stat_code}")
+                            freq = {v: k for k, v in ECOS_CYCLE_LABEL.items()}[cyc_label]
+                            years_back = fc2.slider("조회 기간 (년)", 1, 20, 10,
+                                                    key="_ecos_years")
 
-                        if st.button("📈 조회", key="_ecos_go", type="primary"):
-                            end_s = pd.Timestamp(end_date)
-                            start_s = end_s - pd.DateOffset(years=years_back)
-                            if freq == "Q":
-                                fmt_bound = (lambda t: f"{t.year}Q{(t.month - 1) // 3 + 1}")
+                            # 트리 전체를 평평하게 펼쳐 한 번에 고른다 — 상위
+                            # 항목(예: M2 총량) 자체를 고르고 싶을 때가 많아
+                            # 단계별 강제 드릴다운은 오히려 방해가 된다.
+                            paths = ecos_item_paths(items, freq)
+                            if not paths:
+                                item_code, item_label = "", pick.split(" (")[0]
+                                st.caption("이 통계표는 세부 항목 구분이 없어 전체 "
+                                          "계열을 그대로 조회합니다.")
                             else:
-                                fmt_bound = ECOS_FREQ_FMT[freq]
-                                fmt_bound = (lambda t, _f=fmt_bound: t.strftime(_f))
-                            try:
-                                with st.spinner("시계열 조회 중..."):
-                                    s = ecos_series(ecos_key.strip(), stat_code, freq,
-                                                   fmt_bound(start_s), fmt_bound(end_s),
-                                                   item_code)
-                            except Exception as ex:
-                                st.error(f"🚫 조회 실패: {ex}")
-                                s = pd.Series(dtype=float)
-                            if s.empty:
-                                st.warning("데이터가 없습니다. 주기나 기간을 바꿔보세요.")
-                            else:
-                                fk = go.Figure(go.Scatter(x=s.index, y=s.values,
-                                                          mode="lines",
-                                                          line=dict(color="#2563eb")))
-                                fk.update_layout(height=320,
-                                                 margin=dict(l=0, r=0, t=20, b=0),
-                                                 yaxis=dict(title=item_label))
-                                st.plotly_chart(fk, width="stretch")
-                                last_v = float(s.iloc[-1])
-                                mc1, mc2, mc3 = st.columns(3)
-                                mc1.metric("최근값", f"{last_v:,.2f}",
-                                          help=f"기준: {s.index[-1].strftime('%Y-%m-%d')}")
-                                if len(s) > 3:
-                                    mc2.metric("3구간 전 대비",
-                                              f"{last_v - float(s.iloc[-4]):+,.2f}")
-                                if len(s) > 12:
-                                    mc3.metric("12구간 전 대비",
-                                              f"{last_v - float(s.iloc[-13]):+,.2f}")
+                                ipick = st.selectbox(
+                                    "세부 항목 선택", list(paths),
+                                    key=f"_ecos_item_{stat_code}_{freq}")
+                                item_code = paths[ipick]
+                                item_label = ipick.rsplit(" (", 1)[0]
+
+                            if st.button("📈 조회", key="_ecos_go", type="primary"):
+                                end_s2 = pd.Timestamp(end_date)
+                                start_s2 = end_s2 - pd.DateOffset(years=years_back)
+                                if freq == "Q":
+                                    fmt_bound = (lambda t: f"{t.year}Q"
+                                                f"{(t.month - 1) // 3 + 1}")
+                                else:
+                                    fmt_bound = ECOS_FREQ_FMT[freq]
+                                    fmt_bound = (lambda t, _f=fmt_bound: t.strftime(_f))
+                                try:
+                                    with st.spinner("시계열 조회 중..."):
+                                        s = ecos_series(ecos_key.strip(), stat_code,
+                                                       freq, fmt_bound(start_s2),
+                                                       fmt_bound(end_s2), item_code)
+                                except Exception as ex:
+                                    st.error(f"🚫 조회 실패: {ex}")
+                                    s = pd.Series(dtype=float)
+                                if s.empty:
+                                    st.warning("데이터가 없습니다. 주기나 기간을 "
+                                              "바꿔보세요.")
+                                else:
+                                    fk = go.Figure(go.Scatter(
+                                        x=s.index, y=s.values, mode="lines",
+                                        line=dict(color="#2563eb")))
+                                    fk.update_layout(height=320,
+                                                     margin=dict(l=0, r=0, t=20, b=0),
+                                                     yaxis=dict(title=item_label))
+                                    st.plotly_chart(fk, width="stretch")
+                                    last_v = float(s.iloc[-1])
+                                    mc1, mc2, mc3 = st.columns(3)
+                                    mc1.metric(
+                                        "최근값", f"{last_v:,.2f}",
+                                        help=f"기준: {s.index[-1].strftime('%Y-%m-%d')}")
+                                    if len(s) > 3:
+                                        mc2.metric("3구간 전 대비",
+                                                  f"{last_v - float(s.iloc[-4]):+,.2f}")
+                                    if len(s) > 12:
+                                        mc3.metric(
+                                            "12구간 전 대비",
+                                            f"{last_v - float(s.iloc[-13]):+,.2f}")
 
     # ---------------- 포트폴리오 노출 ----------------
     # ---------------- 전망 초안으로 넘기기 ----------------
