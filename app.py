@@ -5955,12 +5955,15 @@ ECOS_BASE = "https://ecos.bok.or.kr/api"
 ECOS_FREQ_FMT = {"D": "%Y%m%d", "M": "%Y%m", "A": "%Y"}
 ECOS_CYCLE_LABEL = {"D": "일", "M": "월", "Q": "분기", "A": "년"}
 
-# 검색 없이 자동으로 보여주는 한국 금융여건 고정 지표. (통계표코드, 항목코드) 둘 다
+# 검색 없이 자동으로 보여주는 한국 금융여건 고정 지표: (통계표코드, 항목코드, 주기).
 # 실제 배포 환경에서 라이브 조회로 검증된 값만 넣는다 — 추측으로 채우지 않는다.
-ECOS_KR_LEVEL = {"기준금리": ("722Y001", "0101000"), "원/달러": ("731Y003", "0000002")}
-ECOS_KR_YOY = {"소비자물가(CPI)": ("901Y009", "0"),
-               "전산업생산지수": ("901Y033", ""),
-               "M2 통화량": ("161Y006", "BBHA00")}
+# 원/달러(731Y003)는 표 자체가 일별(D) 전용이라 월 주기가 항목 목록에 아예
+# 없다(실제 StatisticItemList 응답으로 확인) — 일별로 받아 월말값으로 리샘플한다.
+ECOS_KR_LEVEL = {"기준금리": ("722Y001", "0101000", "M"),
+                 "원/달러": ("731Y003", "0000003", "D")}
+ECOS_KR_YOY = {"소비자물가(CPI)": ("901Y009", "0", "M"),
+               "전산업생산지수": ("901Y033", "", "M"),
+               "M2 통화량": ("161Y006", "BBHA00", "M")}
 
 
 def ecos_secret_key() -> str:
@@ -6085,19 +6088,26 @@ def ecos_item_paths(items: list, cycle: str) -> dict:
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def load_ecos_overlay(api_key: str, end):
     """ECOS_KR_LEVEL·ECOS_KR_YOY 고정 지표를 한 번에 받는다. 지표 하나가
-    실패해도 나머지는 계속 진행한다.
+    실패해도 나머지는 계속 진행한다. 일별(D) 지표는 월말값으로 리샘플해
+    다른 지표들과 같은 월 단위 인덱스로 맞춘다(3·12개월 전 대비 계산이
+    "몇 번째 행 앞"이 아니라 실제 개월 수를 의미하게 하려면 필요하다).
     반환: ({지표명: Series}, {실패한 지표명: 이유})."""
     end_s = pd.Timestamp(end)
-    start_s = end_s - pd.DateOffset(years=5)
-    fmt = ECOS_FREQ_FMT["M"]
     data, fails = {}, {}
-    for label, (stat_code, item_code) in {**ECOS_KR_LEVEL, **ECOS_KR_YOY}.items():
+    for label, (stat_code, item_code, cycle) in {**ECOS_KR_LEVEL, **ECOS_KR_YOY}.items():
+        # 일별은 데이터량이 많아 조회 기간을 짧게 잡는다(StatisticSearch
+        # 1회 조회 상한 1000행 안에 들어오도록 — 2년치 영업일이면 충분).
+        years_back = 2 if cycle == "D" else 5
+        start_s = end_s - pd.DateOffset(years=years_back)
+        fmt = ECOS_FREQ_FMT[cycle]
         try:
-            s = ecos_series(api_key, stat_code, "M", start_s.strftime(fmt),
+            s = ecos_series(api_key, stat_code, cycle, start_s.strftime(fmt),
                             end_s.strftime(fmt), item_code)
         except Exception as ex:
             s = pd.Series(dtype=float)
             fails[label] = f"{type(ex).__name__}: {str(ex)[:150]}"
+        if cycle == "D" and not s.empty:
+            s = s.resample("ME").last()
         if s.empty:
             fails.setdefault(label, "빈 응답(데이터 없음)")
         else:
