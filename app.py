@@ -5963,6 +5963,15 @@ ECOS_KR_YOY = {"소비자물가(CPI)": ("901Y009", "0"),
                "M2 통화량": ("161Y006", "BBHA00")}
 
 
+def ecos_secret_key() -> str:
+    """Streamlit Cloud Secrets에 ECOS_API_KEY가 등록돼 있으면 그걸 쓴다.
+    없으면 빈 문자열을 돌려주고, 호출부가 수동 입력창으로 대신한다."""
+    try:
+        return str(st.secrets.get("ECOS_API_KEY", "")).strip()
+    except Exception:
+        return ""
+
+
 def _ecos_get(service: str, api_key: str, path_parts: list, timeout: int = 15) -> list:
     """
     ECOS REST 공통 호출. 성공 시 row 리스트를 돌려주고, 실패하면 예외를 던진다.
@@ -6341,9 +6350,18 @@ def render_macro(base_ccy, start_date, end_date, use_div, fx_hedge, gap_fill):
     st.caption("검색 없이 자동으로 뜨는 고정 지표입니다. 국면 판정(1️⃣~2️⃣)에는 "
               "쓰지 않는 참고용이며, 한국 기준금리·물가·통화량·환율이 미국 "
               "환경을 어떻게 전달받고 있는지 보는 용도입니다.")
-    ecos_key = st.text_input("ECOS API 인증키", type="password", key="_ecos_key",
-                             help="https://ecos.bok.or.kr 에서 무료 발급받습니다. "
-                                  "이 키는 이 브라우저 세션에만 남고 저장되지 않습니다.")
+    ecos_secret = ecos_secret_key()
+    if ecos_secret:
+        ecos_key = ecos_secret
+        st.caption("✅ 서버에 등록된 인증키를 자동으로 씁니다.")
+    else:
+        ecos_key = st.text_input("ECOS API 인증키", type="password", key="_ecos_key",
+                                 help="https://ecos.bok.or.kr 에서 무료 발급받습니다. "
+                                      "이 키는 이 브라우저 세션에만 남고 저장되지 "
+                                      "않습니다. 매번 입력하기 번거로우면 Streamlit "
+                                      "Cloud 앱 설정의 Secrets에 ECOS_API_KEY로 "
+                                      "등록해두세요 — 그러면 이 입력창 자체가 "
+                                      "사라집니다.")
     if not ecos_key.strip():
         st.info("👆 인증키를 입력하면 지표를 볼 수 있습니다.")
     else:
