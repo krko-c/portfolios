@@ -3,3 +3,6 @@ __pycache__/
 .streamlit/secrets.toml
 portfolios.json
 optimizations.json
+
+# golden.py collect의 ad-hoc 출력 (커밋 대상 아님 — tests/fixtures/*.parquet 와는 다르다)
+tools/golden_*.json
