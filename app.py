@@ -1544,11 +1544,11 @@ def dca_result(r: pd.Series, monthly: float, start_value: float = 0.0):
         invested += start_value
     vals, invs, buys = [], [], []
     contrib = {pd.Timestamp(d) for d in first_of_month}
-    for dt, c in curve.items():
-        if dt in contrib and monthly > 0:
+    for d, c in curve.items():
+        if d in contrib and monthly > 0:
             units += monthly / float(c)
             invested += monthly
-            buys.append(dt)
+            buys.append(d)
         vals.append(units * float(c))
         invs.append(invested)
     return (pd.Series(vals, index=idx), pd.Series(invs, index=idx), buys)
