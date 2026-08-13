@@ -16,7 +16,54 @@ from pathlib import Path
 WIDGETS = ("number_input|text_input|selectbox|checkbox|radio|slider|select_slider|"
            "text_area|color_picker|date_input|data_editor|file_uploader|"
            "multiselect|download_button")
-MODULES = ["go", "np", "pd", "st", "yf", "io", "json", "re", "Path", "itertools"]
+
+
+def _assign_target_names(target):
+    """Assign/For/With/컴프리헨션의 대입 대상에서 단순 이름만 뽑는다(튜플·리스트는 재귀)."""
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names = []
+        for elt in target.elts:
+            names.extend(_assign_target_names(elt))
+        return names
+    return []
+
+
+def find_shadowed_imports(tree: ast.AST) -> list:
+    """
+    import/from-import로 들여온 이름을 나중에 변수로 덮어쓰는 곳을 찾는다.
+    할당문뿐 아니라 for 루프 변수·with as·컴프리헨션 변수도 검사한다 —
+    실제로 `for dt, c in ...:` 가 `import datetime as dt` 의 dt를 가린 사고가 있었다.
+    하드코딩된 모듈 목록 대신 파일에 실제로 있는 import를 그대로 쓴다 —
+    목록을 깜빡 안 늘려서 새 import가 검사에서 빠지는 사고를 막기 위함이다.
+    """
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    imported.add(alias.asname or alias.name)
+
+    shadow = []
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.For):
+            targets = [node.target]
+        elif isinstance(node, ast.With):
+            targets = [item.optional_vars for item in node.items if item.optional_vars]
+        elif isinstance(node, ast.comprehension):
+            targets = [node.target]
+        for t in targets:
+            for name in _assign_target_names(t):
+                if name in imported:
+                    shadow.append((node.lineno, name))
+    return shadow
 
 
 def main(path="app.py"):
@@ -42,11 +89,14 @@ def main(path="app.py"):
     check(f"위젯 key 중복 ({len(keys)}개)", dup_key,
           "Streamlit 이 위젯을 구분하지 못해 상태가 섞입니다")
 
-    # 3. 모듈명 가림
+    # 3. 모듈명 가림 (AST 기반 — import된 이름을 대입문/for/with/컴프리헨션이 덮어쓰는지 검사)
     #    go = st.button(...) 처럼 모듈명을 변수로 덮어쓰면 이후 go.Figure() 가 죽습니다
-    shadow = [(i + 1, m) for i, l in enumerate(lines) for m in MODULES
-              if re.match(rf"^\s*{m}\s*=[^=]", l)]
-    check("모듈명 가림", shadow, "실제로 겪은 사고: go = st.button(...) 으로 plotly 가 죽음")
+    #    for dt, c in ...: 처럼 루프 변수가 import datetime as dt 를 덮어쓴 사고도 있었습니다
+    tree_shadow = ast.parse(src)
+    shadow = find_shadowed_imports(tree_shadow)
+    check("모듈명 가림", shadow,
+          "실제로 겪은 사고: go = st.button(...) 으로 plotly 가 죽음, "
+          "for dt, c in ...: 로 import datetime as dt 가 가려짐")
 
     # 4. key 없는 위젯의 라벨 중복
     joined = "\n".join(lines)
