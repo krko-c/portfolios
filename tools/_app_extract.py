@@ -33,7 +33,7 @@ def extract(need_funcs: set, need_consts: set = frozenset(), prelude: str = "",
     lines = src.split("\n")
 
     parts = []
-    found_funcs = set()
+    found_funcs, found_consts = set(), set()
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in need_funcs:
             parts.append("\n".join(lines[node.lineno - 1:node.end_lineno]))
@@ -42,10 +42,22 @@ def extract(need_funcs: set, need_consts: set = frozenset(), prelude: str = "",
             tgt = getattr(node.targets[0], "id", "")
             if tgt in need_consts:
                 parts.append("\n".join(lines[node.lineno - 1:node.end_lineno]))
+                found_consts.add(tgt)
 
-    missing = set(need_funcs) - found_funcs
-    if missing:
-        raise RuntimeError(f"app.py에서 찾지 못한 함수: {sorted(missing)}")
+    # 함수·상수 이름이 하나라도 안 맞으면 여기서 바로 실패해야 한다. 조용히
+    # 넘어가면 골든이 "일부만 뽑힌 채로 조용히 돌아가는" 상태가 되고, 양쪽
+    # collect가 똑같이 일부만 비교하면 compare는 문제없다고("차이 없음")
+    # 보고한다 — 이게 가장 위험한 실패 방식이다.
+    missing_funcs = set(need_funcs) - found_funcs
+    missing_consts = set(need_consts) - found_consts
+    if missing_funcs or missing_consts:
+        parts_msg = []
+        if missing_funcs:
+            parts_msg.append(f"함수 {sorted(missing_funcs)}")
+        if missing_consts:
+            parts_msg.append(f"상수 {sorted(missing_consts)}")
+        raise RuntimeError(f"app.py에서 찾지 못함: {', '.join(parts_msg)} "
+                           f"(이름이 바뀌었거나 top-level에서 사라졌을 수 있음)")
 
     mod = types.ModuleType("app_extract")
     if extra_globals:
